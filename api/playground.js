@@ -29,7 +29,8 @@ export default async function handler(req, res) {
     if (!productId || !actionId) return res.status(400).json({ message: "Missing productId or actionId" });
 
     // Load products.json from Shopify Files
-    const cfg = await fetch(process.env.PRODUCTS_URL, { cache: "no-store" });
+const PRODUCTS_URL = process.env.PRODUCTS_URL || "https://cdn.shopify.com/s/files/1/0797/0576/8213/files/products.json?v=1758262885";
+const cfg = await fetch(PRODUCTS_URL, { cache: "no-store" });
     if (!cfg.ok) return res.status(500).json({ message: "Failed to load products.json" });
     const products = await cfg.json();
 
