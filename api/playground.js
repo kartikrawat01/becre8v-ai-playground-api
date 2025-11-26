@@ -1,8 +1,7 @@
 // api/playground.js
-// Simple Chat-style Playground for Robocoders Kit
+// Simple Chat-style Playground for Robocoders Kit using raw JSON knowledge
 
 const CHAT_URL = "https://api.openai.com/v1/chat/completions";
-// TEMP TEST: return KB to the frontend instead of calling OpenAI
 
 // Single product we support for now
 const PRODUCT = {
@@ -22,7 +21,7 @@ const PRODUCT = {
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
     .split(",")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 }
 function allow(res, origin) {
@@ -30,71 +29,31 @@ function allow(res, origin) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (!origin) return false;
   const list = origins();
-  if (!list.length || list.some(a => origin.startsWith(a))) {
+  if (!list.length || list.some((a) => origin.startsWith(a))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     return true;
   }
   return false;
 }
 
-/* ---------- Knowledge helpers ---------- */
-async function fetchJsonOrText(url) {
+/* ---------- Knowledge loader (RAW JSON TEXT) ---------- */
+async function loadKnowledgeText() {
+  const url = (process.env.KNOWLEDGE_URL || "").trim();
+  if (!url) return "";
   try {
-    const r = await fetch(url, { cache: "no-store" });
-    if (!r.ok) return null;
-    const ct = (r.headers.get("content-type") || "").toLowerCase();
-    if (ct.includes("application/json")) return await r.json();
-    const text = await r.text();
-    return { __markdown: true, text };
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) return "";
+    // we keep it as TEXT so the full JSON is visible to the model
+    const text = await res.text();
+    return text || "";
   } catch {
-    return null;
+    return "";
   }
 }
-function take(arr, n = 6) {
-  return Array.isArray(arr) ? arr.slice(0, n) : [];
-}
+
 function clampChars(s, max = 2000) {
   if (!s) return "";
   return s.length > max ? s.slice(0, max) : s;
-}
-
-function selectContextFromKB(kb) {
-  if (!kb) return "";
-  if (kb.__markdown) return clampChars(kb.text, 1200);
-
-  const bullets = (label, arr, n = 6) =>
-    arr && arr.length ? `\n${label}:\n• ${take(arr, n).join("\n• ")}` : "";
-
-  let out = "";
-  if (kb.tagline) out += `Tagline: ${kb.tagline}\n`;
-  if (Array.isArray(kb.tone)) {
-    const toneLines = take(kb.tone.map(t => `${t.rule}: ${t.description}`), 5);
-    out += bullets("Tone", toneLines, 5);
-  }
-
-  out += bullets(
-    "What is in the box",
-    kb?.contents?.map(c => `${c.name}: ${c.description}`) || [],
-    8
-  );
-  out += bullets(
-    "Starter Projects",
-    kb?.projects?.map(p => `${p.name}: ${p.description}`) || [],
-    6
-  );
-  out += bullets("Skills", kb?.skills || [], 6);
-
-  return clampChars(out, 1500);
-}
-
-async function gatherKnowledge(knowledgeUrls = []) {
-  if (!knowledgeUrls.length) return "";
-  const items = await Promise.all(knowledgeUrls.map(fetchJsonOrText));
-  const parts = items
-    .filter(Boolean)
-    .map(kb => selectContextFromKB(kb))
-    .filter(Boolean);
-  return clampChars(parts.join("\n\n"), 2000);
 }
 
 /* ---------- Handler ---------- */
@@ -121,42 +80,45 @@ export default async function handler(req, res) {
 
     const product = PRODUCT;
 
-    // Build knowledge URLs from env
-    const knowledgeUrls = [];
-    const envUrl = (process.env.KNOWLEDGE_URL || "").trim();
-    if (envUrl) knowledgeUrls.push(envUrl);
-
-    const kbContext = await gatherKnowledge(knowledgeUrls);
+    // Load raw JSON knowledge text from env URL
+    const kbRaw = await loadKnowledgeText();
+    // Optional: clamp if file is huge
+    const kbContext = clampChars(kbRaw, 8000);
 
     const guards = (product?.behavior?.guardrails || []).join(" | ");
-    const tone =
-      product?.behavior?.tone || "kid-safe, friendly, step-by-step";
 
-  const sys = `
-You are the official Be Cre8v Robocoders Kit Assistant.
+    const sys = `
+You are the official Be Cre8v "Robocoders Kit" Assistant.
 
 VERY IMPORTANT RULES (follow strictly):
-1. You MUST use the facts inside the Knowledge section as the main source of truth. 
-2. Whenever describing components, explaining steps, troubleshooting, ideas, or safety – ALWAYS reference details from the Knowledge section.
-3. Do NOT invent components, features, sensors, or parts that are NOT in the Robocoders Kit.
-4. If the user asks something NOT covered by the Knowledge section, say: 
-   "This is not included in the Robocoders Kit, but here is a safe alternative..."
-5. ALWAYS respond in kid-safe, friendly, simple language.
+1. You MUST treat the following JSON as the single source of truth about the Robocoders Kit.
+2. When answering about components, what is inside the box, projects, skills, steps, wiring, or safety:
+   - FIRST carefully read the JSON.
+   - THEN answer ONLY using details that are consistent with the JSON.
+3. Do NOT invent extra parts, sensors, boards, or features that are NOT present in the JSON.
+4. If the user asks for something that is not described in the JSON, say clearly:
+   "This part is not listed in the Robocoders Kit data. Here is a safe general suggestion..."
+5. ALWAYS answer in kid-safe, friendly, simple language as if talking to a child and their parent.
 6. ALWAYS add a gentle safety reminder when tools, electricity, motors, or batteries are involved.
+7. You may help with ideas, steps, troubleshooting, Python help, and safety, but all related to this kit.
 
-Knowledge (your official kit information):
+Here are your guardrails from Be Cre8v:
+${guards}
+
+Below is the JSON data (Knowledge) for the Robocoders Kit.
+You MUST read this carefully and base your answers on it:
+
+JSON_KNOWLEDGE_START
 ${kbContext}
+JSON_KNOWLEDGE_END
 `;
-
 
     // Take last few messages from chat history
     const history = Array.isArray(messages)
-      ? messages
-          .slice(-8)
-          .map(m => ({
-            role: m.role === "assistant" ? "assistant" : "user",
-            content: clampChars(String(m.content || ""), 600)
-          }))
+      ? messages.slice(-8).map((m) => ({
+          role: m.role === "assistant" ? "assistant" : "user",
+          content: clampChars(String(m.content || ""), 600)
+        }))
       : [];
 
     const OPENAI_KEY = String(process.env.OPENAI_API_KEY || "").trim();
