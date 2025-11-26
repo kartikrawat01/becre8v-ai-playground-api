@@ -17,6 +17,9 @@ const PRODUCT = {
   }
 };
 
+// For inspecting what happened when trying to load the knowledge JSON
+let lastKbDebug = "KB not loaded yet";
+
 /* ---------- CORS helpers ---------- */
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -43,15 +46,44 @@ function clampChars(s, max = 2000) {
 }
 
 /* ---------- Knowledge loader ---------- */
+
+// Load JSON from KNOWLEDGE_URL and parse it, with detailed debug info
 async function loadKnowledge() {
   const url = (process.env.KNOWLEDGE_URL || "").trim();
-  if (!url) return null;
+
+  if (!url) {
+    lastKbDebug = "KNOWLEDGE_URL env var is empty.";
+    return null;
+  }
+
   try {
+    lastKbDebug = `Fetching URL: ${url}`;
     const res = await fetch(url, { cache: "no-store" });
-    if (!res.ok) return null;
+
+    if (!res.ok) {
+      lastKbDebug = `Fetch failed: HTTP ${res.status} ${res.statusText} for ${url}`;
+      return null;
+    }
+
     const txt = await res.text();
-    return JSON.parse(txt);
-  } catch {
+    lastKbDebug = `Fetch OK (length=${txt.length}). Parsing JSON...`;
+
+    let json;
+    try {
+      json = JSON.parse(txt);
+    } catch (parseErr) {
+      lastKbDebug = `JSON parse error: ${parseErr?.message || String(parseErr)}`;
+      return null;
+    }
+
+    const keys = Object.keys(json || {});
+    lastKbDebug = `JSON parsed OK. Top-level keys: ${keys.join(", ") || "(none)"}`;
+
+    return json;
+  } catch (err) {
+    lastKbDebug = `Unexpected error while fetching knowledge: ${
+      err?.message || String(err)
+    }`;
     return null;
   }
 }
@@ -79,11 +111,13 @@ function buildKnowledgeContext(kb) {
   let ctx = "";
 
   if (contents.length) {
-    ctx += "KIT_CONTENTS_JSON = " + JSON.stringify(contents).slice(0, 6000) + "\n\n";
+    ctx +=
+      "KIT_CONTENTS_JSON = " + JSON.stringify(contents).slice(0, 6000) + "\n\n";
   }
 
   if (projects.length) {
-    ctx += "KIT_PROJECTS_JSON = " + JSON.stringify(projects).slice(0, 6000) + "\n\n";
+    ctx +=
+      "KIT_PROJECTS_JSON = " + JSON.stringify(projects).slice(0, 6000) + "\n\n";
   }
 
   if (skills.length) {
@@ -119,7 +153,8 @@ export default async function handler(req, res) {
 
     const kb = await loadKnowledge();
     const kbContext = buildKnowledgeContext(kb);
-        // ---------- TEMP DEBUG: type "__debug_kb__" in the chat to inspect KB ----------
+
+    // ---------- DEBUG: type "__debug_kb__" in the chat to inspect KB ----------
     if (input === "__debug_kb__") {
       return res.status(200).json({
         text:
@@ -128,7 +163,13 @@ export default async function handler(req, res) {
           `contentsCount: ${
             Array.isArray(kb?.contents) ? kb.contents.length : 0
           }\n` +
-          `firstContentName: ${kb?.contents?.[0]?.name || "NONE"}\n\n` +
+          `firstContentName: ${
+            Array.isArray(kb?.contents) && kb.contents.length
+              ? kb.contents[0].name
+              : "NONE"
+          }\n\n` +
+          `env.KNOWLEDGE_URL: ${process.env.KNOWLEDGE_URL || "(empty)"}\n` +
+          `lastKbDebug: ${lastKbDebug}\n\n` +
           "kbContextPreview:\n" +
           clampChars(kbContext, 400)
       });
@@ -197,13 +238,18 @@ ${kbContext}
 
     if (!oai.ok) {
       const err = await oai.text().catch(() => "");
-      return res.status(oai.status).json({ message: "OpenAI error", details: err.slice(0, 800) });
+      return res
+        .status(oai.status)
+        .json({ message: "OpenAI error", details: err.slice(0, 800) });
     }
 
     const data = await oai.json();
-    const text = (data.choices?.[0]?.message?.content || "").trim() || "No response.";
+    const text =
+      (data.choices?.[0]?.message?.content || "").trim() || "No response.";
     return res.status(200).json({ text });
   } catch (e) {
-    return res.status(500).json({ message: "Server error", details: String(e?.message || e) });
+    return res
+      .status(500)
+      .json({ message: "Server error", details: String(e?.message || e) });
   }
 }
