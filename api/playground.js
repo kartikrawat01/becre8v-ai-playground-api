@@ -2,6 +2,7 @@
 // Simple Chat-style Playground for Robocoders Kit
 
 const CHAT_URL = "https://api.openai.com/v1/chat/completions";
+// TEMP TEST: return KB to the frontend instead of calling OpenAI
 
 // Single product we support for now
 const PRODUCT = {
@@ -131,13 +132,22 @@ export default async function handler(req, res) {
     const tone =
       product?.behavior?.tone || "kid-safe, friendly, step-by-step";
 
-    const sys = `You are Be Cre8v Kid-Safe Assistant for the product "${product.name}".
-Rules: ${guards}.
-Always answer as if you are helping a child and their parent build and use this kit.
-Keep replies short, encouraging, and very practical.
-If the user asks for ideas, steps, troubleshooting, Python help, or safety tips, you can answer all of that naturally in chat form.
-Use the facts below about the kit only when relevant:
-${kbContext}`;
+  const sys = `
+You are the official Be Cre8v Robocoders Kit Assistant.
+
+VERY IMPORTANT RULES (follow strictly):
+1. You MUST use the facts inside the Knowledge section as the main source of truth. 
+2. Whenever describing components, explaining steps, troubleshooting, ideas, or safety – ALWAYS reference details from the Knowledge section.
+3. Do NOT invent components, features, sensors, or parts that are NOT in the Robocoders Kit.
+4. If the user asks something NOT covered by the Knowledge section, say: 
+   "This is not included in the Robocoders Kit, but here is a safe alternative..."
+5. ALWAYS respond in kid-safe, friendly, simple language.
+6. ALWAYS add a gentle safety reminder when tools, electricity, motors, or batteries are involved.
+
+Knowledge (your official kit information):
+${kbContext}
+`;
+
 
     // Take last few messages from chat history
     const history = Array.isArray(messages)
