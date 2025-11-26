@@ -1,5 +1,5 @@
 // api/playground.js
-// Simple Chat-style Playground for Robocoders Kit using structured knowledge
+// Simple Chat-style Playground for Robocoders Kit using structured JSON knowledge
 
 const CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
@@ -21,7 +21,7 @@ const PRODUCT = {
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
     .split(",")
-    .map(s => s.trim())
+    .map((s) => s.trim())
     .filter(Boolean);
 }
 function allow(res, origin) {
@@ -29,20 +29,20 @@ function allow(res, origin) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   if (!origin) return false;
   const list = origins();
-  if (!list.length || list.some(a => origin.startsWith(a))) {
+  if (!list.length || list.some((a) => origin.startsWith(a))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     return true;
   }
   return false;
 }
 
-/* ---------- Knowledge loader & formatter ---------- */
-
 function clampChars(s, max = 2000) {
   if (!s) return "";
   const str = String(s);
   return str.length > max ? str.slice(0, max) : str;
 }
+
+/* ---------- Knowledge loader & formatter ---------- */
 
 // Load JSON from KNOWLEDGE_URL and parse it
 async function loadKnowledge() {
@@ -58,41 +58,58 @@ async function loadKnowledge() {
   }
 }
 
-// Turn the JSON into a compact, friendly text summary
+// Turn the JSON into small JSON-like blobs the model can use directly
 function buildKnowledgeContext(kb) {
   if (!kb || typeof kb !== "object") return "";
 
-  const bullets = (label, arr) =>
-    Array.isArray(arr) && arr.length
-      ? `\n${label}:\n• ${arr.join("\n• ")}`
-      : "";
+  // Components in the box
+  const contents = Array.isArray(kb.contents)
+    ? kb.contents.map((c) => ({
+        name: c.name,
+        type: c.type || "",
+        description: c.description || ""
+      }))
+    : [];
 
-  let sections = [];
+  // Project names only (descriptions already live in model if needed)
+  const projects = Array.isArray(kb.projects)
+    ? kb.projects.map((p) => ({
+        name: p.name,
+        description: p.description || ""
+      }))
+    : [];
 
-  if (kb.tagline) {
-    sections.push(`Tagline: ${clampChars(kb.tagline, 400)}`);
+  // Skills – keep as simple strings
+  const skills = Array.isArray(kb.skills) ? kb.skills : [];
+
+  // We encode them as JSON-in-text so the model can "read" them like tables.
+  let ctx = "";
+
+  if (contents.length) {
+    const shortContents = contents.slice(0, 60); // plenty for one kit
+    ctx +=
+      "KIT_CONTENTS_JSON = " +
+      JSON.stringify(shortContents).slice(0, 6000) +
+      "\n\n";
   }
 
-  if (Array.isArray(kb.contents) && kb.contents.length) {
-    const items = kb.contents
-      .slice(0, 20)
-      .map(c => `${c.name}: ${clampChars(c.description || "", 120)}`);
-    sections.push(`What comes in the box (kit components):\n• ${items.join("\n• ")}`);
+  if (projects.length) {
+    const shortProjects = projects.slice(0, 80);
+    ctx +=
+      "KIT_PROJECTS_JSON = " +
+      JSON.stringify(shortProjects).slice(0, 6000) +
+      "\n\n";
   }
 
-  if (Array.isArray(kb.projects) && kb.projects.length) {
-    const items = kb.projects
-      .slice(0, 15)
-      .map(p => `${p.name}: ${clampChars(p.description || "", 160)}`);
-    sections.push(`Starter projects included in this kit:\n• ${items.join("\n• ")}`);
+  if (skills.length) {
+    const shortSkills = skills.slice(0, 40);
+    ctx +=
+      "KIT_SKILLS = " +
+      JSON.stringify(shortSkills).slice(0, 4000) +
+      "\n\n";
   }
 
-  if (Array.isArray(kb.skills) && kb.skills.length) {
-    const items = kb.skills.slice(0, 10).map(s => clampChars(s, 120));
-    sections.push(`Skills kids practice with this kit:\n• ${items.join("\n• ")}`);
-  }
-
-  return clampChars(sections.join("\n\n"), 4000);
+  return ctx.trim();
 }
 
 /* ---------- Handler ---------- */
@@ -128,33 +145,47 @@ export default async function handler(req, res) {
     const sys = `
 You are the official Be Cre8v "Robocoders Kit" Assistant.
 
-You have structured knowledge about this kit, summarised in the "Knowledge" section below.
-This Knowledge is accurate and should be treated as the main source of truth.
+You have three important data tables:
 
-VERY IMPORTANT INSTRUCTIONS:
-- When the user asks "what comes in the box", "what is inside the kit", or similar:
-  • Answer ONLY using the "What comes in the box (kit components)" list.
+1) KIT_CONTENTS_JSON  → exact list of kit components (each has "name", "type", "description")
+2) KIT_PROJECTS_JSON  → exact list of project ideas included with this kit (each has "name", "description")
+3) KIT_SKILLS         → list of skills kids build with this kit
+
+These JSON tables are the SINGLE source of truth about the kit.
+
+VERY STRICT RULES (follow exactly):
+- When the user asks "what comes in the box", "components", "what is inside the kit", etc.:
+  • Read KIT_CONTENTS_JSON and list the "name" values EXACTLY as written there (Robocoders Brain, USB Cable, DC Motor, LED Module, etc.).
+  • You may optionally give a SHORT explanation using the "description" for each, but do not rename items.
+  • Do NOT invent extra parts like "chassis", "wheels", "sensors pack" unless they appear in KIT_CONTENTS_JSON.
+
 - When the user asks for "starter projects", "projects included", "what can I build", etc.:
-  • Answer using the "Starter projects included in this kit" section.
-- When the user asks what they will learn or what skills this kit builds:
-  • Answer using the "Skills kids practice with this kit" section.
-- You may combine these facts to give ideas, steps, troubleshooting, Python help, or safety tips.
-- Do NOT invent extra hardware or features that are not consistent with the Knowledge text.
-- If something is clearly not covered (for example, about a totally different kit), say:
-  "This specific detail is not in my Robocoders data, but here is a safe general suggestion..."
-- Always respond in kid-safe, simple, friendly language, as if talking to a child and their parent.
-- Always mention adult supervision when tools, electricity, motors, or batteries are involved.
+  • Read KIT_PROJECTS_JSON and give project names EXACTLY as in the "name" field (Hello World, Smart Box, Mood Lamp, Coin Collector, etc.).
+  • You may summarise descriptions, but keep the official names.
 
-Here are the guardrails from Be Cre8v:
+- When the user asks what they will "learn", "skills", "outcomes":
+  • Use KIT_SKILLS to answer.
+
+- For troubleshooting, ideas, Python help, or step-by-step guidance:
+  • Base your answers on these same components and projects.
+  • Never talk about hardware or features that clearly do not exist in these tables.
+
+- If a user asks about something completely outside these tables (for example: a different kit, or a component that is missing):
+  • Clearly say that it is not listed in your Robocoders data and then give a generic but safe suggestion.
+
+- Always respond in kid-safe, simple, friendly language for ages 8–14.
+- Always include a gentle safety reminder when using tools, electricity, motors, or batteries.
+
+Guardrails from Be Cre8v:
 ${guards}
 
-Knowledge about the Robocoders Kit:
+Here is your data:
 ${kbContext}
 `.trim();
 
     // Take last few messages from chat history
     const history = Array.isArray(messages)
-      ? messages.slice(-8).map(m => ({
+      ? messages.slice(-8).map((m) => ({
           role: m.role === "assistant" ? "assistant" : "user",
           content: clampChars(String(m.content || ""), 600)
         }))
@@ -182,7 +213,7 @@ ${kbContext}
           { role: "user", content: input }
         ],
         max_tokens: 400,
-        temperature: 0.5
+        temperature: 0.4
       })
     });
 
