@@ -119,6 +119,21 @@ export default async function handler(req, res) {
 
     const kb = await loadKnowledge();
     const kbContext = buildKnowledgeContext(kb);
+        // ---------- TEMP DEBUG: type "__debug_kb__" in the chat to inspect KB ----------
+    if (input === "__debug_kb__") {
+      return res.status(200).json({
+        text:
+          "DEBUG KB\n" +
+          `hasKb: ${!!kb}\n` +
+          `contentsCount: ${
+            Array.isArray(kb?.contents) ? kb.contents.length : 0
+          }\n` +
+          `firstContentName: ${kb?.contents?.[0]?.name || "NONE"}\n\n` +
+          "kbContextPreview:\n" +
+          clampChars(kbContext, 400)
+      });
+    }
+    // -------------------------------------------------------------------------------
 
     const guards = (product?.behavior?.guardrails || []).join(" | ");
 
