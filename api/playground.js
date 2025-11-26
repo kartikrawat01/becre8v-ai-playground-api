@@ -1,7 +1,7 @@
 // api/playground.js
 // Simple Chat-style Playground for Robocoders Kit using structured JSON knowledge
 
-const CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const CHAT_URL = "https://api.openai.com/v1/chat/completions"; 
 
 // Single product we support for now (we can extend to multiple later)
 const PRODUCT = {
