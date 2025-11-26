@@ -3,7 +3,7 @@
 
 const CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
-// Single product we support for now
+// Single product we support for now (we can extend to multiple later)
 const PRODUCT = {
   name: "Robocoders Kit",
   behavior: {
@@ -17,9 +17,6 @@ const PRODUCT = {
   }
 };
 
-// For inspecting what happened when trying to load the knowledge JSON
-let lastKbDebug = "KB not loaded yet";
-
 /* ---------- CORS helpers ---------- */
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -27,6 +24,7 @@ function origins() {
     .map((s) => s.trim())
     .filter(Boolean);
 }
+
 function allow(res, origin) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -47,43 +45,34 @@ function clampChars(s, max = 2000) {
 
 /* ---------- Knowledge loader ---------- */
 
-// Load JSON from KNOWLEDGE_URL and parse it, with detailed debug info
+let lastKbDebug = "";
+
 async function loadKnowledge() {
   const url = (process.env.KNOWLEDGE_URL || "").trim();
+  lastKbDebug = `env.KNOWLEDGE_URL="${url}"`;
 
   if (!url) {
-    lastKbDebug = "KNOWLEDGE_URL env var is empty.";
+    lastKbDebug += " | no URL set";
     return null;
   }
 
   try {
-    lastKbDebug = `Fetching URL: ${url}`;
     const res = await fetch(url, { cache: "no-store" });
+    lastKbDebug += ` | fetchStatus=${res.status}`;
 
     if (!res.ok) {
-      lastKbDebug = `Fetch failed: HTTP ${res.status} ${res.statusText} for ${url}`;
+      lastKbDebug += " | fetchNotOk";
       return null;
     }
 
     const txt = await res.text();
-    lastKbDebug = `Fetch OK (length=${txt.length}). Parsing JSON...`;
+    lastKbDebug += ` | bodyLength=${txt.length}`;
 
-    let json;
-    try {
-      json = JSON.parse(txt);
-    } catch (parseErr) {
-      lastKbDebug = `JSON parse error: ${parseErr?.message || String(parseErr)}`;
-      return null;
-    }
-
-    const keys = Object.keys(json || {});
-    lastKbDebug = `JSON parsed OK. Top-level keys: ${keys.join(", ") || "(none)"}`;
-
-    return json;
-  } catch (err) {
-    lastKbDebug = `Unexpected error while fetching knowledge: ${
-      err?.message || String(err)
-    }`;
+    const parsed = JSON.parse(txt);
+    lastKbDebug += " | jsonParsedOk";
+    return parsed;
+  } catch (e) {
+    lastKbDebug += ` | error=${String(e)}`;
     return null;
   }
 }
@@ -112,12 +101,16 @@ function buildKnowledgeContext(kb) {
 
   if (contents.length) {
     ctx +=
-      "KIT_CONTENTS_JSON = " + JSON.stringify(contents).slice(0, 6000) + "\n\n";
+      "KIT_CONTENTS_JSON = " +
+      JSON.stringify(contents).slice(0, 6000) +
+      "\n\n";
   }
 
   if (projects.length) {
     ctx +=
-      "KIT_PROJECTS_JSON = " + JSON.stringify(projects).slice(0, 6000) + "\n\n";
+      "KIT_PROJECTS_JSON = " +
+      JSON.stringify(projects).slice(0, 6000) +
+      "\n\n";
   }
 
   if (skills.length) {
@@ -158,23 +151,18 @@ export default async function handler(req, res) {
     if (input === "__debug_kb__") {
       return res.status(200).json({
         text:
-          "DEBUG KB\n" +
+          "DEBUG KB V2\n" +
           `hasKb: ${!!kb}\n` +
           `contentsCount: ${
             Array.isArray(kb?.contents) ? kb.contents.length : 0
           }\n` +
-          `firstContentName: ${
-            Array.isArray(kb?.contents) && kb.contents.length
-              ? kb.contents[0].name
-              : "NONE"
-          }\n\n` +
-          `env.KNOWLEDGE_URL: ${process.env.KNOWLEDGE_URL || "(empty)"}\n` +
-          `lastKbDebug: ${lastKbDebug}\n\n` +
+          `firstContentName: ${kb?.contents?.[0]?.name || "NONE"}\n` +
+          `lastKbDebug: ${lastKbDebug || "EMPTY"}\n\n` +
           "kbContextPreview:\n" +
           clampChars(kbContext, 400)
       });
     }
-    // -------------------------------------------------------------------------------
+    // --------------------------------------------------------------------------
 
     const guards = (product?.behavior?.guardrails || []).join(" | ");
 
