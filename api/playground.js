@@ -141,22 +141,8 @@ export default async function handler(req, res) {
       return res.status(403).json({ message: "Forbidden origin" });
     }
 
-   const { input = "", messages = [], attachment = null } = req.body || {};
-
-// Attachment support (image only for now)
-let att = null;
-if (attachment && typeof attachment === "object") {
-  const { kind, dataUrl, name } = attachment;
-  if (kind === "image" && isDataUrlImage(dataUrl)) {
-    if (String(dataUrl).length > 4_500_000) {
-      return res.status(400).json({ message: "Image too large" });
-    }
-    att = { kind: "image", dataUrl: String(dataUrl), name: String(name || "image") };
-  }
-}
-
-// allow either text OR attachment
-if (!String(input).trim() && !att) {
+const { input = "", messages = [], attachment = null } = req.body || {};
+if (!String(input).trim()) {
   return res.status(400).json({ message: "Empty input" });
 }
 
