@@ -1,7 +1,7 @@
 // api/playground.js
-// Simple Chat-style Playground for Robocoders Kit using structured JSON knowledge
+// Chat Playground for Robocoders Kit + image review (vision) via gpt-4o-mini
 
-const CHAT_URL = "https://api.openai.com/v1/chat/completions"; 
+const CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
 // Single product we support for now (we can extend to multiple later)
 const PRODUCT = {
@@ -41,6 +41,10 @@ function clampChars(s, max = 2000) {
   if (!s) return "";
   const str = String(s);
   return str.length > max ? str.slice(0, max) : str;
+}
+
+function isDataUrlImage(s) {
+  return typeof s === "string" && s.startsWith("data:image/");
 }
 
 /* ---------- Knowledge loader ---------- */
@@ -137,9 +141,21 @@ export default async function handler(req, res) {
       return res.status(403).json({ message: "Forbidden origin" });
     }
 
-    const { input = "", messages = [] } = req.body || {};
-    if (!input.trim()) {
+    const { input = "", messages = [], attachment = null } = req.body || {};
+    if (!String(input).trim()) {
       return res.status(400).json({ message: "Empty input" });
+    }
+
+    // Attachment support (image only for now)
+    let att = null;
+    if (attachment && typeof attachment === "object") {
+      const { kind, dataUrl, name } = attachment;
+      if (kind === "image" && isDataUrlImage(dataUrl)) {
+        if (String(dataUrl).length > 4_500_000) {
+          return res.status(400).json({ message: "Image too large" });
+        }
+        att = { kind: "image", dataUrl: String(dataUrl), name: String(name || "image") };
+      }
     }
 
     const product = PRODUCT;
@@ -147,22 +163,19 @@ export default async function handler(req, res) {
     const kb = await loadKnowledge();
     const kbContext = buildKnowledgeContext(kb);
 
-    // ---------- DEBUG: type "__debug_kb__" in the chat to inspect KB ----------
-    if (input === "__debug_kb__") {
+    // DEBUG: type "__debug_kb__"
+    if (String(input) === "__debug_kb__") {
       return res.status(200).json({
         text:
           "DEBUG KB V2\n" +
           `hasKb: ${!!kb}\n` +
-          `contentsCount: ${
-            Array.isArray(kb?.contents) ? kb.contents.length : 0
-          }\n` +
+          `contentsCount: ${Array.isArray(kb?.contents) ? kb.contents.length : 0}\n` +
           `firstContentName: ${kb?.contents?.[0]?.name || "NONE"}\n` +
           `lastKbDebug: ${lastKbDebug || "EMPTY"}\n\n` +
           "kbContextPreview:\n" +
           clampChars(kbContext, 400)
       });
     }
-    // --------------------------------------------------------------------------
 
     const guards = (product?.behavior?.guardrails || []).join(" | ");
 
@@ -183,6 +196,11 @@ STRICT RULES:
 - Use KIT_SKILLS if the user asks about skills.
 - Stay kid-safe and Indian-English friendly.
 - Always include a safety reminder for tools, electricity, motors, or heat.
+
+IMAGE RULES (if an image is attached):
+- First describe what you see in 1-2 lines.
+- Then answer the user’s question.
+- If the image shows wiring/tools/motors/electricity, remind adult supervision.
 
 Guardrails:
 ${guards}
@@ -206,6 +224,16 @@ ${kbContext}
       });
     }
 
+    const userMsg = att?.kind === "image"
+      ? {
+          role: "user",
+          content: [
+            { type: "text", text: String(input) },
+            { type: "image_url", image_url: { url: att.dataUrl } }
+          ]
+        }
+      : { role: "user", content: String(input) };
+
     const oai = await fetch(CHAT_URL, {
       method: "POST",
       headers: {
@@ -217,9 +245,9 @@ ${kbContext}
         messages: [
           { role: "system", content: sys },
           ...history,
-          { role: "user", content: input }
+          userMsg
         ],
-        max_tokens: 350,
+        max_tokens: 450,
         temperature: 0.4
       })
     });
