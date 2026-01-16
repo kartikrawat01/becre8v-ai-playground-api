@@ -3,7 +3,7 @@
 
 const OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations";
 
-/* -------------------- CORS -------------------- */
+/* ---------- CORS helpers (MATCH playground.js style) ---------- */
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -12,62 +12,69 @@ function origins() {
     .filter(Boolean);
 }
 
-function setCors(res, origin) {
-  // Always set these headers (even on errors)
+function allow(res, origin) {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
+  // IMPORTANT: Only allow known origins
+  if (!origin) return false;
+
   const list = origins();
 
-  // If no allowlist configured, keep it locked
-  if (!list.length) return { ok: false, reason: "ALLOWED_ORIGIN not set" };
+  // If allowlist is empty, block
+  if (!list.length) return false;
 
-  // For browser calls we require an Origin header
-  // (direct browser navigation to the endpoint has no Origin - that's normal)
-  if (!origin) return { ok: false, reason: "Missing Origin header" };
-
-  const ok = list.some((a) => origin.startsWith(a));
-  if (ok) res.setHeader("Access-Control-Allow-Origin", origin);
-
-  return { ok, reason: ok ? "ok" : `Origin not allowed: ${origin}` };
+  if (list.some((a) => origin.startsWith(a))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    return true;
+  }
+  return false;
 }
 
-/* -------------------- helpers -------------------- */
-
+/* ---------- helpers ---------- */
 function clamp(s, max = 500) {
   const t = String(s || "").trim();
   return t.length > max ? t.slice(0, max) : t;
 }
 
-/* -------------------- handler -------------------- */
-
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
-  const cors = setCors(res, origin);
 
-  // Preflight must always succeed (CORS headers already set above)
+  // OPTIONS preflight
   if (req.method === "OPTIONS") {
+    allow(res, origin);
     return res.status(204).end();
   }
 
-  // Only POST is allowed
-  if (req.method !== "POST") {
-    return res.status(405).json({
-      message:
-        "Method not allowed. Use POST from the AI Playground (this endpoint blocks direct browser opens)."
+  // DEBUG endpoint (so we can see exact env + origin reaching server)
+  // Open in browser: https://.../api/generate-image?debug=1
+  if (req.method === "GET" && req.query && req.query.debug === "1") {
+    const list = origins();
+    return res.status(200).json({
+      seenOrigin: origin || null,
+      allowedOriginEnv: process.env.ALLOWED_ORIGIN || "",
+      allowedOriginsParsed: list
     });
   }
 
-  // Block requests whose origin isn't in allowlist
-  if (!cors.ok) {
+  if (req.method !== "POST") {
+    allow(res, origin);
+    return res.status(405).json({ message: "Method not allowed" });
+  }
+
+  // CORS allow check
+  if (!allow(res, origin)) {
     return res.status(403).json({
       message: "Forbidden origin",
-      details: cors.reason
+      details: {
+        seenOrigin: origin || null,
+        allowedOriginEnv: process.env.ALLOWED_ORIGIN || ""
+      }
     });
   }
 
-  // Validate env key
+  // Env key check
   const apiKey = String(process.env.OPENAI_API_KEY || "").trim();
   if (!apiKey) {
     return res.status(500).json({ message: "Missing OPENAI_API_KEY" });
@@ -78,11 +85,9 @@ export default async function handler(req, res) {
     const p = clamp(prompt, 400);
     if (!p) return res.status(400).json({ message: "Prompt is required" });
 
-    // Kid-safe instruction wrapper
     const safePrompt = [
       "Create a kid-safe, playful illustration for children.",
-      "No violence, no adult content, no realistic faces of real people.",
-      "No copyrighted logos, no watermark, no readable text.",
+      "No violence, no adult content, no copyrighted logos, no watermark, no readable text.",
       "Bright colors, clean shapes, friendly style.",
       "",
       `Prompt: ${p}`
@@ -116,12 +121,8 @@ export default async function handler(req, res) {
       return res.status(500).json({ message: "No image returned" });
     }
 
-    // Return BOTH keys so frontend never mismatches
     const dataUrl = `data:image/png;base64,${b64}`;
-    return res.status(200).json({
-      dataUrl,
-      image: dataUrl
-    });
+    return res.status(200).json({ dataUrl, image: dataUrl });
   } catch (e) {
     return res.status(500).json({
       message: "Server error",
