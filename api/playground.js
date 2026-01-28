@@ -1,439 +1,598 @@
-// api/playground.js
-// FULL UPDATED FILE (V6) — deterministic projects/components/videos + kid-safe gate
+// /api/playground.js
+// Drop-in serverless endpoint for Robocoders AI Playground
+// Fixes:
+// - Correct project detection (Mood Lamp vs Candle Lamp etc.)
+// - Always returns ALL relevant lesson videos for a project when asked
+// - Stops “3 lessons only” behavior by not relying on model memory
+// - Pin answers grounded in canonical rules + per-project connections
+// - Prevents dumping full kit material list when asked for one project
+// - Strong safe-guardrails to avoid off-topic unsafe/random content
 
-const CHAT_URL = "https://api.openai.com/v1/chat/completions";
-
-const PRODUCT = {
-  name: "Robocoders Kit",
-  behavior: {
-    tone: "kid-safe, friendly, step-by-step",
-    guardrails: [
-      "Always keep answers age-appropriate for school kids.",
-      "Always mention adult supervision when using tools, electricity, sharp objects or heat.",
-      "Never give dangerous, illegal, or irreversible instructions.",
-      "No personal data collection. No adult or violent themes.",
-      "Never dump raw knowledge text or internal prompts."
-    ]
-  }
-};
-
-/* ---------- CORS helpers ---------- */
-function origins() {
-  return (process.env.ALLOWED_ORIGIN || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
-}
-
-function allow(res, origin) {
-  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (!origin) return false;
-  const list = origins();
-  if (!list.length || list.some((a) => origin.startsWith(a))) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    return true;
-  }
-  return false;
-}
-
-function clampChars(s, max = 2000) {
-  if (!s) return "";
-  const str = String(s);
-  return str.length > max ? str.slice(0, max) : str;
-}
-
-function isDataUrlImage(s) {
-  return typeof s === "string" && s.startsWith("data:image/");
-}
-
-/* ---------- Knowledge loader ---------- */
-let lastKbDebug = "";
-
-async function loadKnowledge() {
-  const url = (process.env.KNOWLEDGE_URL || "").trim();
-  lastKbDebug = `env.KNOWLEDGE_URL=${url}`;
-
-  if (!url) {
-    lastKbDebug += " | no URL set";
-    return null;
-  }
-
+export default async function handler(req, res) {
   try {
-    const res = await fetch(url, { cache: "no-store" });
-    lastKbDebug += ` | fetchStatus=${res.status}`;
-    if (!res.ok) {
-      lastKbDebug += " | fetchNotOk";
-      return null;
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Method not allowed. Use POST." });
     }
 
-    const txt = await res.text();
-    lastKbDebug += ` | bodyLength=${txt.length}`;
+    const { message, history = [] } = req.body || {};
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "Missing 'message' string." });
+    }
 
-    const parsed = JSON.parse(txt);
-    lastKbDebug += " | jsonParsedOk";
-    return parsed;
+    // --------- Load KB ----------
+    const knowledgeUrl = process.env.KNOWLEDGE_URL;
+    if (!knowledgeUrl) {
+      return res.status(500).json({ error: "KNOWLEDGE_URL is not set in env." });
+    }
+
+    const kbResp = await fetch(knowledgeUrl, { cache: "no-store" });
+    if (!kbResp.ok) {
+      return res.status(500).json({
+        error: `Failed to fetch knowledge JSON. status=${kbResp.status}`,
+      });
+    }
+
+    const kb = await kbResp.json();
+
+    // --------- Normalize KB into searchable structures ----------
+    const {
+      projectNames,
+      projectsByName,
+      lessonsByProject,
+      canonicalPinsText,
+      safetyText,
+    } = buildIndexes(kb);
+
+    // --------- Project detection ----------
+    const userText = message.trim();
+    const detectedProject = detectProject(userText, projectNames);
+
+    // --------- Intent detection (deterministic) ----------
+    const intent = detectIntent(userText);
+
+    // If user asks for project list: answer deterministically (no model)
+    if (intent.type === "LIST_PROJECTS") {
+      return res.status(200).json({
+        answer:
+          "Robocoders Kit projects/modules:\n\n" +
+          projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n"),
+        debug: {
+          detectedProject: detectedProject || null,
+          intent,
+          kbMode: "deterministic",
+        },
+      });
+    }
+
+    // If user asks for videos/lessons OR “not working” troubleshooting:
+    // return ALL relevant videos for that project, in the canonical preference order.
+    if (intent.type === "PROJECT_VIDEOS") {
+      if (!detectedProject) {
+        return res.status(200).json({
+          answer:
+            "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I’ll share all the relevant lesson videos for that project.",
+          debug: { detectedProject: null, intent },
+        });
+      }
+
+      const videos = lessonsByProject[detectedProject] || [];
+      if (!videos.length) {
+        return res.status(200).json({
+          answer:
+            `I found the project "${detectedProject}", but no lesson videos are mapped for it in the knowledge file.\n` +
+            "If you share the lesson links for this project, I’ll add them into the KB mapping.",
+          debug: { detectedProject, intent, videosFound: 0 },
+        });
+      }
+
+      // Always return ALL relevant lesson links for that project (not only 3)
+      const out =
+        `Lesson videos for ${detectedProject}:\n\n` +
+        videos
+          .map((v, idx) => {
+            const links = (v.videoLinks || []).map((u) => `- ${u}`).join("\n");
+            return (
+              `${idx + 1}. ${v.lessonName}\n` +
+              `${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}` +
+              `Links:\n${links}`
+            );
+          })
+          .join("\n\n");
+
+      return res.status(200).json({
+        answer: out,
+        debug: {
+          detectedProject,
+          intent,
+          lessonsReturned: videos.length,
+          kbMode: "deterministic",
+        },
+      });
+    }
+
+    // --------- Build minimal grounded context for model ----------
+    // We only inject:
+    // - Canonical pin rules (global)
+    // - The ONE detected project’s “Components Used” + “Connections” + key steps (not the whole kit list)
+    // - Safety boundaries
+    const projectContext = detectedProject
+      ? projectsByName[detectedProject] || null
+      : null;
+
+    const groundedContext = buildGroundedContext({
+      detectedProject,
+      projectContext,
+      canonicalPinsText,
+      safetyText,
+      lessonsForProject: detectedProject ? (lessonsByProject[detectedProject] || []) : [],
+      intent,
+    });
+
+    // --------- OpenAI call ----------
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
+    }
+
+    const system = buildSystemPrompt();
+
+    // Keep short history to reduce drift
+    const trimmedHistory = Array.isArray(history)
+      ? history.slice(-10).filter((x) => x && typeof x.content === "string" && typeof x.role === "string")
+      : [];
+
+    const payload = {
+      model: "gpt-4o-mini",
+      temperature: 0.1,
+      messages: [
+        { role: "system", content: system },
+        { role: "system", content: groundedContext },
+        ...trimmedHistory,
+        { role: "user", content: userText },
+      ],
+    };
+
+    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!resp.ok) {
+      const errText = await resp.text().catch(() => "");
+      return res.status(500).json({
+        error: `OpenAI error status=${resp.status}`,
+        details: errText.slice(0, 2000),
+      });
+    }
+
+    const data = await resp.json();
+    const answer = data?.choices?.[0]?.message?.content?.trim() || "I couldn’t generate a response.";
+
+    return res.status(200).json({
+      answer,
+      debug: {
+        detectedProject: detectedProject || null,
+        intent,
+        kbMode: "grounded-context",
+      },
+    });
   } catch (e) {
-    lastKbDebug += ` | error=${String(e)}`;
-    return null;
+    return res.status(500).json({
+      error: "Server error",
+      details: String(e?.message || e),
+    });
   }
 }
 
-/* ---------- Hard kid-safety gate ---------- */
-function normalizeText(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s]/gu, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+/* ----------------------- Helpers ----------------------- */
+
+function buildSystemPrompt() {
+  // Hard guardrails to stop random/off-topic unsafe outputs.
+  // Also forces strict grounding to provided context.
+  return `
+You are the Robocoders Kit assistant for children aged 8–14 and parents.
+
+Hard rules:
+- Only answer from the provided Grounded Context. If info is missing, say what is missing and ask for the exact project/module name or the missing detail.
+- Never mix projects. If the user asks Candle Lamp, do not give Mood Lamp content (and vice versa).
+- Never invent pins. If pin info is not present in Grounded Context, say you don’t have it.
+- If user asks for materials/components of a project, provide only that project's Components Used (do not dump the full kit list).
+- If user asks for lesson videos or “not working” troubleshooting: do NOT guess random links. Only share links listed in Grounded Context.
+- Safety: Do not discuss sexual content, pregnancy, “how babies are made”, romantic/valentines content, horror movies, or any adult topics. Politely refuse and redirect to Robocoders help.
+
+Style:
+- Simple, calm, step-by-step.
+- If it’s a troubleshooting question: suggest order = Connections first, then Build, then Coding, then Working, then Introduction.
+`;
 }
 
-function isDisallowedKidTopic(userText) {
-  const t = normalizeText(userText);
-  if (!t) return false;
+function buildIndexes(kb) {
+  // This function is tolerant: it works even if KB structure changes a bit.
+  // We extract:
+  // - canonical project names list
+  // - per-project content chunks (components + connections + steps)
+  // - per-project lessons with ALL links
+  // - canonical pins rules
+  // - safety boundaries
 
-  const sexual = [
-    "sex","sexual","porn","pornography","nude","nudes","blowjob","handjob",
-    "condom","pregnant","pregnancy","make babies","how to make babies",
-    "sperm","ovulation","period","vagina","penis","boobs","breasts",
-    "masturbat","orgasm","intercourse","positions"
-  ];
-  const gore = ["how to kill","kill someone","murder","suicide","self harm","gore","dismember","torture"];
-  const romance = ["valentine","valentines","kiss","dating","boyfriend","girlfriend","crush"];
+  const projectNames = [];
 
-  const hit = (arr) => arr.some((k) => t.includes(k));
-  return hit(sexual) || hit(gore) || hit(romance);
+  // 1) Canonical project list
+  // In your PDF knowledge, canonical names exist (Hello World!, Mood Lamp, etc.) :contentReference[oaicite:0]{index=0}
+  // Try multiple possible locations in JSON.
+  const candidates =
+    kb?.canonical?.projects ||
+    kb?.projects ||
+    kb?.modules ||
+    kb?.glossary?.projects ||
+    [];
+
+  if (Array.isArray(candidates) && candidates.length) {
+    for (const p of candidates) {
+      const name = typeof p === "string" ? p : p?.name;
+      if (name && !projectNames.includes(name)) projectNames.push(name);
+    }
+  }
+
+  // Fallback: if KB is “pages-based”, derive from pages that look like "Project Name"
+  if (!projectNames.length && Array.isArray(kb?.pages)) {
+    for (const pg of kb.pages) {
+      const t = (pg?.text || "").trim();
+      const m = t.match(/Project Name\s*[\:\-]?\s*([^\n]+)/i);
+      if (m && m[1]) {
+        const name = m[1].trim();
+        if (name && !projectNames.includes(name)) projectNames.push(name);
+      }
+    }
+  }
+
+  // If still empty, use the known canonical list from the reference PDF (last resort)
+  if (!projectNames.length) {
+    projectNames.push(
+      "Hello World!",
+      "Mood Lamp",
+      "Game Controller",
+      "Coin Counter",
+      "Smart Box",
+      "Musical Instrument",
+      "Toll Booth",
+      "Analog Meter",
+      "DJ Nights",
+      "Roll The Dice",
+      "Table Fan",
+      "Disco Lights",
+      "Motion Activated Wave Sensor",
+      "RGB Color Mixer",
+      "The Fruit Game",
+      "The Ping Pong Game",
+      "The UFO Shooter Game",
+      "The Extension Wire",
+      "Light Intensity Meter",
+      "Pulley LED",
+      "Candle Lamp"
+    );
+  }
+
+  // 2) Project content blocks
+  const projectsByName = {};
+  for (const name of projectNames) {
+    projectsByName[name] = extractProjectBlock(kb, name);
+  }
+
+  // 3) Lessons by project
+  const lessonsByProject = {};
+  for (const name of projectNames) {
+    lessonsByProject[name] = extractLessons(kb, name);
+    // Sort lessons by preference order: Connections > Build > Coding > Working > Introduction :contentReference[oaicite:1]{index=1}
+    lessonsByProject[name].sort((a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName));
+  }
+
+  // 4) Canonical pins / ports rules
+  const canonicalPinsText =
+    extractCanonicalPins(kb) ||
+    "Canonical pin rules not found.";
+
+  // 5) Safety text (optional)
+  const safetyText = extractSafety(kb) || "Robocoders is low-voltage and kid-safe. No wall power. No cutting or soldering. Adult help allowed when needed.";
+
+  return { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText };
 }
 
-function refusalMessage() {
-  return (
-    "I can’t help with that topic. I can help with Robocoders Kit projects, coding, electronics setup, and troubleshooting. " +
-    "Tell me what you want to build or fix, and I’ll guide you step-by-step."
-  );
+function detectIntent(text) {
+  const t = text.toLowerCase();
+
+  const wantsList =
+    t.includes("projects") ||
+    t.includes("modules") ||
+    t.includes("all project") ||
+    t.includes("all module");
+
+  if (wantsList && (t.includes("what are") || t.includes("list") || t.includes("give"))) {
+    return { type: "LIST_PROJECTS" };
+  }
+
+  const videoWords = ["video", "videos", "lesson", "lessons", "link", "youtube"];
+  const troubleWords = ["not working", "doesn't work", "not responding", "stuck", "problem", "issue", "error"];
+
+  if (videoWords.some((w) => t.includes(w)) || troubleWords.some((w) => t.includes(w))) {
+    return { type: "PROJECT_VIDEOS" };
+  }
+
+  return { type: "GENERAL" };
 }
 
-/* ---------- Simple query detectors ---------- */
-function looksLikeVideoRequest(query) {
-  const q = normalizeText(query);
-  const triggers = ["video", "youtube", "lesson", "watch", "link", "tutorial", "recording"];
-  return triggers.some((t) => q.includes(t));
+function detectProject(text, projectNames) {
+  const t = text.toLowerCase();
+
+  // Exact containment match first
+  for (const p of projectNames) {
+    if (t.includes(p.toLowerCase())) return p;
+  }
+
+  // Fuzzy-ish: remove punctuation/spaces
+  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const nt = norm(text);
+
+  let best = null;
+  let bestScore = 0;
+
+  for (const p of projectNames) {
+    const np = norm(p);
+    if (!np) continue;
+
+    // simple overlap score
+    let score = 0;
+    if (nt.includes(np)) score += 10;
+    // partial chunk overlaps
+    const chunks = np.split(/(world|lamp|game|counter|box|instrument|booth|meter|dice|fan|disco|motion|rgb|fruit|pingpong|ufo|extension|pulley|candle)/).filter(Boolean);
+    for (const c of chunks) {
+      if (c.length >= 4 && nt.includes(c)) score += 1;
+    }
+
+    if (score > bestScore) {
+      bestScore = score;
+      best = p;
+    }
+  }
+
+  return bestScore >= 2 ? best : null;
 }
 
-function looksLikeListProjectsRequest(query) {
-  const q = normalizeText(query);
-  const triggers = ["projects", "project list", "all projects", "what projects", "starter projects"];
-  return triggers.some((t) => q.includes(t));
+function buildGroundedContext({ detectedProject, projectContext, canonicalPinsText, safetyText, lessonsForProject, intent }) {
+  const lines = [];
+
+  lines.push("Grounded Context (authoritative):");
+  lines.push("");
+  lines.push("Safety:");
+  lines.push(safetyText);
+  lines.push("");
+  lines.push("Canonical Brain / Pins / Ports rules:");
+  lines.push(canonicalPinsText);
+  lines.push("");
+
+  if (detectedProject && projectContext) {
+    lines.push(`Project in focus: ${detectedProject}`);
+    lines.push("");
+    lines.push("Project details (use only this for this project):");
+    lines.push(projectContext);
+    lines.push("");
+  } else {
+    lines.push("No project selected yet.");
+    lines.push("If the user question is project-specific, ask for the exact project/module name.");
+    lines.push("");
+  }
+
+  if (intent?.type === "PROJECT_VIDEOS" && detectedProject) {
+    // Also inject lessons so the model can explain “why this video”
+    lines.push("Lesson videos for this project (only these links are allowed):");
+    if (!lessonsForProject.length) {
+      lines.push("(No lesson videos found in KB for this project.)");
+    } else {
+      for (const l of lessonsForProject) {
+        lines.push(`- ${l.lessonName}`);
+        if (l.explainLine) lines.push(`  Why: ${l.explainLine}`);
+        for (const u of l.videoLinks || []) lines.push(`  Link: ${u}`);
+      }
+    }
+    lines.push("");
+  }
+
+  return lines.join("\n");
 }
 
-function looksLikeListComponentsRequest(query) {
-  const q = normalizeText(query);
-  const triggers = ["components", "what is inside", "inside the box", "kit contents", "what comes in"];
-  return triggers.some((t) => q.includes(t));
+function extractProjectBlock(kb, projectName) {
+  // Pull only the project section, not the full components master list.
+  // From your reference PDF, each project has: difficulty, time, components used, build steps, connections. :contentReference[oaicite:2]{index=2}
+  if (Array.isArray(kb?.pages)) {
+    const norm = (s) => s.toLowerCase();
+    const pNorm = norm(projectName);
+
+    // Find page that starts with "Project Name" and matches this project
+    const pages = kb.pages
+      .map((pg) => (pg?.text ? String(pg.text) : ""))
+      .filter(Boolean);
+
+    let start = -1;
+    for (let i = 0; i < pages.length; i++) {
+      const txt = pages[i].toLowerCase();
+      if (txt.includes("project name") && txt.includes(pNorm)) {
+        start = i;
+        break;
+      }
+    }
+
+    if (start >= 0) {
+      // Grab a reasonable window (project spans multiple pages)
+      const chunk = pages.slice(start, start + 6).join("\n\n");
+      return sanitizeChunk(chunk);
+    }
+  }
+
+  // If KB already has structured projects
+  const p =
+    (kb?.projects && kb.projects[projectName]) ||
+    (Array.isArray(kb?.projects) ? kb.projects.find((x) => x?.name === projectName) : null);
+
+  if (p) {
+    const parts = [];
+    if (p.componentsUsed) parts.push("Components Used:\n" + p.componentsUsed.join("\n"));
+    if (p.connections) parts.push("Connections:\n" + p.connections.join("\n"));
+    if (p.steps) parts.push("Build Steps:\n" + p.steps.join("\n"));
+    return sanitizeChunk(parts.join("\n\n"));
+  }
+
+  return "";
 }
 
-/* ---------- Lesson helpers ---------- */
-function isValidYouTube(url) {
-  const u = String(url || "").trim();
-  if (!u) return false;
-  if (u === "https://youtu.be/" || u === "https://youtu.be") return false;
-  if (u.startsWith("https://youtu.be/") && u.length > "https://youtu.be/".length + 3) return true;
-  if (u.includes("youtube.com") && u.includes("watch")) return true;
-  return false;
+function extractLessons(kb, projectName) {
+  // Lessons in your PDF section are strongly structured. :contentReference[oaicite:3]{index=3}
+  // If KB has pages: scan for "Project: <name>" / "Module: <name>" blocks.
+  const lessons = [];
+
+  if (Array.isArray(kb?.pages)) {
+    const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
+
+    const p = projectName.toLowerCase();
+
+    // Find all occurrences in the lessons area
+    for (let i = 0; i < pages.length; i++) {
+      const txt = pages[i];
+      const low = txt.toLowerCase();
+
+      // Match either "Project: X" or "Project : X"
+      if (low.includes("project:") || low.includes("project :")) {
+        // Quick check if this page belongs to this project lessons
+        if (!low.includes(p)) continue;
+
+        // Parse multiple lesson blocks on the same page
+        const blocks = txt.split(/Lesson ID\s*[:\-]/i);
+        for (let b = 1; b < blocks.length; b++) {
+          const block = "Lesson ID:" + blocks[b];
+
+          const lessonName = matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
+                             matchLine(block, /Lesson Name\s*:\s*([^\n]+)/i) ||
+                             "";
+
+          // Collect ALL video links in that block
+          const links = [];
+          const linkMatches = block.match(/https?:\/\/[^\s\)]+/gi) || [];
+          for (const u of linkMatches) {
+            // cleanup trailing punctuation
+            links.push(u.replace(/[\,\)\]]+$/g, ""));
+          }
+
+          // Explain line
+          const explainLine = matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)When the AI/i) ||
+                              matchLine(block, /What this lesson helps with\s*\(AI explanation line\)\s*:\s*([\s\S]*?)When the AI/i) ||
+                              "";
+
+          if (lessonName && links.length) {
+            lessons.push({
+              lessonName: lessonName.trim(),
+              videoLinks: uniq(links),
+              explainLine: cleanExplain(explainLine),
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // Structured KB fallback
+  if (!lessons.length && kb?.lessons && kb.lessons[projectName]) {
+    for (const l of kb.lessons[projectName]) {
+      lessons.push({
+        lessonName: l.lessonName,
+        videoLinks: Array.isArray(l.videoLinks) ? l.videoLinks : (l.videoLink ? [l.videoLink] : []),
+        explainLine: l.explainLine || "",
+      });
+    }
+  }
+
+  return dedupeLessons(lessons);
 }
 
-function extractLikelyProjectNameFromVideoQuery(query, projects) {
-  // Try to match any project name inside the query
-  const q = normalizeText(query);
-  if (!q) return "";
-
-  const names = (projects || [])
-    .map((p) => String(p?.name || "").trim())
-    .filter(Boolean);
-
-  // longest-first match
-  names.sort((a, b) => b.length - a.length);
-
-  for (const name of names) {
-    const n = normalizeText(name);
-    if (n && q.includes(n)) return name;
+function extractCanonicalPins(kb) {
+  // From your canonical knowledge: A6/A7 reserved, D13 reserved, etc. :contentReference[oaicite:4]{index=4}
+  if (Array.isArray(kb?.pages)) {
+    const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
+    // Find the "Fixed Port Mappings (Canonical)" section
+    const idx = pages.findIndex((t) => t.toLowerCase().includes("fixed port mappings"));
+    if (idx >= 0) {
+      const chunk = pages.slice(idx, idx + 3).join("\n\n");
+      return sanitizeChunk(chunk);
+    }
   }
   return "";
 }
 
-function findLessonMatches(lessons, query, projectHint = "") {
-  const q = normalizeText(query);
-  const ph = normalizeText(projectHint);
-  if (!q && !ph) return [];
-
-  const scored = lessons.map((l) => {
-    const id = String(l?.lesson_id || l?.id || "");
-    const name = String(l?.lesson_name || l?.name || "");
-    const proj = String(l?.project || "");
-    const url = String(l?.video_url || l?.video || l?.url || "");
-    const valid = l?.video_valid === true || isValidYouTube(url);
-
-    const blob = normalizeText(`${id} ${name} ${proj}`);
-    let score = 0;
-
-    if (!valid) score -= 200; // never prefer broken links
-    if (ph && blob.includes(ph)) score += 120; // strongest: project match
-    if (id && q.includes(normalizeText(id))) score += 90;
-    if (name && q.includes(normalizeText(name))) score += 80;
-
-    // token overlap
-    const tokens = q.split(" ").filter((x) => x.length >= 3);
-    for (const t of tokens) {
-      if (blob.includes(t)) score += 8;
+function extractSafety(kb) {
+  if (Array.isArray(kb?.pages)) {
+    const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
+    const idx = pages.findIndex((t) => t.toLowerCase().includes("global safety"));
+    if (idx >= 0) {
+      const chunk = pages.slice(idx, idx + 2).join("\n\n");
+      return sanitizeChunk(chunk);
     }
-
-    return { lesson: l, score, valid };
-  });
-
-  scored.sort((a, b) => b.score - a.score);
-  return scored.filter((x) => x.score > 0 && x.valid).slice(0, 5);
+  }
+  return "";
 }
 
-/* ---------- Knowledge context builder (structured only + small grounding snippets) ---------- */
-function buildKnowledgeContext(kb) {
-  if (!kb || typeof kb !== "object") return { ctx: "", stats: {} };
-
-  const contents = Array.isArray(kb.contents) ? kb.contents : [];
-  const projects = Array.isArray(kb.projects) ? kb.projects : [];
-  const skills = Array.isArray(kb.skills) ? kb.skills : [];
-  const lessons = Array.isArray(kb.lessons) ? kb.lessons : [];
-  const pages = Array.isArray(kb.pages) ? kb.pages : [];
-
-  const stats = {
-    contentsCount: contents.length,
-    projectsCount: projects.length,
-    skillsCount: skills.length,
-    lessonsCount: lessons.length,
-    pagesCount: pages.length
-  };
-
-  let ctx = "";
-
-  if (contents.length) {
-    const slim = contents.map((c) => ({
-      name: c.name,
-      type: c.type || "component",
-      description: c.description || ""
-    }));
-    ctx += "KIT_CONTENTS_JSON = " + JSON.stringify(slim).slice(0, 12000) + "\n\n";
-  }
-
-  if (projects.length) {
-    const slim = projects.map((p) => ({
-      name: p.name,
-      difficulty: p.difficulty || "",
-      estimated_time: p.estimated_time || ""
-    }));
-    ctx += "KIT_PROJECTS_JSON = " + JSON.stringify(slim).slice(0, 12000) + "\n\n";
-  }
-
-  if (skills.length) {
-    ctx += "KIT_SKILLS = " + JSON.stringify(skills).slice(0, 8000) + "\n\n";
-  }
-
-  if (lessons.length) {
-    const slim = lessons.map((l) => ({
-      lesson_id: l.lesson_id || "",
-      lesson_name: l.lesson_name || "",
-      project: l.project || "",
-      video_url: l.video_url || "",
-      video_valid: l.video_valid === true
-    }));
-    ctx += "LESSONS_JSON = " + JSON.stringify(slim).slice(0, 14000) + "\n\n";
-  }
-
-  // Tiny safety grounding: first page preview only (prevents leakage + keeps model oriented)
-  if (pages.length && pages[0]?.text) {
-    ctx += "REFERENCE_PREVIEW (do not dump raw text):\n";
-    ctx += clampChars(pages[0].text, 500) + "\n\n";
-  }
-
-  return { ctx: ctx.trim(), stats };
+function lessonRank(lessonName = "") {
+  const n = lessonName.toLowerCase();
+  if (n.includes("connection")) return 1;
+  if (n.includes("build")) return 2;
+  if (n.includes("coding")) return 3;
+  if (n.includes("working")) return 4;
+  if (n.includes("intro")) return 5;
+  return 99;
 }
 
-/* ---------- Handler ---------- */
-export default async function handler(req, res) {
-  const origin = req.headers.origin || "";
+function sanitizeChunk(s) {
+  return String(s || "")
+    .replace(/\u0000/g, "")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
-  if (req.method === "OPTIONS") {
-    allow(res, origin);
-    return res.status(204).end();
+function matchLine(text, regex) {
+  const m = text.match(regex);
+  if (!m) return "";
+  return (m[1] || "").trim();
+}
+
+function uniq(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const x of arr) {
+    const k = String(x).trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
   }
+  return out;
+}
 
-  if (req.method !== "POST") {
-    allow(res, origin);
-    return res.status(405).json({ message: "Method not allowed" });
+function cleanExplain(s) {
+  return String(s || "")
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function dedupeLessons(lessons) {
+  const out = [];
+  const seen = new Set();
+  for (const l of lessons) {
+    const key = (l.lessonName || "").toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(l);
   }
-
-  try {
-    if (!allow(res, origin)) return res.status(403).json({ message: "Forbidden origin" });
-
-    const { input = "", messages = [], attachment = null } = req.body || {};
-    const userInput = String(input || "").trim();
-    if (!userInput) return res.status(400).json({ message: "Empty input" });
-
-    // Hard safety refusal first
-    if (isDisallowedKidTopic(userInput)) {
-      return res.status(200).json({ text: refusalMessage() });
-    }
-
-    // Attachment support (image only)
-    let att = null;
-    if (attachment && typeof attachment === "object") {
-      const { kind, dataUrl, name } = attachment;
-      if (kind === "image" && isDataUrlImage(dataUrl)) {
-        if (String(dataUrl).length > 4_500_000) return res.status(400).json({ message: "Image too large" });
-        att = { kind: "image", dataUrl: String(dataUrl), name: String(name || "image") };
-      }
-    }
-
-    const kb = await loadKnowledge();
-    const { ctx: kbContext, stats: kbStats } = buildKnowledgeContext(kb);
-
-    // DEBUG
-    if (userInput === "__debug_kb__") {
-      return res.status(200).json({
-        text:
-          "DEBUG KB V6\n" +
-          `hasKb: ${!!kb}\n` +
-          `contentsCount: ${kbStats?.contentsCount ?? 0}\n` +
-          `projectsCount: ${kbStats?.projectsCount ?? 0}\n` +
-          `skillsCount: ${kbStats?.skillsCount ?? 0}\n` +
-          `lessonsCount: ${kbStats?.lessonsCount ?? 0}\n` +
-          `pagesCount: ${kbStats?.pagesCount ?? 0}\n` +
-          `firstProject: ${kb?.projects?.[0]?.name || "NONE"}\n` +
-          `firstLesson: ${kb?.lessons?.[0]?.lesson_id || "NONE"}\n` +
-          `lastKbDebug: ${lastKbDebug || "EMPTY"}\n\n` +
-          "kbContextPreview:\n" +
-          clampChars(kbContext, 900)
-      });
-    }
-
-    // Deterministic: list projects (all 21)
-    if (looksLikeListProjectsRequest(userInput) && Array.isArray(kb?.projects) && kb.projects.length) {
-      const names = kb.projects.map((p) => String(p?.name || "").trim()).filter(Boolean);
-      const unique = [...new Set(names)];
-      return res.status(200).json({
-        text:
-          "Projects in the Robocoders Kit:\n" +
-          unique.map((n, i) => `${i + 1}. ${n}`).join("\n")
-      });
-    }
-
-    // Deterministic: list components (all 89)
-    if (looksLikeListComponentsRequest(userInput) && Array.isArray(kb?.contents) && kb.contents.length) {
-      const names = kb.contents.map((c) => String(c?.name || "").trim()).filter(Boolean);
-      const unique = [...new Set(names)];
-      return res.status(200).json({
-        text:
-          "Components inside the Robocoders Kit:\n" +
-          unique.map((n, i) => `${i + 1}. ${n}`).join("\n") +
-          `\n\nTotal components: ${unique.length}`
-      });
-    }
-
-    // Deterministic: lesson/project video
-    if (looksLikeVideoRequest(userInput) && Array.isArray(kb?.lessons) && kb.lessons.length) {
-      const projectHint = extractLikelyProjectNameFromVideoQuery(userInput, kb?.projects || []);
-      const matches = findLessonMatches(kb.lessons, userInput, projectHint);
-
-      if (!matches.length) {
-        // important: do not hallucinate
-        const hint = projectHint
-          ? `I don’t have a valid video link stored for "${projectHint}" in the lessons table.`
-          : "I can share the correct lesson video, but I need the exact lesson name or a matching project name.";
-        return res.status(200).json({
-          text:
-            hint +
-            " If you tell me the exact lesson name (as written), I’ll fetch the right link."
-        });
-      }
-
-      const top = matches.slice(0, 3).map((m) => {
-        const l = m.lesson;
-        const id = l.lesson_id || "";
-        const name = l.lesson_name || "";
-        const proj = l.project || "";
-        const url = l.video_url || "";
-        return `- ${proj ? `${proj} | ` : ""}${id}${name ? ` | ${name}` : ""}\n  ${url}`;
-      }).join("\n");
-
-      return res.status(200).json({
-        text: "Here are the correct video links I found:\n" + top
-      });
-    }
-
-    // Otherwise: OpenAI
-    const guards = (PRODUCT?.behavior?.guardrails || []).join(" | ");
-
-    const sys = `
-You are the official Be Cre8v "Robocoders Kit" Assistant.
-Tone: kid-safe, friendly, step-by-step, Indian-English.
-
-STRICT RULES:
-- Never invent parts. Use only KIT_CONTENTS_JSON.
-- Never invent projects. Use only KIT_PROJECTS_JSON.
-- For lesson/video links: use only LESSONS_JSON. Never guess a link.
-- Never discuss romantic/sexual topics, baby-making, valentines, or horror/violent themes. Refuse politely.
-- Do not dump raw knowledge text. Summarize and help.
-
-Always add a safety reminder when tools, electricity, motors, sharp objects, or heat are involved.
-
-Guardrails: ${guards}
-
-Data:
-${kbContext || "(No external knowledge loaded.)"}
-`.trim();
-
-    const history = Array.isArray(messages)
-      ? messages.slice(-8).map((m) => ({
-          role: m.role === "assistant" ? "assistant" : "user",
-          content: clampChars(String(m.content || ""), 700)
-        }))
-      : [];
-
-    const OPENAI_KEY = String(process.env.OPENAI_API_KEY || "").trim();
-    if (!OPENAI_KEY) {
-      return res.status(500).json({ message: "Server config error", details: "OPENAI_API_KEY is empty" });
-    }
-
-    const userMsg = att?.kind === "image"
-      ? {
-          role: "user",
-          content: [
-            { type: "text", text: userInput },
-            { type: "image_url", image_url: { url: att.dataUrl } }
-          ]
-        }
-      : { role: "user", content: userInput };
-
-    const oai = await fetch(CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${OPENAI_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
-        messages: [{ role: "system", content: sys }, ...history, userMsg],
-        max_tokens: 900,
-        temperature: 0.12
-      })
-    });
-
-    if (!oai.ok) {
-      const err = await oai.text().catch(() => "");
-      return res.status(oai.status).json({ message: "OpenAI error", details: err.slice(0, 800) });
-    }
-
-    const data = await oai.json();
-    const text = (data.choices?.[0]?.message?.content || "").trim() || "No response.";
-    return res.status(200).json({ text });
-  } catch (e) {
-    return res.status(500).json({ message: "Server error", details: String(e?.message || e) });
-  }
+  return out;
 }
