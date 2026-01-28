@@ -1,5 +1,5 @@
 // api/generate-image.js
-// Image generation endpoint for Be Cre8v AI Playground (kid-safe)
+// Image generation endpoint for Be Cre8v AI Playground (kid-safe + worksheet-ready + more realistic by default)
 
 const OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations";
 
@@ -16,36 +16,48 @@ function allow(res, origin) {
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
   if (!origin) return false;
-
   const list = origins();
-  // If no list is set, allow all (optional). You can remove this if you want strict mode only.
-  if (!list.length) {
+  if (!list.length || list.some((a) => origin.startsWith(a))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     return true;
   }
-
-  if (list.some((a) => origin === a || origin.startsWith(a))) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    return true;
-  }
-
   return false;
 }
 
-// Works even when req.body is undefined (common in some serverless setups)
-async function readJsonBody(req) {
-  if (req.body && typeof req.body === "object") return req.body;
+function isWorksheetPrompt(p) {
+  const t = String(p || "").toLowerCase();
+  return [
+    "worksheet",
+    "printable",
+    "printable sheet",
+    "activity sheet",
+    "workbook",
+    "quiz sheet",
+    "exercise sheet",
+    "practice sheet",
+    "lesson sheet",
+    "handout",
+    "pdf",
+    "a4",
+    "classroom",
+  ].some((k) => t.includes(k));
+}
 
-  const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
-  const raw = Buffer.concat(chunks).toString("utf8");
-
-  if (!raw) return {};
-  try {
-    return JSON.parse(raw);
-  } catch {
-    return {};
-  }
+function wantsCartoonStyle(p) {
+  const t = String(p || "").toLowerCase();
+  return [
+    "cartoon",
+    "animated",
+    "anime",
+    "illustration",
+    "vector",
+    "flat",
+    "comic",
+    "pixar",
+    "kids style",
+    "storybook",
+    "cute",
+  ].some((k) => t.includes(k));
 }
 
 export default async function handler(req, res) {
@@ -57,11 +69,7 @@ export default async function handler(req, res) {
   }
 
   if (!allow(res, origin)) {
-    return res.status(403).json({
-      message: "Forbidden origin",
-      origin,
-      allowed: origins(),
-    });
+    return res.status(403).json({ message: "Forbidden origin", origin, allowed: origins() });
   }
 
   if (req.method !== "POST") {
@@ -69,14 +77,9 @@ export default async function handler(req, res) {
   }
 
   try {
-    const body = await readJsonBody(req);
-    const prompt = body?.prompt;
-
+    const { prompt } = req.body || {};
     if (!prompt || !String(prompt).trim()) {
-      return res.status(400).json({
-        message: "Prompt is required",
-        got: typeof prompt,
-      });
+      return res.status(400).json({ message: "Prompt is required" });
     }
 
     const apiKey = process.env.OPENAI_API_KEY;
@@ -84,12 +87,45 @@ export default async function handler(req, res) {
       return res.status(500).json({ message: "Missing OPENAI_API_KEY" });
     }
 
-    const safePrompt = `
-Kid-safe illustration for children.
-No text, no watermark, no logos.
-Bright colors, friendly style.
-No scary, violent, or unsafe content.
+    const worksheetMode = isWorksheetPrompt(prompt);
+    const keepCartoon = wantsCartoonStyle(prompt);
 
+    const size = worksheetMode ? "1024x1024" : "1024x1024";
+
+    const baseRules = `
+Kid-safe image for children and families.
+No hateful content, no nudity, no sexual content, no violence/gore.
+No text watermark, no logos, no brand names.
+`.trim();
+
+    const styleRules = worksheetMode
+      ? `
+Make a printable worksheet page layout.
+A4 portrait feel, clean white background, neat margins.
+Clear section boxes with headings and spaces for writing.
+High contrast, printer friendly (minimal color accents).
+Simple small icons/illustrations only as decoration.
+Keep text short and large (avoid tiny paragraphs).
+`.trim()
+      : `
+Make it look high quality and not cartoon by default.
+Photorealistic or semi-realistic, natural lighting, clean composition.
+Avoid exaggerated cartoon outlines.
+`.trim();
+
+    const finalStyleRules = keepCartoon && !worksheetMode
+      ? `
+Friendly illustrated style is allowed because the user asked for it.
+Still: no watermark, no logos, no text overlay unless the user explicitly requests text.
+`.trim()
+      : styleRules;
+
+    const safePrompt = `
+${baseRules}
+
+${finalStyleRules}
+
+User request:
 ${String(prompt).trim()}
 `.trim();
 
@@ -102,25 +138,15 @@ ${String(prompt).trim()}
       body: JSON.stringify({
         model: "gpt-image-1",
         prompt: safePrompt,
-        size: "1024x1024",
-        // Smaller payloads than PNG (often fixes hosting/proxy limits)
-        output_format: "webp",
-        // quality can be "low"|"medium"|"high" or "auto" depending on docs; keep auto-safe:
-        quality: "auto",
-        n: 1,
+        size,
       }),
     });
 
-    const openaiRequestId =
-      r.headers.get("x-request-id") || r.headers.get("request-id") || null;
-
     if (!r.ok) {
-      const errText = await r.text();
+      const err = await r.text();
       return res.status(r.status).json({
         message: "Image API error",
-        status: r.status,
-        openai_request_id: openaiRequestId,
-        details: errText.slice(0, 1500),
+        details: err.slice(0, 800),
       });
     }
 
@@ -128,22 +154,21 @@ ${String(prompt).trim()}
 
     const imageBase64 = data?.data?.[0]?.b64_json;
     if (!imageBase64) {
-      return res.status(500).json({
-        message: "No image returned",
-        openai_request_id: openaiRequestId,
-        raw_keys: Object.keys(data || {}),
-      });
+      return res.status(500).json({ message: "No image returned" });
     }
 
+    // Most responses are usable as PNG; if OpenAI returns webp, browser will still render it.
+    // We return a data URL and a filename so frontend can download.
+    const mime = worksheetMode ? "image/png" : "image/png";
+    const filename = worksheetMode ? "worksheet.png" : "image.png";
+
     return res.status(200).json({
-      // Match output_format above
-      image: `data:image/webp;base64,${imageBase64}`,
-      openai_request_id: openaiRequestId,
+      image: `data:${mime};base64,${imageBase64}`,
+      filename,
+      openai_request_id: data?.openai_request_id || null,
+      meta: { worksheetMode, size },
     });
   } catch (e) {
-    return res.status(500).json({
-      message: "Server error",
-      details: String(e),
-    });
+    return res.status(500).json({ message: "Server error", details: String(e?.message || e) });
   }
 }
