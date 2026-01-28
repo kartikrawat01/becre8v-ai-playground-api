@@ -1,5 +1,6 @@
 // api/generate-image.js
-// Image generation endpoint for Be Cre8v AI Playground (kid-safe) - single page only
+// Be Cre8v AI Playground — Image Generation (kid-safe)
+// Focus: premium, highly-informational, A4 single-page worksheets (vintage / illustrated style)
 
 const OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations";
 
@@ -31,11 +32,13 @@ function looksLikeWorksheet(prompt) {
     p.includes("printable") ||
     p.includes("sheet") ||
     p.includes("activity") ||
-    p.includes("fill in") ||
-    p.includes("quiz") ||
     p.includes("mcq") ||
+    p.includes("quiz") ||
     p.includes("match") ||
     p.includes("timeline") ||
+    p.includes("cause") ||
+    p.includes("effect") ||
+    p.includes("compare") ||
     p.includes("critical thinking")
   );
 }
@@ -70,44 +73,67 @@ export default async function handler(req, res) {
     const isWorksheet = looksLikeWorksheet(prompt);
 
     const safety = `
-Kid-safe content for children.
-No sexual content. No gore. No weapons instructions.
+Kid-safe educational content for children.
+No sexual content. No gore. No violence instructions.
 No watermark. No logos.
 `.trim();
 
-    const realisticStyle = `
-Style:
-- high quality, realistic (not cartoon), natural lighting
-- warm, child-friendly, but realistic
-- clean composition, sharp details
-- no exaggerated anime/cartoon look
+    // This is the key: push style + layout + density HARD
+    const premiumVintageWorksheet = `
+Create ONE SINGLE PAGE printable worksheet (A4 portrait).
+Make it extremely beautiful and premium, like a museum-style illustrated worksheet / vintage parchment poster.
+
+Visual style (very important):
+- vintage parchment paper background with subtle texture
+- warm earthy palette (tan, sepia, muted reds/greens/blues)
+- decorative header banner, small icons, elegant borders/dividers
+- high-quality hand-painted illustration style (not cartoon), like an old history book illustration
+- very aesthetic, balanced, professional layout, lots of visual polish
+
+Layout rules:
+- single page only, no multi-page, no repeated pages
+- clean grid layout with consistent margins
+- 6 to 8 content blocks maximum, clearly separated
+- readable hierarchy: big title, section headings, body text, checkboxes/lines
+- include 1 hero illustration and 2–3 small supporting illustrations/icons
+- include fill-in lines and small checkboxes where appropriate
+
+Make it highly informational (very important):
+Include these sections (adapt to the topic):
+1) quick facts (4–6 bullets)
+2) key people / key terms box (short)
+3) timeline (5–7 points)
+4) causes vs effects (two-column)
+5) map/places/events (small box, even if symbolic)
+6) critical thinking (3 prompts)
+7) mini quiz (4 questions with options A/B/C or true/false)
+8) reflection (1 longer prompt with lines)
+
+Text rendering note:
+- keep text short, clear, aligned, and large enough to read
+- prefer bullets and short lines
+- no tiny paragraphs
 `.trim();
 
-    const premiumWorksheetStyle = `
-Create a single-page premium educational worksheet for ages 10–15.
-Page format:
-- A4 portrait layout (print-friendly)
-- clear grid layout with consistent margins and spacing
-- visually rich but uncluttered
-Design language:
-- modern textbook + museum exhibit feel (premium)
-- tasteful color accents (not loud), mostly white background
-- include small high-quality illustrative visuals relevant to the topic (realistic illustration style)
-Content:
-- informative + critical thinking
-- include 4–6 sections max (example: quick facts, timeline, cause-effect, compare/contrast, reflection question, mini quiz)
-- include answer boxes/lines where needed
-- keep text readable and aligned
-Do not look like a basic black-and-white form. It should feel designed by a professional education brand.
+    const realisticIllustration = `
+Style:
+- realistic, high-quality illustration (not cartoon)
+- natural lighting, clean composition
+- no exaggerated anime/cartoon look
 `.trim();
 
     const finalPrompt = `
 ${safety}
 
-${isWorksheet ? premiumWorksheetStyle : realisticStyle}
+${isWorksheet ? premiumVintageWorksheet : realisticIllustration}
 
 User request:
 ${String(prompt).trim()}
+
+Hard constraints:
+- single page only
+- printable worksheet/poster aesthetic
+- very information-dense but not cluttered
 `.trim();
 
     const r = await fetch(OPENAI_IMAGE_URL, {
@@ -119,9 +145,8 @@ ${String(prompt).trim()}
       body: JSON.stringify({
         model: "gpt-image-1",
         prompt: finalPrompt,
-        // A4-ish portrait improves worksheet layout a lot
+        // portrait for worksheets gives far better layouts
         size: isWorksheet ? "1024x1536" : "1024x1024",
-        // single image only
         n: 1
       })
     });
@@ -141,7 +166,7 @@ ${String(prompt).trim()}
       return res.status(500).json({ message: "No image returned" });
     }
 
-    // webp is smaller; browser displays + downloads fine
+    // Use webp for size; browser download works fine
     const mime = "image/webp";
     const dataUrl = `data:${mime};base64,${b64}`;
 
