@@ -1,28 +1,84 @@
 // /api/playground.js
-// Drop-in serverless endpoint for Robocoders AI Playground
-// Fixes:
-// - Correct project detection (Mood Lamp vs Candle Lamp etc.)
-// - Always returns ALL relevant lesson videos for a project when asked
-// - Stops “3 lessons only” behavior by not relying on model memory
-// - Pin answers grounded in canonical rules + per-project connections
-// - Prevents dumping full kit material list when asked for one project
-// - Strong safe-guardrails to avoid off-topic unsafe/random content
+// Robocoders AI Playground (chat endpoint) — with CORS + OPTIONS fixed
+// Keeps your existing deterministic logic + grounded OpenAI call
+// IMPORTANT: Frontend currently sends { input, messages, attachment }
+// This backend now supports BOTH formats:
+// - { input, messages }  (your current frontend)
+// - { message, history } (older format)
+
+function origins() {
+  return (process.env.ALLOWED_ORIGIN || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+function allow(res, origin) {
+  res.setHeader("Vary", "Origin");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+
+  if (!origin) return false;
+
+  const list = origins();
+  // If no list provided, allow all (not recommended for prod)
+  if (!list.length || list.some((a) => origin.startsWith(a))) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    return true;
+  }
+  return false;
+}
 
 export default async function handler(req, res) {
-  try {
-    if (req.method !== "POST") {
-      return res.status(405).json({ error: "Method not allowed. Use POST." });
-    }
+  const origin = req.headers.origin || "";
 
-    const { message, history = [] } = req.body || {};
+  // 1) Preflight for CORS
+  if (req.method === "OPTIONS") {
+    allow(res, origin);
+    return res.status(204).end();
+  }
+
+  // 2) Allowlist origin
+  if (!allow(res, origin)) {
+    return res
+      .status(403)
+      .json({ error: "Forbidden origin", origin, allowed: origins() });
+  }
+
+  // 3) Only POST
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed. Use POST." });
+  }
+
+  try {
+    // ---- Accept both payload shapes (do NOT break your frontend) ----
+    const body = req.body || {};
+
+    // Your frontend: { input, messages, attachment }
+    // Old backend:   { message, history }
+    const message =
+      typeof body.message === "string"
+        ? body.message
+        : typeof body.input === "string"
+        ? body.input
+        : "";
+
+    const history = Array.isArray(body.history)
+      ? body.history
+      : Array.isArray(body.messages)
+      ? body.messages
+      : [];
+
     if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Missing 'message' string." });
+      return res.status(400).json({ error: "Missing message/input string." });
     }
 
     // --------- Load KB ----------
     const knowledgeUrl = process.env.KNOWLEDGE_URL;
     if (!knowledgeUrl) {
-      return res.status(500).json({ error: "KNOWLEDGE_URL is not set in env." });
+      return res
+        .status(500)
+        .json({ error: "KNOWLEDGE_URL is not set in env." });
     }
 
     const kbResp = await fetch(knowledgeUrl, { cache: "no-store" });
@@ -44,7 +100,7 @@ export default async function handler(req, res) {
     } = buildIndexes(kb);
 
     // --------- Project detection ----------
-    const userText = message.trim();
+    const userText = String(message || "").trim();
     const detectedProject = detectProject(userText, projectNames);
 
     // --------- Intent detection (deterministic) ----------
@@ -53,7 +109,8 @@ export default async function handler(req, res) {
     // If user asks for project list: answer deterministically (no model)
     if (intent.type === "LIST_PROJECTS") {
       return res.status(200).json({
-        answer:
+        // IMPORTANT: frontend expects data.text (not data.answer)
+        text:
           "Robocoders Kit projects/modules:\n\n" +
           projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n"),
         debug: {
@@ -69,7 +126,7 @@ export default async function handler(req, res) {
     if (intent.type === "PROJECT_VIDEOS") {
       if (!detectedProject) {
         return res.status(200).json({
-          answer:
+          text:
             "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I’ll share all the relevant lesson videos for that project.",
           debug: { detectedProject: null, intent },
         });
@@ -78,7 +135,7 @@ export default async function handler(req, res) {
       const videos = lessonsByProject[detectedProject] || [];
       if (!videos.length) {
         return res.status(200).json({
-          answer:
+          text:
             `I found the project "${detectedProject}", but no lesson videos are mapped for it in the knowledge file.\n` +
             "If you share the lesson links for this project, I’ll add them into the KB mapping.",
           debug: { detectedProject, intent, videosFound: 0 },
@@ -100,7 +157,7 @@ export default async function handler(req, res) {
           .join("\n\n");
 
       return res.status(200).json({
-        answer: out,
+        text: out,
         debug: {
           detectedProject,
           intent,
@@ -111,10 +168,6 @@ export default async function handler(req, res) {
     }
 
     // --------- Build minimal grounded context for model ----------
-    // We only inject:
-    // - Canonical pin rules (global)
-    // - The ONE detected project’s “Components Used” + “Connections” + key steps (not the whole kit list)
-    // - Safety boundaries
     const projectContext = detectedProject
       ? projectsByName[detectedProject] || null
       : null;
@@ -124,21 +177,32 @@ export default async function handler(req, res) {
       projectContext,
       canonicalPinsText,
       safetyText,
-      lessonsForProject: detectedProject ? (lessonsByProject[detectedProject] || []) : [],
+      lessonsForProject: detectedProject
+        ? lessonsByProject[detectedProject] || []
+        : [],
       intent,
     });
 
     // --------- OpenAI call ----------
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
+      return res
+        .status(500)
+        .json({ error: "OPENAI_API_KEY is not set in env." });
     }
 
     const system = buildSystemPrompt();
 
     // Keep short history to reduce drift
     const trimmedHistory = Array.isArray(history)
-      ? history.slice(-10).filter((x) => x && typeof x.content === "string" && typeof x.role === "string")
+      ? history
+          .slice(-10)
+          .filter(
+            (x) =>
+              x &&
+              typeof x.content === "string" &&
+              typeof x.role === "string"
+          )
       : [];
 
     const payload = {
@@ -170,10 +234,13 @@ export default async function handler(req, res) {
     }
 
     const data = await resp.json();
-    const answer = data?.choices?.[0]?.message?.content?.trim() || "I couldn’t generate a response.";
+    const answer =
+      data?.choices?.[0]?.message?.content?.trim() ||
+      "I couldn’t generate a response.";
 
+    // IMPORTANT: frontend expects data.text
     return res.status(200).json({
-      answer,
+      text: answer,
       debug: {
         detectedProject: detectedProject || null,
         intent,
@@ -191,8 +258,6 @@ export default async function handler(req, res) {
 /* ----------------------- Helpers ----------------------- */
 
 function buildSystemPrompt() {
-  // Hard guardrails to stop random/off-topic unsafe outputs.
-  // Also forces strict grounding to provided context.
   return `
 You are the Robocoders Kit assistant for children aged 8–14 and parents.
 
@@ -211,19 +276,8 @@ Style:
 }
 
 function buildIndexes(kb) {
-  // This function is tolerant: it works even if KB structure changes a bit.
-  // We extract:
-  // - canonical project names list
-  // - per-project content chunks (components + connections + steps)
-  // - per-project lessons with ALL links
-  // - canonical pins rules
-  // - safety boundaries
-
   const projectNames = [];
 
-  // 1) Canonical project list
-  // In your PDF knowledge, canonical names exist (Hello World!, Mood Lamp, etc.) :contentReference[oaicite:0]{index=0}
-  // Try multiple possible locations in JSON.
   const candidates =
     kb?.canonical?.projects ||
     kb?.projects ||
@@ -238,7 +292,6 @@ function buildIndexes(kb) {
     }
   }
 
-  // Fallback: if KB is “pages-based”, derive from pages that look like "Project Name"
   if (!projectNames.length && Array.isArray(kb?.pages)) {
     for (const pg of kb.pages) {
       const t = (pg?.text || "").trim();
@@ -250,7 +303,6 @@ function buildIndexes(kb) {
     }
   }
 
-  // If still empty, use the known canonical list from the reference PDF (last resort)
   if (!projectNames.length) {
     projectNames.push(
       "Hello World!",
@@ -277,29 +329,31 @@ function buildIndexes(kb) {
     );
   }
 
-  // 2) Project content blocks
   const projectsByName = {};
   for (const name of projectNames) {
     projectsByName[name] = extractProjectBlock(kb, name);
   }
 
-  // 3) Lessons by project
   const lessonsByProject = {};
   for (const name of projectNames) {
     lessonsByProject[name] = extractLessons(kb, name);
-    // Sort lessons by preference order: Connections > Build > Coding > Working > Introduction :contentReference[oaicite:1]{index=1}
-    lessonsByProject[name].sort((a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName));
+    lessonsByProject[name].sort(
+      (a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName)
+    );
   }
 
-  // 4) Canonical pins / ports rules
-  const canonicalPinsText =
-    extractCanonicalPins(kb) ||
-    "Canonical pin rules not found.";
+  const canonicalPinsText = extractCanonicalPins(kb) || "Canonical pin rules not found.";
+  const safetyText =
+    extractSafety(kb) ||
+    "Robocoders is low-voltage and kid-safe. No wall power. No cutting or soldering. Adult help allowed when needed.";
 
-  // 5) Safety text (optional)
-  const safetyText = extractSafety(kb) || "Robocoders is low-voltage and kid-safe. No wall power. No cutting or soldering. Adult help allowed when needed.";
-
-  return { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText };
+  return {
+    projectNames,
+    projectsByName,
+    lessonsByProject,
+    canonicalPinsText,
+    safetyText,
+  };
 }
 
 function detectIntent(text) {
@@ -328,12 +382,10 @@ function detectIntent(text) {
 function detectProject(text, projectNames) {
   const t = text.toLowerCase();
 
-  // Exact containment match first
   for (const p of projectNames) {
     if (t.includes(p.toLowerCase())) return p;
   }
 
-  // Fuzzy-ish: remove punctuation/spaces
   const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
   const nt = norm(text);
 
@@ -344,11 +396,15 @@ function detectProject(text, projectNames) {
     const np = norm(p);
     if (!np) continue;
 
-    // simple overlap score
     let score = 0;
     if (nt.includes(np)) score += 10;
-    // partial chunk overlaps
-    const chunks = np.split(/(world|lamp|game|counter|box|instrument|booth|meter|dice|fan|disco|motion|rgb|fruit|pingpong|ufo|extension|pulley|candle)/).filter(Boolean);
+
+    const chunks = np
+      .split(
+        /(world|lamp|game|controller|counter|box|instrument|booth|meter|dice|fan|disco|motion|rgb|fruit|pingpong|ufo|extension|pulley|candle)/
+      )
+      .filter(Boolean);
+
     for (const c of chunks) {
       if (c.length >= 4 && nt.includes(c)) score += 1;
     }
@@ -362,7 +418,14 @@ function detectProject(text, projectNames) {
   return bestScore >= 2 ? best : null;
 }
 
-function buildGroundedContext({ detectedProject, projectContext, canonicalPinsText, safetyText, lessonsForProject, intent }) {
+function buildGroundedContext({
+  detectedProject,
+  projectContext,
+  canonicalPinsText,
+  safetyText,
+  lessonsForProject,
+  intent,
+}) {
   const lines = [];
 
   lines.push("Grounded Context (authoritative):");
@@ -387,7 +450,6 @@ function buildGroundedContext({ detectedProject, projectContext, canonicalPinsTe
   }
 
   if (intent?.type === "PROJECT_VIDEOS" && detectedProject) {
-    // Also inject lessons so the model can explain “why this video”
     lines.push("Lesson videos for this project (only these links are allowed):");
     if (!lessonsForProject.length) {
       lines.push("(No lesson videos found in KB for this project.)");
@@ -405,13 +467,10 @@ function buildGroundedContext({ detectedProject, projectContext, canonicalPinsTe
 }
 
 function extractProjectBlock(kb, projectName) {
-  // Pull only the project section, not the full components master list.
-  // From your reference PDF, each project has: difficulty, time, components used, build steps, connections. :contentReference[oaicite:2]{index=2}
   if (Array.isArray(kb?.pages)) {
     const norm = (s) => s.toLowerCase();
     const pNorm = norm(projectName);
 
-    // Find page that starts with "Project Name" and matches this project
     const pages = kb.pages
       .map((pg) => (pg?.text ? String(pg.text) : ""))
       .filter(Boolean);
@@ -426,13 +485,11 @@ function extractProjectBlock(kb, projectName) {
     }
 
     if (start >= 0) {
-      // Grab a reasonable window (project spans multiple pages)
       const chunk = pages.slice(start, start + 6).join("\n\n");
       return sanitizeChunk(chunk);
     }
   }
 
-  // If KB already has structured projects
   const p =
     (kb?.projects && kb.projects[projectName]) ||
     (Array.isArray(kb?.projects) ? kb.projects.find((x) => x?.name === projectName) : null);
@@ -449,46 +506,38 @@ function extractProjectBlock(kb, projectName) {
 }
 
 function extractLessons(kb, projectName) {
-  // Lessons in your PDF section are strongly structured. :contentReference[oaicite:3]{index=3}
-  // If KB has pages: scan for "Project: <name>" / "Module: <name>" blocks.
   const lessons = [];
 
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-
     const p = projectName.toLowerCase();
 
-    // Find all occurrences in the lessons area
     for (let i = 0; i < pages.length; i++) {
       const txt = pages[i];
       const low = txt.toLowerCase();
 
-      // Match either "Project: X" or "Project : X"
       if (low.includes("project:") || low.includes("project :")) {
-        // Quick check if this page belongs to this project lessons
         if (!low.includes(p)) continue;
 
-        // Parse multiple lesson blocks on the same page
         const blocks = txt.split(/Lesson ID\s*[:\-]/i);
         for (let b = 1; b < blocks.length; b++) {
           const block = "Lesson ID:" + blocks[b];
 
-          const lessonName = matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
-                             matchLine(block, /Lesson Name\s*:\s*([^\n]+)/i) ||
-                             "";
+          const lessonName =
+            matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
+            matchLine(block, /Lesson Name\s*:\s*([^\n]+)/i) ||
+            "";
 
-          // Collect ALL video links in that block
           const links = [];
           const linkMatches = block.match(/https?:\/\/[^\s\)]+/gi) || [];
           for (const u of linkMatches) {
-            // cleanup trailing punctuation
             links.push(u.replace(/[\,\)\]]+$/g, ""));
           }
 
-          // Explain line
-          const explainLine = matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)When the AI/i) ||
-                              matchLine(block, /What this lesson helps with\s*\(AI explanation line\)\s*:\s*([\s\S]*?)When the AI/i) ||
-                              "";
+          const explainLine =
+            matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)When the AI/i) ||
+            matchLine(block, /What this lesson helps with\s*\(AI explanation line\)\s*:\s*([\s\S]*?)When the AI/i) ||
+            "";
 
           if (lessonName && links.length) {
             lessons.push({
@@ -502,12 +551,15 @@ function extractLessons(kb, projectName) {
     }
   }
 
-  // Structured KB fallback
   if (!lessons.length && kb?.lessons && kb.lessons[projectName]) {
     for (const l of kb.lessons[projectName]) {
       lessons.push({
         lessonName: l.lessonName,
-        videoLinks: Array.isArray(l.videoLinks) ? l.videoLinks : (l.videoLink ? [l.videoLink] : []),
+        videoLinks: Array.isArray(l.videoLinks)
+          ? l.videoLinks
+          : l.videoLink
+          ? [l.videoLink]
+          : [],
         explainLine: l.explainLine || "",
       });
     }
@@ -517,11 +569,11 @@ function extractLessons(kb, projectName) {
 }
 
 function extractCanonicalPins(kb) {
-  // From your canonical knowledge: A6/A7 reserved, D13 reserved, etc. :contentReference[oaicite:4]{index=4}
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-    // Find the "Fixed Port Mappings (Canonical)" section
-    const idx = pages.findIndex((t) => t.toLowerCase().includes("fixed port mappings"));
+    const idx = pages.findIndex((t) =>
+      t.toLowerCase().includes("fixed port mappings")
+    );
     if (idx >= 0) {
       const chunk = pages.slice(idx, idx + 3).join("\n\n");
       return sanitizeChunk(chunk);
@@ -543,7 +595,7 @@ function extractSafety(kb) {
 }
 
 function lessonRank(lessonName = "") {
-  const n = lessonName.toLowerCase();
+  const n = String(lessonName || "").toLowerCase();
   if (n.includes("connection")) return 1;
   if (n.includes("build")) return 2;
   if (n.includes("coding")) return 3;
@@ -561,7 +613,7 @@ function sanitizeChunk(s) {
 }
 
 function matchLine(text, regex) {
-  const m = text.match(regex);
+  const m = String(text || "").match(regex);
   if (!m) return "";
   return (m[1] || "").trim();
 }
@@ -569,7 +621,7 @@ function matchLine(text, regex) {
 function uniq(arr) {
   const out = [];
   const seen = new Set();
-  for (const x of arr) {
+  for (const x of arr || []) {
     const k = String(x).trim();
     if (!k || seen.has(k)) continue;
     seen.add(k);
@@ -588,7 +640,7 @@ function cleanExplain(s) {
 function dedupeLessons(lessons) {
   const out = [];
   const seen = new Set();
-  for (const l of lessons) {
+  for (const l of lessons || []) {
     const key = (l.lessonName || "").toLowerCase();
     if (!key || seen.has(key)) continue;
     seen.add(key);
