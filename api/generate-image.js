@@ -3,35 +3,7 @@
 // Focus: premium, highly-informational, A4 single-page worksheets (vintage / illustrated style)
 
 const OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations";
-const OPENAI_CHAT_URL  = "https://api.openai.com/v1/chat/completions";
 
-/* ------------------------------------------------------------------ */
-/* PROMPT ENHANCER SYSTEM PROMPT (NEW)                                 */
-/* ------------------------------------------------------------------ */
-const PROMPT_ENHANCER_SYSTEM_PROMPT = `
-You are the Be Cre8v AI Playground Image Prompt Enhancer.
-
-Your job is to rewrite user image requests into extremely high-quality,
-structured, descriptive prompts suitable for premium educational image generation.
-
-Rules:
-- Do NOT mention AI, prompts, or instructions in the output
-- Output ONLY the final rewritten image prompt text
-- Make images educational, aesthetic, information-rich
-- Prefer printable, clean layouts when applicable
-- Avoid cartoons unless explicitly requested
-- Default age range: children 8–15
-- Do not add animation unless explicitly requested
-- Do not remove factual density
-- Improve layout clarity, hierarchy, and visual guidance
-
-You do NOT generate images.
-You ONLY rewrite prompts.
-`.trim();
-
-/* ------------------------------------------------------------------ */
-/* CORS HELPERS (UNCHANGED)                                            */
-/* ------------------------------------------------------------------ */
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
     .split(",")
@@ -53,9 +25,6 @@ function allow(res, origin) {
   return false;
 }
 
-/* ------------------------------------------------------------------ */
-/* INTENT DETECTION (UNCHANGED)                                        */
-/* ------------------------------------------------------------------ */
 function looksLikeWorksheet(prompt) {
   const p = String(prompt || "").toLowerCase();
   return (
@@ -74,38 +43,6 @@ function looksLikeWorksheet(prompt) {
   );
 }
 
-/* ------------------------------------------------------------------ */
-/* PROMPT ENHANCER (NEW, SAFE, INTERNAL)                               */
-/* ------------------------------------------------------------------ */
-async function enhanceImagePrompt(rawPrompt, apiKey) {
-  const r = await fetch(OPENAI_CHAT_URL, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: PROMPT_ENHANCER_SYSTEM_PROMPT },
-        { role: "user", content: rawPrompt }
-      ]
-    })
-  });
-
-  if (!r.ok) {
-    // Fail safe: return original prompt if enhancer fails
-    return rawPrompt;
-  }
-
-  const data = await r.json();
-  return data?.choices?.[0]?.message?.content?.trim() || rawPrompt;
-}
-
-/* ------------------------------------------------------------------ */
-/* MAIN HANDLER                                                        */
-/* ------------------------------------------------------------------ */
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
 
@@ -135,54 +72,57 @@ export default async function handler(req, res) {
 
     const isWorksheet = looksLikeWorksheet(prompt);
 
-    /* ------------------ SAFETY + STYLE (UNCHANGED) ------------------ */
     const safety = `
 Kid-safe educational content for children.
 No sexual content. No gore. No violence instructions.
 No watermark. No logos.
 `.trim();
 
+    // This is the key: push style + layout + density HARD
     const premiumVintageWorksheet = `
-`
 Create ONE SINGLE PAGE printable worksheet (A4 portrait).
 Make it extremely beautiful and premium, like a museum-style illustrated worksheet / vintage parchment poster.
 
-Visual style:
-- vintage parchment background with subtle texture
+Visual style (very important):
+- vintage parchment paper background with subtle texture
 - warm earthy palette (tan, sepia, muted reds/greens/blues)
-- decorative header banner, elegant borders and dividers
-- hand-painted historical illustration style (not cartoon)
-- very balanced, professional, high-polish layout
+- decorative header banner, small icons, elegant borders/dividers
+- high-quality hand-painted illustration style (not cartoon), like an old history book illustration
+- very aesthetic, balanced, professional layout, lots of visual polish
 
 Layout rules:
-- single page only
-- clean grid layout, strong margins
-- 6–8 content blocks max
-- clear hierarchy: title → sections → prompts
-- include 1 hero illustration + 2–3 small icons
-- include fill-in lines and checkboxes
+- single page only, no multi-page, no repeated pages
+- clean grid layout with consistent margins
+- 6 to 8 content blocks maximum, clearly separated
+- readable hierarchy: big title, section headings, body text, checkboxes/lines
+- include 1 hero illustration and 2–3 small supporting illustrations/icons
+- include fill-in lines and small checkboxes where appropriate
 
-Content density:
-1) quick facts
-2) key people / terms
-3) timeline
-4) causes vs effects
-5) places / map box
-6) critical thinking
-7) mini quiz
-8) reflection
+Make it highly informational (very important):
+Include these sections (adapt to the topic):
+1) quick facts (4–6 bullets)
+2) key people / key terms box (short)
+3) timeline (5–7 points)
+4) causes vs effects (two-column)
+5) map/places/events (small box, even if symbolic)
+6) critical thinking (3 prompts)
+7) mini quiz (4 questions with options A/B/C or true/false)
+8) reflection (1 longer prompt with lines)
+
+Text rendering note:
+- keep text short, clear, aligned, and large enough to read
+- prefer bullets and short lines
+- no tiny paragraphs
 `.trim();
 
     const realisticIllustration = `
 Style:
-- realistic, high-quality illustration
-- clean composition
-- educational clarity
-- not cartoon or anime
+- realistic, high-quality illustration (not cartoon)
+- natural lighting, clean composition
+- no exaggerated anime/cartoon look
 `.trim();
 
-    /* ------------------ BASE PROMPT (UNCHANGED) ------------------ */
-    const basePrompt = `
+    const finalPrompt = `
 ${safety}
 
 ${isWorksheet ? premiumVintageWorksheet : realisticIllustration}
@@ -192,14 +132,10 @@ ${String(prompt).trim()}
 
 Hard constraints:
 - single page only
-- printable educational aesthetic
-- high information density without clutter
+- printable worksheet/poster aesthetic
+- very information-dense but not cluttered
 `.trim();
 
-    /* ------------------ ENHANCE PROMPT (NEW STEP) ------------------ */
-    const enhancedPrompt = await enhanceImagePrompt(basePrompt, apiKey);
-
-    /* ------------------ IMAGE GENERATION ------------------ */
     const r = await fetch(OPENAI_IMAGE_URL, {
       method: "POST",
       headers: {
@@ -208,7 +144,8 @@ Hard constraints:
       },
       body: JSON.stringify({
         model: "gpt-image-1",
-        prompt: enhancedPrompt,
+        prompt: finalPrompt,
+        // portrait for worksheets gives far better layouts
         size: isWorksheet ? "1024x1536" : "1024x1024",
         n: 1
       })
@@ -229,6 +166,7 @@ Hard constraints:
       return res.status(500).json({ message: "No image returned" });
     }
 
+    // Use webp for size; browser download works fine
     const mime = "image/webp";
     const dataUrl = `data:${mime};base64,${b64}`;
 
@@ -236,7 +174,6 @@ Hard constraints:
       mime,
       image: dataUrl
     });
-
   } catch (e) {
     return res.status(500).json({
       message: "Server error",
