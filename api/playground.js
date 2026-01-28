@@ -1,10 +1,16 @@
 // /api/playground.js
 // Robocoders AI Playground (chat endpoint) — with CORS + OPTIONS fixed
-// Keeps your existing deterministic logic + grounded OpenAI call
-// IMPORTANT: Frontend currently sends { input, messages, attachment }
-// This backend now supports BOTH formats:
-// - { input, messages }  (your current frontend)
+// Keeps deterministic logic + grounded OpenAI call
+// Supports BOTH payload formats:
+// - { input, messages, attachment }  (current frontend)
 // - { message, history } (older format)
+//
+// Update in this version:
+// - Adds a lightweight "Prompt Planner" (gpt-4o-mini) to improve normal chat quality
+// - Does NOT break deterministic flows (LIST_PROJECTS, PROJECT_VIDEOS)
+// - Keeps your existing KB grounding rules intact
+
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -21,7 +27,6 @@ function allow(res, origin) {
   if (!origin) return false;
 
   const list = origins();
-  // If no list provided, allow all (not recommended for prod)
   if (!list.length || list.some((a) => origin.startsWith(a))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     return true;
@@ -29,6 +34,56 @@ function allow(res, origin) {
   return false;
 }
 
+/* -------------------- Chat Prompt Planner -------------------- */
+/*
+Goal:
+- Make the user message clearer + more answerable (like ChatGPT feel)
+- Only used for GENERAL chats (not deterministic LIST_PROJECTS / PROJECT_VIDEOS)
+- Output is ONLY the rewritten prompt (no extra commentary)
+*/
+const CHAT_PLANNER_PROMPT = `
+You are Be Cre8v AI Conversation Planner.
+
+Rewrite the user's message into a clearer, more intelligent version BEFORE it is answered.
+
+Rules:
+- Do NOT answer the user.
+- Output ONLY the rewritten prompt text.
+- Preserve intent and key details.
+- Make it easier to answer with steps, structure, and the right questions.
+- Keep child-friendly, encouraging tone.
+- If the user asks something project-specific but doesn't specify the project/module name, include a short clarification question in the rewritten prompt.
+- Do not add adult/unsafe content.
+`.trim();
+
+async function planChatPrompt(userText, apiKey) {
+  const r = await fetch(OPENAI_CHAT_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.4,
+      messages: [
+        { role: "system", content: CHAT_PLANNER_PROMPT },
+        { role: "user", content: String(userText || "").trim() },
+      ],
+    }),
+  });
+
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error("Planner error: " + t.slice(0, 800));
+  }
+
+  const data = await r.json();
+  const out = data?.choices?.[0]?.message?.content?.trim();
+  return out || String(userText || "").trim();
+}
+
+/* -------------------- Handler -------------------- */
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
 
@@ -69,9 +124,15 @@ export default async function handler(req, res) {
       ? body.messages
       : [];
 
+    // Attachment is currently sent by frontend; keep it for future use
+    const attachment = body.attachment || null;
+
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "Missing message/input string." });
     }
+
+    // Raw user text (unchanged)
+    const rawUserText = String(message || "").trim();
 
     // --------- Load KB ----------
     const knowledgeUrl = process.env.KNOWLEDGE_URL;
@@ -99,23 +160,21 @@ export default async function handler(req, res) {
       safetyText,
     } = buildIndexes(kb);
 
-    // --------- Project detection ----------
-    const userText = String(message || "").trim();
-    const detectedProject = detectProject(userText, projectNames);
+    // --------- Intent detection (deterministic, using RAW text) ----------
+    const rawIntent = detectIntent(rawUserText);
 
-    // --------- Intent detection (deterministic) ----------
-    const intent = detectIntent(userText);
+    // --------- Project detection (deterministic, using RAW text) ----------
+    const rawDetectedProject = detectProject(rawUserText, projectNames);
 
     // If user asks for project list: answer deterministically (no model)
-    if (intent.type === "LIST_PROJECTS") {
+    if (rawIntent.type === "LIST_PROJECTS") {
       return res.status(200).json({
-        // IMPORTANT: frontend expects data.text (not data.answer)
         text:
           "Robocoders Kit projects/modules:\n\n" +
           projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n"),
         debug: {
-          detectedProject: detectedProject || null,
-          intent,
+          detectedProject: rawDetectedProject || null,
+          intent: rawIntent,
           kbMode: "deterministic",
         },
       });
@@ -123,28 +182,27 @@ export default async function handler(req, res) {
 
     // If user asks for videos/lessons OR “not working” troubleshooting:
     // return ALL relevant videos for that project, in the canonical preference order.
-    if (intent.type === "PROJECT_VIDEOS") {
-      if (!detectedProject) {
+    if (rawIntent.type === "PROJECT_VIDEOS") {
+      if (!rawDetectedProject) {
         return res.status(200).json({
           text:
             "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I’ll share all the relevant lesson videos for that project.",
-          debug: { detectedProject: null, intent },
+          debug: { detectedProject: null, intent: rawIntent },
         });
       }
 
-      const videos = lessonsByProject[detectedProject] || [];
+      const videos = lessonsByProject[rawDetectedProject] || [];
       if (!videos.length) {
         return res.status(200).json({
           text:
-            `I found the project "${detectedProject}", but no lesson videos are mapped for it in the knowledge file.\n` +
+            `I found the project "${rawDetectedProject}", but no lesson videos are mapped for it in the knowledge file.\n` +
             "If you share the lesson links for this project, I’ll add them into the KB mapping.",
-          debug: { detectedProject, intent, videosFound: 0 },
+          debug: { detectedProject: rawDetectedProject, intent: rawIntent, videosFound: 0 },
         });
       }
 
-      // Always return ALL relevant lesson links for that project (not only 3)
       const out =
-        `Lesson videos for ${detectedProject}:\n\n` +
+        `Lesson videos for ${rawDetectedProject}:\n\n` +
         videos
           .map((v, idx) => {
             const links = (v.videoLinks || []).map((u) => `- ${u}`).join("\n");
@@ -159,15 +217,40 @@ export default async function handler(req, res) {
       return res.status(200).json({
         text: out,
         debug: {
-          detectedProject,
-          intent,
+          detectedProject: rawDetectedProject,
+          intent: rawIntent,
           lessonsReturned: videos.length,
           kbMode: "deterministic",
         },
       });
     }
 
-    // --------- Build minimal grounded context for model ----------
+    // --------- OpenAI key (needed for planner + answer model) ----------
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      return res
+        .status(500)
+        .json({ error: "OPENAI_API_KEY is not set in env." });
+    }
+
+    // --------- Planner (ONLY for GENERAL) ----------
+    // We do NOT change deterministic behavior above.
+    let plannedUserText = rawUserText;
+    try {
+      plannedUserText = await planChatPrompt(rawUserText, apiKey);
+    } catch (plannerErr) {
+      // Planner is "best-effort" only; never fail the chat because planner failed.
+      plannedUserText = rawUserText;
+    }
+
+    // Re-run project detection using planned text if raw didn’t detect
+    const detectedProject =
+      rawDetectedProject || detectProject(plannedUserText, projectNames);
+
+    // Use the existing intent (raw deterministic intent) for routing
+    const intent = rawIntent;
+
+    // --------- Build grounded context for model ----------
     const projectContext = detectedProject
       ? projectsByName[detectedProject] || null
       : null;
@@ -181,15 +264,8 @@ export default async function handler(req, res) {
         ? lessonsByProject[detectedProject] || []
         : [],
       intent,
+      attachment,
     });
-
-    // --------- OpenAI call ----------
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) {
-      return res
-        .status(500)
-        .json({ error: "OPENAI_API_KEY is not set in env." });
-    }
 
     const system = buildSystemPrompt();
 
@@ -197,14 +273,12 @@ export default async function handler(req, res) {
     const trimmedHistory = Array.isArray(history)
       ? history
           .slice(-10)
-          .filter(
-            (x) =>
-              x &&
-              typeof x.content === "string" &&
-              typeof x.role === "string"
-          )
+          .filter((x) => x && typeof x.content === "string" && typeof x.role === "string")
       : [];
 
+    // NOTE:
+    // - We pass plannedUserText as the final user message for better answer quality
+    // - We keep original history untouched to avoid breaking UI behavior
     const payload = {
       model: "gpt-4o-mini",
       temperature: 0.1,
@@ -212,11 +286,11 @@ export default async function handler(req, res) {
         { role: "system", content: system },
         { role: "system", content: groundedContext },
         ...trimmedHistory,
-        { role: "user", content: userText },
+        { role: "user", content: plannedUserText },
       ],
     };
 
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    const resp = await fetch(OPENAI_CHAT_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -238,13 +312,13 @@ export default async function handler(req, res) {
       data?.choices?.[0]?.message?.content?.trim() ||
       "I couldn’t generate a response.";
 
-    // IMPORTANT: frontend expects data.text
     return res.status(200).json({
       text: answer,
       debug: {
         detectedProject: detectedProject || null,
         intent,
         kbMode: "grounded-context",
+        plannerUsed: plannedUserText !== rawUserText,
       },
     });
   } catch (e) {
@@ -272,7 +346,7 @@ Hard rules:
 Style:
 - Simple, calm, step-by-step.
 - If it’s a troubleshooting question: suggest order = Connections first, then Build, then Coding, then Working, then Introduction.
-`;
+`.trim();
 }
 
 function buildIndexes(kb) {
@@ -342,7 +416,8 @@ function buildIndexes(kb) {
     );
   }
 
-  const canonicalPinsText = extractCanonicalPins(kb) || "Canonical pin rules not found.";
+  const canonicalPinsText =
+    extractCanonicalPins(kb) || "Canonical pin rules not found.";
   const safetyText =
     extractSafety(kb) ||
     "Robocoders is low-voltage and kid-safe. No wall power. No cutting or soldering. Adult help allowed when needed.";
@@ -365,14 +440,28 @@ function detectIntent(text) {
     t.includes("all project") ||
     t.includes("all module");
 
-  if (wantsList && (t.includes("what are") || t.includes("list") || t.includes("give"))) {
+  if (
+    wantsList &&
+    (t.includes("what are") || t.includes("list") || t.includes("give"))
+  ) {
     return { type: "LIST_PROJECTS" };
   }
 
   const videoWords = ["video", "videos", "lesson", "lessons", "link", "youtube"];
-  const troubleWords = ["not working", "doesn't work", "not responding", "stuck", "problem", "issue", "error"];
+  const troubleWords = [
+    "not working",
+    "doesn't work",
+    "not responding",
+    "stuck",
+    "problem",
+    "issue",
+    "error",
+  ];
 
-  if (videoWords.some((w) => t.includes(w)) || troubleWords.some((w) => t.includes(w))) {
+  if (
+    videoWords.some((w) => t.includes(w)) ||
+    troubleWords.some((w) => t.includes(w))
+  ) {
     return { type: "PROJECT_VIDEOS" };
   }
 
@@ -425,6 +514,7 @@ function buildGroundedContext({
   safetyText,
   lessonsForProject,
   intent,
+  attachment,
 }) {
   const lines = [];
 
@@ -437,6 +527,12 @@ function buildGroundedContext({
   lines.push(canonicalPinsText);
   lines.push("");
 
+  if (attachment && attachment.kind === "image") {
+    lines.push("User attached an image.");
+    lines.push("If the user asks about the image, ask what project this photo is from and what is not working.");
+    lines.push("");
+  }
+
   if (detectedProject && projectContext) {
     lines.push(`Project in focus: ${detectedProject}`);
     lines.push("");
@@ -445,7 +541,9 @@ function buildGroundedContext({
     lines.push("");
   } else {
     lines.push("No project selected yet.");
-    lines.push("If the user question is project-specific, ask for the exact project/module name.");
+    lines.push(
+      "If the user question is project-specific, ask for the exact project/module name."
+    );
     lines.push("");
   }
 
@@ -492,12 +590,16 @@ function extractProjectBlock(kb, projectName) {
 
   const p =
     (kb?.projects && kb.projects[projectName]) ||
-    (Array.isArray(kb?.projects) ? kb.projects.find((x) => x?.name === projectName) : null);
+    (Array.isArray(kb?.projects)
+      ? kb.projects.find((x) => x?.name === projectName)
+      : null);
 
   if (p) {
     const parts = [];
-    if (p.componentsUsed) parts.push("Components Used:\n" + p.componentsUsed.join("\n"));
-    if (p.connections) parts.push("Connections:\n" + p.connections.join("\n"));
+    if (p.componentsUsed)
+      parts.push("Components Used:\n" + p.componentsUsed.join("\n"));
+    if (p.connections)
+      parts.push("Connections:\n" + p.connections.join("\n"));
     if (p.steps) parts.push("Build Steps:\n" + p.steps.join("\n"));
     return sanitizeChunk(parts.join("\n\n"));
   }
