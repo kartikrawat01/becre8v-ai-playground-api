@@ -1,5 +1,5 @@
 // api/generate-image.js
-// Image generation endpoint for Be Cre8v AI Playground (kid-safe + worksheet-ready + more realistic by default)
+// Image generation endpoint for Be Cre8v AI Playground (kid-safe) - single page only
 
 const OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations";
 
@@ -24,40 +24,20 @@ function allow(res, origin) {
   return false;
 }
 
-function isWorksheetPrompt(p) {
-  const t = String(p || "").toLowerCase();
-  return [
-    "worksheet",
-    "printable",
-    "printable sheet",
-    "activity sheet",
-    "workbook",
-    "quiz sheet",
-    "exercise sheet",
-    "practice sheet",
-    "lesson sheet",
-    "handout",
-    "pdf",
-    "a4",
-    "classroom",
-  ].some((k) => t.includes(k));
-}
-
-function wantsCartoonStyle(p) {
-  const t = String(p || "").toLowerCase();
-  return [
-    "cartoon",
-    "animated",
-    "anime",
-    "illustration",
-    "vector",
-    "flat",
-    "comic",
-    "pixar",
-    "kids style",
-    "storybook",
-    "cute",
-  ].some((k) => t.includes(k));
+function looksLikeWorksheet(prompt) {
+  const p = String(prompt || "").toLowerCase();
+  return (
+    p.includes("worksheet") ||
+    p.includes("printable") ||
+    p.includes("sheet") ||
+    p.includes("activity") ||
+    p.includes("fill in") ||
+    p.includes("quiz") ||
+    p.includes("mcq") ||
+    p.includes("match") ||
+    p.includes("timeline") ||
+    p.includes("critical thinking")
+  );
 }
 
 export default async function handler(req, res) {
@@ -69,7 +49,7 @@ export default async function handler(req, res) {
   }
 
   if (!allow(res, origin)) {
-    return res.status(403).json({ message: "Forbidden origin", origin, allowed: origins() });
+    return res.status(403).json({ message: "Forbidden origin" });
   }
 
   if (req.method !== "POST") {
@@ -87,43 +67,44 @@ export default async function handler(req, res) {
       return res.status(500).json({ message: "Missing OPENAI_API_KEY" });
     }
 
-    const worksheetMode = isWorksheetPrompt(prompt);
-    const keepCartoon = wantsCartoonStyle(prompt);
+    const isWorksheet = looksLikeWorksheet(prompt);
 
-    const size = worksheetMode ? "1024x1024" : "1024x1024";
-
-    const baseRules = `
-Kid-safe image for children and families.
-No hateful content, no nudity, no sexual content, no violence/gore.
-No text watermark, no logos, no brand names.
+    const safety = `
+Kid-safe content for children.
+No sexual content. No gore. No weapons instructions.
+No watermark. No logos.
 `.trim();
 
-    const styleRules = worksheetMode
-      ? `
-Make a printable worksheet page layout.
-A4 portrait feel, clean white background, neat margins.
-Clear section boxes with headings and spaces for writing.
-High contrast, printer friendly (minimal color accents).
-Simple small icons/illustrations only as decoration.
-Keep text short and large (avoid tiny paragraphs).
-`.trim()
-      : `
-Make it look high quality and not cartoon by default.
-Photorealistic or semi-realistic, natural lighting, clean composition.
-Avoid exaggerated cartoon outlines.
+    const realisticStyle = `
+Style:
+- high quality, realistic (not cartoon), natural lighting
+- warm, child-friendly, but realistic
+- clean composition, sharp details
+- no exaggerated anime/cartoon look
 `.trim();
 
-    const finalStyleRules = keepCartoon && !worksheetMode
-      ? `
-Friendly illustrated style is allowed because the user asked for it.
-Still: no watermark, no logos, no text overlay unless the user explicitly requests text.
-`.trim()
-      : styleRules;
+    const premiumWorksheetStyle = `
+Create a single-page premium educational worksheet for ages 10–15.
+Page format:
+- A4 portrait layout (print-friendly)
+- clear grid layout with consistent margins and spacing
+- visually rich but uncluttered
+Design language:
+- modern textbook + museum exhibit feel (premium)
+- tasteful color accents (not loud), mostly white background
+- include small high-quality illustrative visuals relevant to the topic (realistic illustration style)
+Content:
+- informative + critical thinking
+- include 4–6 sections max (example: quick facts, timeline, cause-effect, compare/contrast, reflection question, mini quiz)
+- include answer boxes/lines where needed
+- keep text readable and aligned
+Do not look like a basic black-and-white form. It should feel designed by a professional education brand.
+`.trim();
 
-    const safePrompt = `
-${baseRules}
+    const finalPrompt = `
+${safety}
 
-${finalStyleRules}
+${isWorksheet ? premiumWorksheetStyle : realisticStyle}
 
 User request:
 ${String(prompt).trim()}
@@ -133,42 +114,45 @@ ${String(prompt).trim()}
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
+        "Content-Type": "application/json"
       },
       body: JSON.stringify({
         model: "gpt-image-1",
-        prompt: safePrompt,
-        size,
-      }),
+        prompt: finalPrompt,
+        // A4-ish portrait improves worksheet layout a lot
+        size: isWorksheet ? "1024x1536" : "1024x1024",
+        // single image only
+        n: 1
+      })
     });
 
     if (!r.ok) {
       const err = await r.text();
       return res.status(r.status).json({
         message: "Image API error",
-        details: err.slice(0, 800),
+        details: err.slice(0, 1500)
       });
     }
 
     const data = await r.json();
+    const b64 = data?.data?.[0]?.b64_json;
 
-    const imageBase64 = data?.data?.[0]?.b64_json;
-    if (!imageBase64) {
+    if (!b64) {
       return res.status(500).json({ message: "No image returned" });
     }
 
-    // Most responses are usable as PNG; if OpenAI returns webp, browser will still render it.
-    // We return a data URL and a filename so frontend can download.
-    const mime = worksheetMode ? "image/png" : "image/png";
-    const filename = worksheetMode ? "worksheet.png" : "image.png";
+    // webp is smaller; browser displays + downloads fine
+    const mime = "image/webp";
+    const dataUrl = `data:${mime};base64,${b64}`;
 
     return res.status(200).json({
-      image: `data:${mime};base64,${imageBase64}`,
-      filename,
-      openai_request_id: data?.openai_request_id || null,
-      meta: { worksheetMode, size },
+      mime,
+      image: dataUrl
     });
   } catch (e) {
-    return res.status(500).json({ message: "Server error", details: String(e?.message || e) });
+    return res.status(500).json({
+      message: "Server error",
+      details: String(e?.message || e)
+    });
   }
 }
