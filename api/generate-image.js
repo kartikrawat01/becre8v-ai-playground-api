@@ -1,7 +1,9 @@
 // api/generate-image.js
 // Be Cre8v AI Playground — Image Generation (kid-safe)
-// Focus: premium, highly-informational, A4 single-page worksheets (vintage / illustrated style)
+// Goal: better image quality + worksheet aesthetics using a prompt-enhancer
+// API unchanged: POST { prompt } -> { mime, image (dataURL), filename }
 
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations";
 
 function origins() {
@@ -39,9 +41,129 @@ function looksLikeWorksheet(prompt) {
     p.includes("cause") ||
     p.includes("effect") ||
     p.includes("compare") ||
-    p.includes("critical thinking")
+    p.includes("critical thinking") ||
+    p.includes("a4") ||
+    p.includes("handout") ||
+    p.includes("classroom")
   );
 }
+
+function clampText(s, maxChars) {
+  const t = String(s || "").trim();
+  if (t.length <= maxChars) return t;
+  return t.slice(0, maxChars - 1) + "…";
+}
+
+function safeFilename(base) {
+  const cleaned = String(base || "image")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `${cleaned || "image"}-${stamp}.webp`;
+}
+
+function isProbablyTooLongForServerless(prompt) {
+  return String(prompt || "").length > 6000;
+}
+
+async function fetchWithTimeout(url, options, timeoutMs = 60000) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { ...options, signal: ctrl.signal });
+    return resp;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/* ---------------- Prompt Enhancer ---------------- */
+
+function buildPromptEnhancerSystem() {
+  return `
+You are Be Cre8v Image Prompt Enhancer.
+Rewrite the user's request into the BEST-POSSIBLE image-generation prompt for a kids STEM/learning brand.
+Output ONLY the final improved prompt text. No explanations.
+
+Global rules:
+- Keep the user's core intent, topic, and constraints.
+- Kid-safe only (no sexual content, gore, self-harm, hate, weapons instructions).
+- No watermarks, no logos, no copyrighted characters.
+- Avoid neon gradients. Prefer clean solid-color design language cues and tasteful accents.
+- Ensure readable text if a worksheet/poster is requested.
+
+If the user asks for a worksheet/printable:
+- ONE SINGLE PAGE, A4 portrait, printable classroom worksheet.
+- Clean grid, consistent margins, clear sections, high readability.
+- 6–9 sections max. Use bullets, checkboxes, short lines (no tiny paragraphs).
+- Include: quick facts, timeline, cause/effect, key terms/people, 3 critical-thinking prompts, 4-question mini quiz, reflection lines.
+- Add 1 main illustration + 2–4 small icons/illustrations relevant to the topic.
+- Text must be large enough to read.
+
+If not a worksheet:
+- Create a premium, clean, kid-friendly image suited to the request (illustration/poster/realistic as appropriate).
+- Clear composition, high quality, helpful detail without clutter.
+`.trim();
+}
+
+async function enhancePrompt({ apiKey, userPrompt, isWorksheet }) {
+  const trimmedUser = clampText(userPrompt, 2500);
+  const classifierHint = isWorksheet
+    ? "The user is requesting a worksheet/printable."
+    : "The user is requesting a general image (not necessarily a worksheet).";
+
+  const payload = {
+    model: "gpt-4o-mini",
+    temperature: 0.25,
+    messages: [
+      { role: "system", content: buildPromptEnhancerSystem() },
+      {
+        role: "user",
+        content:
+          `${classifierHint}\n\nUser request:\n` +
+          trimmedUser +
+          `\n\nHard constraints:\n- kid-safe\n- no watermarks/logos\n- output is a single image`,
+      },
+    ],
+  };
+
+  const r = await fetchWithTimeout(
+    OPENAI_CHAT_URL,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+    45000
+  );
+
+  if (!r.ok) {
+    const err = await r.text().catch(() => "");
+    return {
+      ok: false,
+      prompt: null,
+      error: `Prompt enhancer error status=${r.status} ${err.slice(0, 600)}`,
+    };
+  }
+
+  const data = await r.json().catch(() => ({}));
+  const out =
+    data?.choices?.[0]?.message?.content &&
+    String(data.choices[0].message.content).trim();
+
+  if (!out) {
+    return { ok: false, prompt: null, error: "Prompt enhancer returned empty output." };
+  }
+
+  return { ok: true, prompt: clampText(out, 3500), error: null };
+}
+
+/* ---------------- Main Handler ---------------- */
 
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
@@ -70,114 +192,82 @@ export default async function handler(req, res) {
       return res.status(500).json({ message: "Missing OPENAI_API_KEY" });
     }
 
-    const isWorksheet = looksLikeWorksheet(prompt);
+    const userPromptRaw = String(prompt).trim();
+    const isWorksheet = looksLikeWorksheet(userPromptRaw);
 
-    const safety = `
-Kid-safe educational content for children.
-No sexual content. No gore. No violence instructions.
-No watermark. No logos.
-`.trim();
+    const userPrompt = isProbablyTooLongForServerless(userPromptRaw)
+      ? clampText(userPromptRaw, 5500)
+      : userPromptRaw;
 
-    // This is the key: push style + layout + density HARD
-    const premiumVintageWorksheet = `
-Create ONE SINGLE PAGE printable worksheet (A4 portrait).
-Make it extremely beautiful and premium, like a museum-style illustrated worksheet / vintage parchment poster.
+    // 1) Enhance prompt (quality boost)
+    const enhanced = await enhancePrompt({ apiKey, userPrompt, isWorksheet });
 
-Visual style (very important):
-- vintage parchment paper background with subtle texture
-- warm earthy palette (tan, sepia, muted reds/greens/blues)
-- decorative header banner, small icons, elegant borders/dividers
-- high-quality hand-painted illustration style (not cartoon), like an old history book illustration
-- very aesthetic, balanced, professional layout, lots of visual polish
+    // Fallback: still generate even if enhancer fails
+    const finalPrompt = enhanced.ok && enhanced.prompt ? enhanced.prompt : userPrompt;
 
-Layout rules:
-- single page only, no multi-page, no repeated pages
-- clean grid layout with consistent margins
-- 6 to 8 content blocks maximum, clearly separated
-- readable hierarchy: big title, section headings, body text, checkboxes/lines
-- include 1 hero illustration and 2–3 small supporting illustrations/icons
-- include fill-in lines and small checkboxes where appropriate
+    // 2) Image generation (NO response_format here — it causes 400)
+    const imgPayload = {
+      model: "gpt-image-1",
+      prompt: finalPrompt,
+      size: isWorksheet ? "1024x1536" : "1024x1024",
+      n: 1,
+    };
 
-Make it highly informational (very important):
-Include these sections (adapt to the topic):
-1) quick facts (4–6 bullets)
-2) key people / key terms box (short)
-3) timeline (5–7 points)
-4) causes vs effects (two-column)
-5) map/places/events (small box, even if symbolic)
-6) critical thinking (3 prompts)
-7) mini quiz (4 questions with options A/B/C or true/false)
-8) reflection (1 longer prompt with lines)
-
-Text rendering note:
-- keep text short, clear, aligned, and large enough to read
-- prefer bullets and short lines
-- no tiny paragraphs
-`.trim();
-
-    const realisticIllustration = `
-Style:
-- realistic, high-quality illustration (not cartoon)
-- natural lighting, clean composition
-- no exaggerated anime/cartoon look
-`.trim();
-
-    const finalPrompt = `
-${safety}
-
-${isWorksheet ? premiumVintageWorksheet : realisticIllustration}
-
-User request:
-${String(prompt).trim()}
-
-Hard constraints:
-- single page only
-- printable worksheet/poster aesthetic
-- very information-dense but not cluttered
-`.trim();
-
-    const r = await fetch(OPENAI_IMAGE_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json"
+    const r = await fetchWithTimeout(
+      OPENAI_IMAGE_URL,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(imgPayload),
       },
-      body: JSON.stringify({
-        model: "gpt-image-1",
-        prompt: finalPrompt,
-        // portrait for worksheets gives far better layouts
-        size: isWorksheet ? "1024x1536" : "1024x1024",
-        n: 1
-      })
-    });
+      90000
+    );
 
     if (!r.ok) {
-      const err = await r.text();
+      const err = await r.text().catch(() => "");
       return res.status(r.status).json({
         message: "Image API error",
-        details: err.slice(0, 1500)
+        details: err.slice(0, 1500),
+        debug: {
+          isWorksheet,
+          enhancerOk: enhanced.ok,
+          enhancerError: enhanced.ok ? null : enhanced.error,
+        },
       });
     }
 
-    const data = await r.json();
+    const data = await r.json().catch(() => ({}));
     const b64 = data?.data?.[0]?.b64_json;
 
     if (!b64) {
-      return res.status(500).json({ message: "No image returned" });
+      return res.status(500).json({
+        message: "No image returned",
+        debug: {
+          isWorksheet,
+          enhancerOk: enhanced.ok,
+          enhancerError: enhanced.ok ? null : enhanced.error,
+          hasData: !!data?.data?.length,
+          firstKeys: data?.data?.[0] ? Object.keys(data.data[0]) : [],
+        },
+      });
     }
 
-    // Use webp for size; browser download works fine
     const mime = "image/webp";
     const dataUrl = `data:${mime};base64,${b64}`;
+    const filename = isWorksheet ? safeFilename("worksheet") : safeFilename("image");
 
     return res.status(200).json({
       mime,
-      image: dataUrl
+      image: dataUrl,
+      filename,
     });
   } catch (e) {
     return res.status(500).json({
       message: "Server error",
-      details: String(e?.message || e)
+      details: String(e?.message || e),
     });
   }
 }
