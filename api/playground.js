@@ -482,28 +482,60 @@ function buildGroundedContext({ detectedProject, projectContext, canonicalPinsTe
 
 function extractProjectBlock(kb, projectName) {
   const projects = Array.isArray(kb?.projects) ? kb.projects : [];
-  const components = Array.isArray(kb?.contents) ? kb.contents : [];
+  const components =
+  Array.isArray(kb?.components)
+    ? kb.components
+    : Array.isArray(kb?.contents)
+    ? kb.contents
+    : [];
 
   const componentMap = {};
-  for (const c of components) componentMap[c.id] = c.name;
-
-  const project = projects.find(
-    (p) =>
-      p.name === projectName ||
-      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
-  );
+for (const c of components) {
+  const key = c.id || c.name;
+  componentMap[key] = {
+    name: c.name || c.id,
+    description: c.description || c.desc || ""
+  };
+}
+ const project = projects.find(
+  (p) =>
+    String(p.name).toLowerCase() === projectName.toLowerCase() ||
+    (Array.isArray(p.aliases) &&
+      p.aliases.some(
+        (a) => String(a).toLowerCase() === projectName.toLowerCase()
+      ))
+);
 
   if (!project) return null;
 
   let text = "";
   text += `Project Name: ${project.name}\n`;
+ if (project.description) text += `Description: ${project.description}\n`;
+if (project.about) text += `Description: ${project.about}\n`;
+if (project.overview) text += `Description: ${project.overview}\n`;
   if (project.difficulty) text += `Difficulty: ${project.difficulty}\n`;
   if (project.estimated_time) text += `Estimated Time: ${project.estimated_time}\n`;
+if (Array.isArray(project.components_used)) {
 
-  if (Array.isArray(project.components_used)) {
-    const readable = project.components_used.map((id) => componentMap[id] || id);
-    text += `Components Used: ${readable.join(", ")}\n`;
-  }
+  const readable = project.components_used.map((item) => {
+
+    // item can be id OR name
+    const key = String(item);
+const found = componentMap[key];
+
+
+    if (!found) return String(item);
+
+    if (found.description) {
+      return `${found.name} – ${found.description}`;
+    }
+
+    return found.name;
+  });
+
+  text += `Components Used:\n- ${readable.join("\n- ")}\n`;
+}
+
 
   return text.trim();
 }
@@ -512,15 +544,23 @@ function extractLessons(kb, projectName) {
   const projects = Array.isArray(kb?.projects) ? kb.projects : [];
   const project = projects.find(
     (p) =>
-      p.name === projectName ||
-      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
-  );
+    String(p.name).toLowerCase() === projectName.toLowerCase() ||
+    (Array.isArray(p.aliases) &&
+      p.aliases.some(
+        (a) => String(a).toLowerCase() === projectName.toLowerCase()
+      ))
+);
+
+  ;
 
   if (!project || !Array.isArray(project.lessons)) return [];
 
   return project.lessons.map((l) => ({
     lessonName: l.lesson_name,
-    videoLinks: l.videoLinks || [],
+    videoLinks:
+  l.videoLinks ||
+  l.vidvideoLinkseo_url ||
+  [],
     explainLine: l.explainLine || null,
   }));
 }
