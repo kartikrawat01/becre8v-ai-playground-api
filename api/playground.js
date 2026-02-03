@@ -1,11 +1,12 @@
 // /api/playground.js
-// Robocoders AI Playground (chat endpoint) — Enhanced v2
-// - Handles basic overview questions about the kit
-// - Maintains all existing deterministic flows (LIST_PROJECTS, PROJECT_VIDEOS)
-// - Improved prompt planner for better conversational quality
-// - Grounded context with KB data
+// Robocoders AI Playground (chat endpoint) — CORS + deterministic flows + grounded OpenAI call
+// Payload formats supported:
+// - { input, messages, attachment } (current frontend)
+// - { message, history } (older format)
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+
+/* ---------------- CORS helpers ---------------- */
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -14,23 +15,45 @@ function origins() {
     .filter(Boolean);
 }
 
-function allow(res, origin) {
+// Allow request if:
+// - Origin is allowed, OR
+// - Origin missing but Referer is allowed (some environments show Origin:null)
+function isAllowedOrigin(req) {
+  const list = origins();
+  if (!list.length) return true; // if not set, allow all (not recommended, but avoids lockout)
+
+  const origin = (req.headers.origin || "").trim();
+  const referer = (req.headers.referer || "").trim();
+
+  if (origin && list.some((a) => origin.startsWith(a))) return { ok: true, by: "origin", value: origin };
+  if (!origin && referer && list.some((a) => referer.startsWith(a))) return { ok: true, by: "referer", value: referer };
+
+  return { ok: false, by: origin ? "origin" : "referer", value: origin || referer || null };
+}
+
+function setCors(res, req) {
+  const origin = (req.headers.origin || "").trim();
+  const allow = isAllowedOrigin(req);
+
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (!origin) return false;
-  const list = origins();
-  if (!list.length || list.some((a) => origin.startsWith(a))) {
+
+  // If origin is present and allowed, echo it back
+  if (allow.ok && origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
-    return true;
   }
-  return false;
+
+  return allow;
 }
 
-/* -------------------- Chat Prompt Planner -------------------- */
+/* ---------------- Prompt Planner ---------------- */
+
 const CHAT_PLANNER_PROMPT = `
 You are Be Cre8v AI Conversation Planner.
+
 Rewrite the user's message into a clearer, more intelligent version BEFORE it is answered.
+
 Rules:
 - Do NOT answer the user.
 - Output ONLY the rewritten prompt text.
@@ -57,51 +80,59 @@ async function planChatPrompt(userText, apiKey) {
       ],
     }),
   });
+
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     throw new Error("Planner error: " + t.slice(0, 800));
   }
+
   const data = await r.json();
   const out = data?.choices?.[0]?.message?.content?.trim();
   return out || String(userText || "").trim();
 }
 
-/* -------------------- Handler -------------------- */
-export default async function handler(req, res) {
-  const origin = req.headers.origin || "";
-  
-  // 1) Preflight for CORS
+/* ---------------- Main handler ---------------- */
+
+module.exports = async function handler(req, res) {
+  // 1) CORS preflight
   if (req.method === "OPTIONS") {
-    allow(res, origin);
+    setCors(res, req);
     return res.status(204).end();
   }
-  
-  // 2) Allowlist origin
-  if (!allow(res, origin)) {
-    return res
-      .status(403)
-      .json({ error: "Forbidden origin", origin, allowed: origins() });
+
+  // 2) CORS allowlist
+  const allow = setCors(res, req);
+  if (!allow.ok) {
+    return res.status(403).json({
+      error: "Forbidden origin",
+      seenOrigin: (req.headers.origin || null),
+      seenReferer: (req.headers.referer || null),
+      allowedOriginEnv: process.env.ALLOWED_ORIGIN || "",
+      allowedOriginsParsed: origins(),
+    });
   }
-  
+
   // 3) Only POST
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed. Use POST." });
   }
 
   try {
-    // ---- Accept both payload shapes ----
     const body = req.body || {};
+
     const message =
       typeof body.message === "string"
         ? body.message
         : typeof body.input === "string"
         ? body.input
         : "";
+
     const history = Array.isArray(body.history)
       ? body.history
       : Array.isArray(body.messages)
       ? body.messages
       : [];
+
     const attachment = body.attachment || null;
 
     if (!message || typeof message !== "string") {
@@ -110,13 +141,12 @@ export default async function handler(req, res) {
 
     const rawUserText = String(message || "").trim();
 
-    // --------- Load KB ----------
+    // Load KB
     const knowledgeUrl = process.env.KNOWLEDGE_URL;
     if (!knowledgeUrl) {
-      return res
-        .status(500)
-        .json({ error: "KNOWLEDGE_URL is not set in env." });
+      return res.status(500).json({ error: "KNOWLEDGE_URL is not set in env." });
     }
+
     const kbResp = await fetch(knowledgeUrl, { cache: "no-store" });
     if (!kbResp.ok) {
       return res.status(500).json({
@@ -125,52 +155,26 @@ export default async function handler(req, res) {
     }
     const kb = await kbResp.json();
 
-    // --------- Build indexes ----------
-    const {
-      projectNames,
-      projectsByName,
-      lessonsByProject,
-      canonicalPinsText,
-      safetyText,
-      kitOverview,
-      componentsSummary,
-      projectsSummary,
-    } = buildIndexes(kb);
+    const { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText } =
+      buildIndexes(kb);
 
-    // --------- Intent detection (deterministic) ----------
     const rawIntent = detectIntent(rawUserText);
-    const rawDetectedProject = detectProject(rawUserText, projectNames);
+const detectedComponent = detectComponent(rawUserText, kb);
+if (detectedComponent) {
+  return res.status(200).json({
+    text: `${detectedComponent.name}:\n${detectedComponent.description}`,
+    debug: { detectedComponent: detectedComponent.name, kbMode: "component-lookup" },
+  });
+}
 
-    // --------- Handle KIT_OVERVIEW intent (NEW) ----------
-    if (rawIntent.type === "KIT_OVERVIEW") {
-      return res.status(200).json({
-        text: kitOverview,
-        debug: {
-          intent: rawIntent,
-          kbMode: "deterministic_overview",
-        },
-      });
-    }
+    const rawDetectedProject = detectProject(rawUserText, projectNames, kb);
 
-    // --------- Handle COMPONENTS_LIST intent (NEW) ----------
-    if (rawIntent.type === "COMPONENTS_LIST") {
-      const componentsText = formatComponentsList(componentsSummary);
-      return res.status(200).json({
-        text: componentsText,
-        debug: {
-          intent: rawIntent,
-          kbMode: "deterministic_components",
-        },
-      });
-    }
-
-    // --------- Handle LIST_PROJECTS intent ----------
+    // Deterministic: list projects
     if (rawIntent.type === "LIST_PROJECTS") {
       return res.status(200).json({
         text:
-          `The Robocoders Kit includes ${projectsSummary.totalCount} exciting projects:\n\n` +
-          projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n") +
-          "\n\nTell me which project you'd like to learn more about!",
+          "Robocoders Kit projects/modules:\n\n" +
+          projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n"),
         debug: {
           detectedProject: rawDetectedProject || null,
           intent: rawIntent,
@@ -179,24 +183,26 @@ export default async function handler(req, res) {
       });
     }
 
-    // --------- Handle PROJECT_VIDEOS intent ----------
+    // Deterministic: project videos
     if (rawIntent.type === "PROJECT_VIDEOS") {
       if (!rawDetectedProject) {
         return res.status(200).json({
           text:
-            "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I'll share all the relevant lesson videos for that project.",
+            "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I’ll share all the relevant lesson videos for that project.",
           debug: { detectedProject: null, intent: rawIntent },
         });
       }
+
       const videos = lessonsByProject[rawDetectedProject] || [];
       if (!videos.length) {
         return res.status(200).json({
           text:
             `I found the project "${rawDetectedProject}", but no lesson videos are mapped for it in the knowledge file.\n` +
-            "If you share the lesson links for this project, I'll add them into the KB mapping.",
+            "If you share the lesson links for this project, I’ll add them into the KB mapping.",
           debug: { detectedProject: rawDetectedProject, intent: rawIntent, videosFound: 0 },
         });
       }
+
       const out =
         `Lesson videos for ${rawDetectedProject}:\n\n` +
         videos
@@ -209,6 +215,7 @@ export default async function handler(req, res) {
             );
           })
           .join("\n\n");
+
       return res.status(200).json({
         text: out,
         debug: {
@@ -220,47 +227,38 @@ export default async function handler(req, res) {
       });
     }
 
-    // --------- OpenAI key ----------
+    // OpenAI key
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return res
-        .status(500)
-        .json({ error: "OPENAI_API_KEY is not set in env." });
+      return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
     }
 
-    // --------- Planner (ONLY for GENERAL) ----------
+    // Planner (best effort)
     let plannedUserText = rawUserText;
     try {
       plannedUserText = await planChatPrompt(rawUserText, apiKey);
-    } catch (plannerErr) {
+    } catch (e) {
       plannedUserText = rawUserText;
     }
 
-    // Re-run project detection using planned text if raw didn't detect
-    const detectedProject =
-      rawDetectedProject || detectProject(plannedUserText, projectNames);
+    const detectedProject = rawDetectedProject || detectProject(plannedUserText, projectNames, kb);
     const intent = rawIntent;
 
-    // --------- Build grounded context for model ----------
-    const projectContext = detectedProject
-      ? projectsByName[detectedProject] || null
-      : null;
+    const projectContext = detectedProject ? projectsByName[detectedProject] || null : null;
+
     const groundedContext = buildGroundedContext({
+        kb,
       detectedProject,
       projectContext,
       canonicalPinsText,
       safetyText,
-      kitOverview,
-      componentsSummary,
-      projectsSummary,
-      lessonsForProject: detectedProject
-        ? lessonsByProject[detectedProject] || []
-        : [],
+      lessonsForProject: detectedProject ? lessonsByProject[detectedProject] || [] : [],
       intent,
       attachment,
     });
 
     const system = buildSystemPrompt();
+
     const trimmedHistory = Array.isArray(history)
       ? history
           .slice(-10)
@@ -296,9 +294,7 @@ export default async function handler(req, res) {
     }
 
     const data = await resp.json();
-    const answer =
-      data?.choices?.[0]?.message?.content?.trim() ||
-      "I couldn't generate a response.";
+    const answer = data?.choices?.[0]?.message?.content?.trim() || "I couldn’t generate a response.";
 
     return res.status(200).json({
       text: answer,
@@ -315,9 +311,10 @@ export default async function handler(req, res) {
       details: String(e?.message || e),
     });
   }
-}
+};
 
-/* ----------------------- Helpers ----------------------- */
+/* ---------------- Helpers ---------------- */
+
 function buildSystemPrompt() {
   return `
 You are the Robocoders Kit assistant for children aged 8–14 and parents.
@@ -325,38 +322,32 @@ You are the Robocoders Kit assistant for children aged 8–14 and parents.
 Hard rules:
 - Only answer from the provided Grounded Context. If info is missing, say what is missing and ask for the exact project/module name or the missing detail.
 - Never mix projects. If the user asks Candle Lamp, do not give Mood Lamp content (and vice versa).
-- Never invent pins. If pin info is not present in Grounded Context, say you don't have it.
+- Never invent pins. If pin info is not present in Grounded Context, say you don’t have it.
 - If user asks for materials/components of a project, provide only that project's Components Used (do not dump the full kit list).
-- If user asks for lesson videos or "not working" troubleshooting: do NOT guess random links. Only share links listed in Grounded Context.
-- Safety: Do not discuss sexual content, pregnancy, "how babies are made", romantic/valentines content, horror movies, or any adult topics. Politely refuse and redirect to Robocoders help.
+- If user asks for lesson videos or “not working” troubleshooting: do NOT guess random links. Only share links listed in Grounded Context.
+- Safety: Do not discuss sexual content, pregnancy, “how babies are made”, romantic/valentines content, horror movies, or any adult topics. Politely refuse and redirect to Robocoders help.
 
 Style:
 - Simple, calm, step-by-step.
-- Friendly and encouraging tone for kids.
-- If it's a troubleshooting question: suggest order = Connections first, then Build, then Coding, then Working, then Introduction.
-- For overview questions, provide clear, concise answers from the Kit Overview section.
+- If it’s a troubleshooting question: suggest order = Connections first, then Build, then Coding, then Working, then Introduction.
 `.trim();
 }
 
 function buildIndexes(kb) {
-  // Extract overview information (NEW)
-  const kitOverview = extractKitOverview(kb);
-  const componentsSummary = extractComponentsSummary(kb);
-  const projectsSummary = extractProjectsSummary(kb);
+  if (!kb.pages && Array.isArray(kb.contents)) {
+    kb.pages = kb.contents.map((c) => ({ text: `${c.name}: ${c.description}` }));
+  }
 
   const projectNames = [];
-  const candidates =
-    kb?.canonical?.projects ||
-    kb?.projects ||
-    kb?.modules ||
-    kb?.glossary?.projects ||
-    [];
+  const candidates = kb?.canonical?.projects || kb?.projects || kb?.modules || kb?.glossary?.projects || [];
+
   if (Array.isArray(candidates) && candidates.length) {
     for (const p of candidates) {
       const name = typeof p === "string" ? p : p?.name;
       if (name && !projectNames.includes(name)) projectNames.push(name);
     }
   }
+
   if (!projectNames.length && Array.isArray(kb?.pages)) {
     for (const pg of kb.pages) {
       const t = (pg?.text || "").trim();
@@ -367,6 +358,8 @@ function buildIndexes(kb) {
       }
     }
   }
+
+  // fallback list (only if KB is missing project list)
   if (!projectNames.length) {
     projectNames.push(
       "Hello World!",
@@ -395,157 +388,94 @@ function buildIndexes(kb) {
 
   const projectsByName = {};
   for (const name of projectNames) {
-    projectsByName[name] = extractProjectBlock(kb, name);
+    projectsByName[name] = extractProjectBlock(kb, name) || "";
   }
 
   const lessonsByProject = {};
   for (const name of projectNames) {
     lessonsByProject[name] = extractLessons(kb, name);
-    lessonsByProject[name].sort(
-      (a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName)
-    );
+    lessonsByProject[name].sort((a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName));
   }
 
-  const canonicalPinsText =
-    extractCanonicalPins(kb) || "Canonical pin rules not found.";
+  const canonicalPinsText = extractCanonicalPins(kb) || "Canonical pin rules not found.";
   const safetyText =
     extractSafety(kb) ||
     "Robocoders is low-voltage and kid-safe. No wall power. No cutting or soldering. Adult help allowed when needed.";
 
-  return {
-    projectNames,
-    projectsByName,
-    lessonsByProject,
-    canonicalPinsText,
-    safetyText,
-    kitOverview,
-    componentsSummary,
-    projectsSummary,
-  };
+  return { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText };
 }
 
 function detectIntent(text) {
   const t = text.toLowerCase();
 
-  // Check for kit overview questions (NEW)
-  const overviewWords = [
-    "what is robocoders",
-    "what's robocoders",
-    "tell me about robocoders",
-    "robocoders kit",
-    "what is the kit",
-    "describe the kit",
-    "explain robocoders",
-  ];
-  if (overviewWords.some((phrase) => t.includes(phrase))) {
-    return { type: "KIT_OVERVIEW" };
-  }
-
-  // Check for components list questions (NEW)
-  const componentWords = [
-    "what is inside",
-    "what's inside",
-    "components in the kit",
-    "what components",
-    "list of components",
-    "all components",
-    "kit contents",
-    "what comes with",
-  ];
-  if (componentWords.some((phrase) => t.includes(phrase))) {
-    return { type: "COMPONENTS_LIST" };
-  }
-
-  const wantsList =
-    t.includes("projects") ||
-    t.includes("modules") ||
-    t.includes("all project") ||
-    t.includes("all module");
-  if (
-    wantsList &&
-    (t.includes("what are") || t.includes("list") || t.includes("give") || t.includes("how many") || t.includes("total"))
-  ) {
-    return { type: "LIST_PROJECTS" };
-  }
+  const wantsList = t.includes("projects") || t.includes("modules") || t.includes("all project") || t.includes("all module");
+  if (wantsList && (t.includes("what are") || t.includes("list") || t.includes("give"))) return { type: "LIST_PROJECTS" };
 
   const videoWords = ["video", "videos", "lesson", "lessons", "link", "youtube"];
-  const troubleWords = [
-    "not working",
-    "doesn't work",
-    "not responding",
-    "stuck",
-    "problem",
-    "issue",
-    "error",
-  ];
-  if (
-    videoWords.some((w) => t.includes(w)) ||
-    troubleWords.some((w) => t.includes(w))
-  ) {
+  const troubleWords = ["not working", "doesn't work", "not responding", "stuck", "problem", "issue", "error"];
+
+  if (videoWords.some((w) => t.includes(w)) || troubleWords.some((w) => t.includes(w))) {
     return { type: "PROJECT_VIDEOS" };
   }
 
   return { type: "GENERAL" };
 }
 
-function detectProject(text, projectNames) {
+function detectProject(text, projectNames, kb) {
   const t = text.toLowerCase();
+
+  // exact project name match
   for (const p of projectNames) {
     if (t.includes(p.toLowerCase())) return p;
   }
-  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]+/g, "");
-  const nt = norm(text);
-  let best = null;
-  let bestScore = 0;
-  for (const p of projectNames) {
-    const np = norm(p);
-    if (!np) continue;
-    let score = 0;
-    if (nt.includes(np)) score += 10;
-    const chunks = np
-      .split(
-        /(world|lamp|game|controller|counter|box|instrument|booth|meter|dice|fan|disco|motion|rgb|fruit|pingpong|ufo|extension|pulley|candle)/
-      )
-      .filter(Boolean);
-    for (const c of chunks) {
-      if (c.length >= 4 && nt.includes(c)) score += 1;
-    }
-    if (score > bestScore) {
-      bestScore = score;
-      best = p;
+
+  // alias match
+  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
+  for (const p of projects) {
+    if (Array.isArray(p.aliases)) {
+      for (const a of p.aliases) {
+        if (t.includes(String(a).toLowerCase())) return p.name;
+      }
     }
   }
-  return bestScore >= 2 ? best : null;
+
+  return null;
 }
 
-function buildGroundedContext({
-  detectedProject,
-  projectContext,
-  canonicalPinsText,
-  safetyText,
-  kitOverview,
-  componentsSummary,
-  projectsSummary,
-  lessonsForProject,
-  intent,
-  attachment,
-}) {
+function buildGroundedContext({ kb, detectedProject, projectContext, canonicalPinsText, safetyText, lessonsForProject, intent, attachment })
+ {
   const lines = [];
+
   lines.push("Grounded Context (authoritative):");
   lines.push("");
-
-  // Always include kit overview for context
-  lines.push("Kit Overview:");
-  lines.push(kitOverview);
-  lines.push("");
-
   lines.push("Safety:");
   lines.push(safetyText);
   lines.push("");
+ if (!detectedProject && Array.isArray(attachment) === false) {
+  // 1️⃣ Detect if user asked about a component
+  const detectedComponent = detectComponent(rawUserText, kb);
 
-  lines.push("Canonical Brain / Pins / Ports rules:");
-  lines.push(canonicalPinsText);
+  // 2️⃣ Agar component mila, description return karo
+  if (detectedComponent) {
+    return res.status(200).json({
+      text: `${detectedComponent.name}:\n${detectedComponent.description}`,
+      debug: {
+        detectedComponent: detectedComponent.name,
+        kbMode: "component-lookup",
+      },
+    });
+  }
+
+  
+  lines.push("All available components (global list):");
+  lines.push(JSON.stringify(
+    (Array.isArray(kb?.components) ? kb.components :
+     Array.isArray(kb?.contents) ? kb.contents : []),
+    null,
+    2
+  ));
   lines.push("");
+}
 
   if (attachment && attachment.kind === "image") {
     lines.push("User attached an image.");
@@ -561,9 +491,7 @@ function buildGroundedContext({
     lines.push("");
   } else {
     lines.push("No project selected yet.");
-    lines.push(
-      "If the user question is project-specific, ask for the exact project/module name."
-    );
+    lines.push("If the user question is project-specific, ask for the exact project/module name.");
     lines.push("");
   }
 
@@ -574,232 +502,105 @@ function buildGroundedContext({
     } else {
       for (const l of lessonsForProject) {
         lines.push(`- ${l.lessonName}`);
-        if (l.explainLine) lines.push(`  Why: ${l.explainLine}`);
-        for (const u of l.videoLinks || []) lines.push(`  Link: ${u}`);
+        if (l.explainLine) lines.push(` Why: ${l.explainLine}`);
+        for (const u of l.videoLinks || []) lines.push(` Link: ${u}`);
       }
     }
     lines.push("");
   }
 
-  return lines.join("\n");
-}
-
-// NEW: Extract kit overview from KB
-function extractKitOverview(kb) {
-  if (kb?.overview) {
-    const o = kb.overview;
-    const lines = [];
-    lines.push(`**${o.kitName || "Robocoders Kit"}**`);
-    lines.push("");
-    if (o.description) lines.push(o.description);
-    lines.push("");
-    if (o.whatIsInside) {
-      lines.push("**What's Inside:**");
-      lines.push(o.whatIsInside);
-      lines.push("");
-    }
-    if (o.keyFeatures && Array.isArray(o.keyFeatures)) {
-      lines.push("**Key Features:**");
-      for (const f of o.keyFeatures) {
-        lines.push(`- ${f}`);
-      }
-      lines.push("");
-    }
-    if (o.totalProjects) lines.push(`Total Projects: ${o.totalProjects}`);
-    if (o.totalComponents) lines.push(`Total Components: ${o.totalComponents}`);
-    if (o.ageRange) lines.push(`Age Range: ${o.ageRange}`);
-    lines.push("");
-    if (o.safetyHighlights) {
-      lines.push("**Safety:**");
-      lines.push(o.safetyHighlights);
-    }
-    return lines.join("\n");
-  }
-  return "Robocoders Kit is an educational electronics and coding kit for children aged 8-14. It includes 21 projects and 92 components for learning physical computing, Visual Block Coding, and hands-on electronics.";
-}
-
-// NEW: Extract components summary
-function extractComponentsSummary(kb) {
-  if (kb?.componentsSummary) {
-    return kb.componentsSummary;
-  }
-  if (kb?.glossary?.components) {
-    return {
-      totalCount: Object.keys(kb.glossary.components).length,
-      components: kb.glossary.components,
-    };
-  }
-  return {
-    totalCount: 92,
-    description: "The kit includes various sensors, actuators, LEDs, motors, structural components, and craft materials.",
-  };
-}
-
-// NEW: Extract projects summary
-function extractProjectsSummary(kb) {
-  if (kb?.projectsSummary) {
-    return kb.projectsSummary;
-  }
-  if (kb?.canonical?.projects) {
-    return {
-      totalCount: kb.canonical.projects.length,
-      projectList: kb.canonical.projects,
-    };
-  }
-  return {
-    totalCount: 21,
-    projectList: [],
-  };
-}
-
-// NEW: Format components list for display
-function formatComponentsList(componentsSummary) {
-  const lines = [];
-  lines.push(`The Robocoders Kit contains ${componentsSummary.totalCount || 92} components including:\n`);
-  
-  if (componentsSummary.categories) {
-    const cats = componentsSummary.categories;
-    if (cats.controller) {
-      lines.push(`**Controller (${cats.controller.count}):**`);
-      lines.push(`- ${cats.controller.components.join(", ")}`);
-      lines.push("");
-    }
-    if (cats.sensors) {
-      lines.push(`**Sensors (${cats.sensors.count}):**`);
-      lines.push(`- ${cats.sensors.components.join(", ")}`);
-      lines.push("");
-    }
-    if (cats.actuators) {
-      lines.push(`**Actuators (${cats.actuators.count}):**`);
-      lines.push(`- ${cats.actuators.components.join(", ")}`);
-      lines.push("");
-    }
-    if (cats.lights) {
-      lines.push(`**Lights (${cats.lights.count}):**`);
-      lines.push(`- ${cats.lights.components.join(", ")}`);
-      lines.push("");
-    }
-    if (cats.power) {
-      lines.push(`**Power (${cats.power.count}):**`);
-      lines.push(`- ${cats.power.components.join(", ")}`);
-      lines.push("");
-    }
-    if (cats.structural) {
-      lines.push(`**Structural Components (${cats.structural.count}):**`);
-      lines.push(`- ${cats.structural.description}`);
-      lines.push("");
-    }
-    if (cats.craft) {
-      lines.push(`**Craft Materials (${cats.craft.count}):**`);
-      lines.push(`- ${cats.craft.components.join(", ")}`);
-      lines.push("");
-    }
-  }
-  
-  lines.push("\nWould you like to know more about any specific component?");
   return lines.join("\n");
 }
 
 function extractProjectBlock(kb, projectName) {
-  if (Array.isArray(kb?.pages)) {
-    const norm = (s) => s.toLowerCase();
-    const pNorm = norm(projectName);
-    const pages = kb.pages
-      .map((pg) => (pg?.text ? String(pg.text) : ""))
-      .filter(Boolean);
-    let start = -1;
-    for (let i = 0; i < pages.length; i++) {
-      const txt = pages[i].toLowerCase();
-      if (txt.includes("project name") && txt.includes(pNorm)) {
-        start = i;
-        break;
-      }
+  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
+  const components =
+  Array.isArray(kb?.components)
+    ? kb.components
+    : Array.isArray(kb?.contents)
+    ? kb.contents
+    : [];
+
+ const componentMap = {};
+for (const c of components) {
+  const key = String(c.id || c.name).toLowerCase();
+  componentMap[key] = {
+    name: c.name || c.id,
+    description: c.description || c.desc || ""
+  };
+}
+
+ const project = projects.find(
+  (p) =>
+    String(p.name).toLowerCase() === projectName.toLowerCase() ||
+    (Array.isArray(p.aliases) &&
+      p.aliases.some(
+        (a) => String(a).toLowerCase() === projectName.toLowerCase()
+      ))
+);
+
+  if (!project) return null;
+
+  let text = "";
+  text += `Project Name: ${project.name}\n`;
+ if (project.description) text += `Description: ${project.description}\n`;
+if (project.about) text += `Description: ${project.about}\n`;
+if (project.overview) text += `Description: ${project.overview}\n`;
+  if (project.difficulty) text += `Difficulty: ${project.difficulty}\n`;
+  if (project.estimated_time) text += `Estimated Time: ${project.estimated_time}\n`;
+if (Array.isArray(project.components_used)) {
+
+  const readable = project.components_used.map((item) => {
+
+    // item can be id OR name
+   const key = String(item).toLowerCase();
+const found = componentMap[key];
+    if (!found) return String(item);
+
+    if (found.description) {
+      return `${found.name} – ${found.description}`;
     }
-    if (start >= 0) {
-      const chunk = pages.slice(start, start + 6).join("\n\n");
-      return sanitizeChunk(chunk);
-    }
-  }
-  const p =
-    (kb?.projects && kb.projects[projectName]) ||
-    (Array.isArray(kb?.projects)
-      ? kb.projects.find((x) => x?.name === projectName)
-      : null);
-  if (p) {
-    const parts = [];
-    if (p.componentsUsed)
-      parts.push("Components Used:\n" + p.componentsUsed.join("\n"));
-    if (p.connections)
-      parts.push("Connections:\n" + p.connections.join("\n"));
-    if (p.steps) parts.push("Build Steps:\n" + p.steps.join("\n"));
-    return sanitizeChunk(parts.join("\n\n"));
-  }
-  return "";
+
+    return found.name;
+  });
+
+  text += `Components Used:\n- ${readable.join("\n- ")}\n`;
+}
+
+
+  return text.trim();
 }
 
 function extractLessons(kb, projectName) {
-  const lessons = [];
-  if (Array.isArray(kb?.pages)) {
-    const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-    const p = projectName.toLowerCase();
-    for (let i = 0; i < pages.length; i++) {
-      const txt = pages[i];
-      const low = txt.toLowerCase();
-      if (low.includes("project:") || low.includes("project :")) {
-        if (!low.includes(p)) continue;
-        const blocks = txt.split(/Lesson ID\s*[:\-]/i);
-        for (let b = 1; b < blocks.length; b++) {
-          const block = "Lesson ID:" + blocks[b];
-          const lessonName =
-            matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
-            matchLine(block, /Lesson Name\s*:\s*([^\n]+)/i) ||
-            "";
-          const links = [];
-          const linkMatches = block.match(/https?:\/\/[^\s\)]+/gi) || [];
-          for (const u of linkMatches) {
-            links.push(u.replace(/[\,\)\]]+$/g, ""));
-          }
-          const explainLine =
-            matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)When the AI/i) ||
-            matchLine(block, /What this lesson helps with\s*\(AI explanation line\)\s*:\s*([\s\S]*?)When the AI/i) ||
-            "";
-          if (lessonName && links.length) {
-            lessons.push({
-              lessonName: lessonName.trim(),
-              videoLinks: uniq(links),
-              explainLine: cleanExplain(explainLine),
-            });
-          }
-        }
-      }
-    }
-  }
-  if (!lessons.length && kb?.lessons && kb.lessons[projectName]) {
-    for (const l of kb.lessons[projectName]) {
-      lessons.push({
-        lessonName: l.lessonName,
-        videoLinks: Array.isArray(l.videoLinks)
-          ? l.videoLinks
-          : l.videoLink
-          ? [l.videoLink]
-          : [],
-        explainLine: l.explainLine || "",
-      });
-    }
-  }
-  return dedupeLessons(lessons);
+  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
+  const project = projects.find(
+    (p) =>
+    String(p.name).toLowerCase() === projectName.toLowerCase() ||
+    (Array.isArray(p.aliases) &&
+      p.aliases.some(
+        (a) => String(a).toLowerCase() === projectName.toLowerCase()
+      ))
+);
+
+  ;
+
+  if (!project || !Array.isArray(project.lessons)) return [];
+
+  return project.lessons.map((l) => ({
+    lessonName: l.lesson_name,
+    videoLinks:
+  l.videoLinks ||
+  l.vidvideoLinkseo_url ||
+  [],
+    explainLine: l.explainLine || null,
+  }));
 }
 
 function extractCanonicalPins(kb) {
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-    const idx = pages.findIndex((t) =>
-      t.toLowerCase().includes("fixed port mappings")
-    );
-    if (idx >= 0) {
-      const chunk = pages.slice(idx, idx + 3).join("\n\n");
-      return sanitizeChunk(chunk);
-    }
+    const idx = pages.findIndex((t) => t.toLowerCase().includes("fixed port mappings"));
+    if (idx >= 0) return sanitizeChunk(pages.slice(idx, idx + 3).join("\n\n"));
   }
   return "";
 }
@@ -808,12 +609,23 @@ function extractSafety(kb) {
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
     const idx = pages.findIndex((t) => t.toLowerCase().includes("global safety"));
-    if (idx >= 0) {
-      const chunk = pages.slice(idx, idx + 2).join("\n\n");
-      return sanitizeChunk(chunk);
-    }
+    if (idx >= 0) return sanitizeChunk(pages.slice(idx, idx + 2).join("\n\n"));
   }
   return "";
+}
+function findProjectsUsingComponent(kb, componentName) {
+  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
+  const key = componentName.toLowerCase();
+
+  return projects
+    .filter(
+      (p) =>
+        Array.isArray(p.components_used) &&
+        p.components_used.some((c) =>
+          String(c).toLowerCase().includes(key)
+        )
+    )
+    .map((p) => p.name);
 }
 
 function lessonRank(lessonName = "") {
@@ -832,41 +644,4 @@ function sanitizeChunk(s) {
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-function matchLine(text, regex) {
-  const m = String(text || "").match(regex);
-  if (!m) return "";
-  return (m[1] || "").trim();
-}
-
-function uniq(arr) {
-  const out = [];
-  const seen = new Set();
-  for (const x of arr || []) {
-    const k = String(x).trim();
-    if (!k || seen.has(k)) continue;
-    seen.add(k);
-    out.push(k);
-  }
-  return out;
-}
-
-function cleanExplain(s) {
-  return String(s || "")
-    .replace(/\n+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function dedupeLessons(lessons) {
-  const out = [];
-  const seen = new Set();
-  for (const l of lessons || []) {
-    const key = (l.lessonName || "").toLowerCase();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    out.push(l);
-  }
-  return out;
 }
