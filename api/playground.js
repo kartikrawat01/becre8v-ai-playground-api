@@ -1,5 +1,5 @@
 // /api/playground.js
-// Robocoders AI Playground (chat endpoint) — CommonJS + CORS + deterministic flows + grounded OpenAI call
+// Robocoders AI Playground (chat endpoint) — CORS + deterministic flows + grounded OpenAI call
 // Payload formats supported:
 // - { input, messages, attachment } (current frontend)
 // - { message, history } (older format)
@@ -20,23 +20,15 @@ function origins() {
 // - Origin missing but Referer is allowed (some environments show Origin:null)
 function isAllowedOrigin(req) {
   const list = origins();
-  if (!list.length) return { ok: true, by: "all", value: null };
+  if (!list.length) return true; // if not set, allow all (not recommended, but avoids lockout)
 
   const origin = (req.headers.origin || "").trim();
   const referer = (req.headers.referer || "").trim();
 
-  if (origin && list.some((a) => origin.startsWith(a))) {
-    return { ok: true, by: "origin", value: origin };
-  }
-  if (!origin && referer && list.some((a) => referer.startsWith(a))) {
-    return { ok: true, by: "referer", value: referer };
-  }
+  if (origin && list.some((a) => origin.startsWith(a))) return { ok: true, by: "origin", value: origin };
+  if (!origin && referer && list.some((a) => referer.startsWith(a))) return { ok: true, by: "referer", value: referer };
 
-  return {
-    ok: false,
-    by: origin ? "origin" : "referer",
-    value: origin || referer || null,
-  };
+  return { ok: false, by: origin ? "origin" : "referer", value: origin || referer || null };
 }
 
 function setCors(res, req) {
@@ -47,6 +39,7 @@ function setCors(res, req) {
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
+  // If origin is present and allowed, echo it back
   if (allow.ok && origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
   }
@@ -112,8 +105,8 @@ module.exports = async function handler(req, res) {
   if (!allow.ok) {
     return res.status(403).json({
       error: "Forbidden origin",
-      seenOrigin: req.headers.origin || null,
-      seenReferer: req.headers.referer || null,
+      seenOrigin: (req.headers.origin || null),
+      seenReferer: (req.headers.referer || null),
       allowedOriginEnv: process.env.ALLOWED_ORIGIN || "",
       allowedOriginsParsed: origins(),
     });
@@ -160,42 +153,25 @@ module.exports = async function handler(req, res) {
         error: `Failed to fetch knowledge JSON. status=${kbResp.status}`,
       });
     }
-
     const kb = await kbResp.json();
 
-    // Indexes
-    const {
-      projectNames,
-      projectsByName,
-      lessonsByProject,
-      canonicalPinsText,
-      safetyText,
-      componentIndex,
-    } = buildIndexes(kb);
+    const { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText } =
+      buildIndexes(kb);
 
-    // Deterministic intent + project detection from RAW text
     const rawIntent = detectIntent(rawUserText);
+    const detectedComponent = detectComponent(rawUserText, kb);
+
+if (detectedComponent) {
+  return res.status(200).json({
+    text: `${detectedComponent.name}:\n${detectedComponent.description}`,
+    debug: {
+      detectedComponent: detectedComponent.name,
+      kbMode: "component-lookup",
+    },
+  });
+}
+
     const rawDetectedProject = detectProject(rawUserText, projectNames, kb);
-
-    // Deterministic component lookup (only when NOT already inside a project)
-    // Example queries: "what is LDR", "servo ka kaam kya hai", "explain buzzer"
-    const detectedComponent = detectComponent(rawUserText, componentIndex);
-
-    if (detectedComponent && !rawDetectedProject) {
-      const projectsUsing = findProjectsUsingComponent(kb, detectedComponent.key);
-
-      const text =
-        `${detectedComponent.name}\n` +
-        `${detectedComponent.description ? `\nWhat it does (simple):\n${detectedComponent.description}\n` : ""}` +
-        (projectsUsing.length
-          ? `\nProjects that use this:\n- ${projectsUsing.join("\n- ")}\n`
-          : "");
-
-      return res.status(200).json({
-        text: text.trim(),
-        debug: { detectedComponent: detectedComponent.name, kbMode: "component-lookup" },
-      });
-    }
 
     // Deterministic: list projects
     if (rawIntent.type === "LIST_PROJECTS") {
@@ -269,7 +245,6 @@ module.exports = async function handler(req, res) {
       plannedUserText = rawUserText;
     }
 
-    // Use RAW intent (deterministic) but allow project detection on planned text
     const detectedProject = rawDetectedProject || detectProject(plannedUserText, projectNames, kb);
     const intent = rawIntent;
 
@@ -322,8 +297,7 @@ module.exports = async function handler(req, res) {
     }
 
     const data = await resp.json();
-    const answer =
-      data?.choices?.[0]?.message?.content?.trim() || "I couldn’t generate a response.";
+    const answer = data?.choices?.[0]?.message?.content?.trim() || "I couldn’t generate a response.";
 
     return res.status(200).json({
       text: answer,
@@ -368,12 +342,7 @@ function buildIndexes(kb) {
   }
 
   const projectNames = [];
-  const candidates =
-    kb?.canonical?.projects ||
-    kb?.projects ||
-    kb?.modules ||
-    kb?.glossary?.projects ||
-    [];
+  const candidates = kb?.canonical?.projects || kb?.projects || kb?.modules || kb?.glossary?.projects || [];
 
   if (Array.isArray(candidates) && candidates.length) {
     for (const p of candidates) {
@@ -436,38 +405,14 @@ function buildIndexes(kb) {
     extractSafety(kb) ||
     "Robocoders is low-voltage and kid-safe. No wall power. No cutting or soldering. Adult help allowed when needed.";
 
-  // Components index (supports kb.components or kb.contents)
-  const components =
-    Array.isArray(kb?.components)
-      ? kb.components
-      : Array.isArray(kb?.contents)
-      ? kb.contents
-      : [];
-
-  const componentIndex = buildComponentIndex(components);
-
-  return {
-    projectNames,
-    projectsByName,
-    lessonsByProject,
-    canonicalPinsText,
-    safetyText,
-    componentIndex,
-  };
+  return { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText };
 }
 
 function detectIntent(text) {
   const t = text.toLowerCase();
 
-  const wantsList =
-    t.includes("projects") ||
-    t.includes("modules") ||
-    t.includes("all project") ||
-    t.includes("all module");
-
-  if (wantsList && (t.includes("what are") || t.includes("list") || t.includes("give"))) {
-    return { type: "LIST_PROJECTS" };
-  }
+  const wantsList = t.includes("projects") || t.includes("modules") || t.includes("all project") || t.includes("all module");
+  if (wantsList && (t.includes("what are") || t.includes("list") || t.includes("give"))) return { type: "LIST_PROJECTS" };
 
   const videoWords = ["video", "videos", "lesson", "lessons", "link", "youtube"];
   const troubleWords = ["not working", "doesn't work", "not responding", "stuck", "problem", "issue", "error"];
@@ -482,10 +427,12 @@ function detectIntent(text) {
 function detectProject(text, projectNames, kb) {
   const t = text.toLowerCase();
 
+  // exact project name match
   for (const p of projectNames) {
     if (t.includes(p.toLowerCase())) return p;
   }
 
+  // alias match
   const projects = Array.isArray(kb?.projects) ? kb.projects : [];
   for (const p of projects) {
     if (Array.isArray(p.aliases)) {
@@ -497,88 +444,30 @@ function detectProject(text, projectNames, kb) {
 
   return null;
 }
+function detectComponent(text, kb) {
+  const t = text.toLowerCase();
 
-/* ---------- Component lookup ---------- */
+  const list =
+    Array.isArray(kb?.components)
+      ? kb.components
+      : Array.isArray(kb?.contents)
+      ? kb.contents
+      : [];
 
-function buildComponentIndex(components) {
-  const idx = [];
-
-  for (const c of components || []) {
-    const name = String(c?.name || c?.id || "").trim();
-    if (!name) continue;
-
-    const key = String(c?.id || c?.name || "").toLowerCase();
-
-    // aliases if present
-    const aliases = Array.isArray(c?.aliases) ? c.aliases : [];
-
-    idx.push({
-      key,
-      name,
-      description: String(c?.description || c?.desc || "").trim(),
-      aliases: aliases.map((a) => String(a).toLowerCase()),
-    });
-  }
-
-  return idx;
-}
-
-// Detect if user is asking “what is X / explain X / X ka kaam”
-function detectComponent(userText, componentIndex) {
-  const t = String(userText || "").toLowerCase();
-
-  // quick gate: only attempt component lookup if message smells like “definition”
-  const gateWords = ["what is", "what’s", "explain", "meaning", "define", "ka kaam", "kya hai", "use of", "purpose of"];
-  const gated = gateWords.some((w) => t.includes(w));
-
-  // still allow if user directly types a component name like "servo"
-  // (we won't require gateWords strictly)
-  for (const c of componentIndex || []) {
-    const nameLower = c.name.toLowerCase();
-
-    if (t === nameLower || t.includes(` ${nameLower} `) || t.includes(nameLower)) {
-      return { ...c };
+  for (const c of list) {
+    const name = String(c.name || c.id || "").toLowerCase();
+    if (name && t.includes(name)) {
+      return {
+        name: c.name || c.id,
+        description: c.description || c.desc || "No description available."
+      };
     }
-
-    for (const a of c.aliases || []) {
-      if (a && (t === a || t.includes(a))) return { ...c };
-    }
-  }
-
-  if (!gated) return null;
-
-  // if gated but no direct match, try partial match (short names)
-  for (const c of componentIndex || []) {
-    const n = c.name.toLowerCase();
-    if (n.length >= 3 && t.includes(n)) return { ...c };
   }
 
   return null;
 }
 
-function findProjectsUsingComponent(kb, componentKeyOrName) {
-  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
-  const needle = String(componentKeyOrName || "").toLowerCase();
-
-  return projects
-    .filter((p) => Array.isArray(p.components_used))
-    .filter((p) =>
-      p.components_used.some((c) => String(c).toLowerCase().includes(needle))
-    )
-    .map((p) => p.name);
-}
-
-/* ---------- Grounded context ---------- */
-
-function buildGroundedContext({
-  detectedProject,
-  projectContext,
-  canonicalPinsText,
-  safetyText,
-  lessonsForProject,
-  intent,
-  attachment,
-}) {
+function buildGroundedContext({ detectedProject, projectContext, canonicalPinsText, safetyText, lessonsForProject, intent, attachment }) {
   const lines = [];
 
   lines.push("Grounded Context (authoritative):");
@@ -625,53 +514,45 @@ function buildGroundedContext({
   return lines.join("\n");
 }
 
-/* ---------- Project extraction ---------- */
-
 function extractProjectBlock(kb, projectName) {
   const projects = Array.isArray(kb?.projects) ? kb.projects : [];
-  const components =
-    Array.isArray(kb?.components)
-      ? kb.components
-      : Array.isArray(kb?.contents)
-      ? kb.contents
-      : [];
+ const components =
+  Array.isArray(kb?.components)
+    ? kb.components
+    : Array.isArray(kb?.contents)
+    ? kb.contents
+    : [];
 
-  const componentMap = {};
-  for (const c of components) {
-    const key = String(c.id || c.name || "").toLowerCase();
-    componentMap[key] = {
-      name: c.name || c.id,
-      description: c.description || c.desc || "",
-    };
-  }
+const componentMap = {};
+for (const c of components) {
+  const key = String(c.id || c.name).toLowerCase();
+  componentMap[key] = {
+    name: c.name || c.id,
+    description: c.description || c.desc || ""
+  };
+}
+
 
   const project = projects.find(
     (p) =>
-      String(p.name || "").toLowerCase() === String(projectName || "").toLowerCase() ||
-      (Array.isArray(p.aliases) &&
-        p.aliases.some((a) => String(a).toLowerCase() === String(projectName || "").toLowerCase()))
+      p.name === projectName ||
+      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
   );
 
   if (!project) return null;
 
   let text = "";
   text += `Project Name: ${project.name}\n`;
-  if (project.description) text += `Description: ${project.description}\n`;
-  if (project.about) text += `Description: ${project.about}\n`;
-  if (project.overview) text += `Description: ${project.overview}\n`;
   if (project.difficulty) text += `Difficulty: ${project.difficulty}\n`;
   if (project.estimated_time) text += `Estimated Time: ${project.estimated_time}\n`;
 
   if (Array.isArray(project.components_used)) {
-    const readable = project.components_used.map((item) => {
-      const key = String(item).toLowerCase();
-      const found = componentMap[key];
-      if (!found) return String(item);
-      if (found.description) return `${found.name} – ${found.description}`;
-      return found.name;
-    });
+    const readable = project.components_used.map((id) => {
+  const key = String(id).toLowerCase();
+  return componentMap[key]?.name || id;
+});
 
-    text += `Components Used:\n- ${readable.join("\n- ")}\n`;
+    text += `Components Used: ${readable.join(", ")}\n`;
   }
 
   return text.trim();
@@ -679,30 +560,20 @@ function extractProjectBlock(kb, projectName) {
 
 function extractLessons(kb, projectName) {
   const projects = Array.isArray(kb?.projects) ? kb.projects : [];
-
   const project = projects.find(
     (p) =>
-      String(p.name || "").toLowerCase() === String(projectName || "").toLowerCase() ||
-      (Array.isArray(p.aliases) &&
-        p.aliases.some((a) => String(a).toLowerCase() === String(projectName || "").toLowerCase()))
+      p.name === projectName ||
+      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
   );
 
   if (!project || !Array.isArray(project.lessons)) return [];
 
   return project.lessons.map((l) => ({
-    lessonName: l.lesson_name || l.lessonName || "",
-    videoLinks: Array.isArray(l.videoLinks)
-      ? l.videoLinks
-      : Array.isArray(l.video_links)
-      ? l.video_links
-      : l.videoLink
-      ? [l.videoLink]
-      : [],
+    lessonName: l.lesson_name,
+    videoLinks: l.videoLinks || [],
     explainLine: l.explainLine || null,
   }));
 }
-
-/* ---------- Misc ---------- */
 
 function extractCanonicalPins(kb) {
   if (Array.isArray(kb?.pages)) {
