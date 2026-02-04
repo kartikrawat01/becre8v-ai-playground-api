@@ -1,12 +1,11 @@
 // /api/playground.js
-// Robocoders AI Playground (chat endpoint) — CORS + deterministic flows + grounded OpenAI call
-// Payload formats supported:
-// - { input, messages, attachment } (current frontend)
-// - { message, history } (older format)
+// Robocoders AI Playground (chat endpoint) — Enhanced v3
+// - Improved JSON structure compatibility
+// - Better data extraction and fallback logic
+// - Enhanced conversational quality
+// - Grounded context with KB data
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
-
-/* ---------------- CORS helpers ---------------- */
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -15,45 +14,23 @@ function origins() {
     .filter(Boolean);
 }
 
-// Allow request if:
-// - Origin is allowed, OR
-// - Origin missing but Referer is allowed (some environments show Origin:null)
-function isAllowedOrigin(req) {
-  const list = origins();
-  if (!list.length) return true; // if not set, allow all (not recommended, but avoids lockout)
-
-  const origin = (req.headers.origin || "").trim();
-  const referer = (req.headers.referer || "").trim();
-
-  if (origin && list.some((a) => origin.startsWith(a))) return { ok: true, by: "origin", value: origin };
-  if (!origin && referer && list.some((a) => referer.startsWith(a))) return { ok: true, by: "referer", value: referer };
-
-  return { ok: false, by: origin ? "origin" : "referer", value: origin || referer || null };
-}
-
-function setCors(res, req) {
-  const origin = (req.headers.origin || "").trim();
-  const allow = isAllowedOrigin(req);
-
+function allow(res, origin) {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-
-  // If origin is present and allowed, echo it back
-  if (allow.ok && origin) {
+  if (!origin) return false;
+  const list = origins();
+  if (!list.length || list.some((a) => origin.startsWith(a))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
+    return true;
   }
-
-  return allow;
+  return false;
 }
 
-/* ---------------- Prompt Planner ---------------- */
-
+/* -------------------- Chat Prompt Planner -------------------- */
 const CHAT_PLANNER_PROMPT = `
 You are Be Cre8v AI Conversation Planner.
-
 Rewrite the user's message into a clearer, more intelligent version BEFORE it is answered.
-
 Rules:
 - Do NOT answer the user.
 - Output ONLY the rewritten prompt text.
@@ -80,59 +57,51 @@ async function planChatPrompt(userText, apiKey) {
       ],
     }),
   });
-
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     throw new Error("Planner error: " + t.slice(0, 800));
   }
-
   const data = await r.json();
   const out = data?.choices?.[0]?.message?.content?.trim();
   return out || String(userText || "").trim();
 }
 
-/* ---------------- Main handler ---------------- */
-
-module.exports = async function handler(req, res) {
-  // 1) CORS preflight
+/* -------------------- Handler -------------------- */
+export default async function handler(req, res) {
+  const origin = req.headers.origin || "";
+  
+  // 1) Preflight for CORS
   if (req.method === "OPTIONS") {
-    setCors(res, req);
+    allow(res, origin);
     return res.status(204).end();
   }
-
-  // 2) CORS allowlist
-  const allow = setCors(res, req);
-  if (!allow.ok) {
-    return res.status(403).json({
-      error: "Forbidden origin",
-      seenOrigin: (req.headers.origin || null),
-      seenReferer: (req.headers.referer || null),
-      allowedOriginEnv: process.env.ALLOWED_ORIGIN || "",
-      allowedOriginsParsed: origins(),
-    });
+  
+  // 2) Allowlist origin
+  if (!allow(res, origin)) {
+    return res
+      .status(403)
+      .json({ error: "Forbidden origin", origin, allowed: origins() });
   }
-
+  
   // 3) Only POST
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed. Use POST." });
   }
 
   try {
+    // ---- Accept both payload shapes ----
     const body = req.body || {};
-
     const message =
       typeof body.message === "string"
         ? body.message
         : typeof body.input === "string"
         ? body.input
         : "";
-
     const history = Array.isArray(body.history)
       ? body.history
       : Array.isArray(body.messages)
       ? body.messages
       : [];
-
     const attachment = body.attachment || null;
 
     if (!message || typeof message !== "string") {
@@ -141,12 +110,13 @@ module.exports = async function handler(req, res) {
 
     const rawUserText = String(message || "").trim();
 
-    // Load KB
+    // --------- Load KB ----------
     const knowledgeUrl = process.env.KNOWLEDGE_URL;
     if (!knowledgeUrl) {
-      return res.status(500).json({ error: "KNOWLEDGE_URL is not set in env." });
+      return res
+        .status(500)
+        .json({ error: "KNOWLEDGE_URL is not set in env." });
     }
-
     const kbResp = await fetch(knowledgeUrl, { cache: "no-store" });
     if (!kbResp.ok) {
       return res.status(500).json({
@@ -155,30 +125,77 @@ module.exports = async function handler(req, res) {
     }
     const kb = await kbResp.json();
 
-    const { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText } =
-      buildIndexes(kb);
+    // --------- Build indexes ----------
+    const {
+      projectNames,
+      projectsByName,
+      lessonsByProject,
+      canonicalPinsText,
+      safetyText,
+      kitOverview,
+      componentsSummary,
+      projectsSummary,
+      componentsMap,
+    } = buildIndexes(kb);
 
+    // --------- Intent detection (deterministic) ----------
     const rawIntent = detectIntent(rawUserText);
-    const detectedComponent = detectComponent(rawUserText, kb);
+    const rawDetectedProject = detectProject(rawUserText, projectNames);
+    const detectedComponent = detectComponent(rawUserText, componentsMap);
 
-if (detectedComponent) {
-  return res.status(200).json({
-    text: `${detectedComponent.name}:\n${detectedComponent.description}`,
-    debug: {
-      detectedComponent: detectedComponent.name,
-      kbMode: "component-lookup",
-    },
-  });
-}
+    // --------- Handle KIT_OVERVIEW intent ----------
+    if (rawIntent.type === "KIT_OVERVIEW") {
+      return res.status(200).json({
+        text: kitOverview,
+        debug: {
+          intent: rawIntent,
+          kbMode: "deterministic_overview",
+        },
+      });
+    }
 
-    const rawDetectedProject = detectProject(rawUserText, projectNames, kb);
+    // --------- Handle COMPONENTS_LIST intent ----------
+    if (rawIntent.type === "COMPONENTS_LIST") {
+      const componentsText = formatComponentsList(componentsSummary);
+      return res.status(200).json({
+        text: componentsText,
+        debug: {
+          intent: rawIntent,
+          kbMode: "deterministic_components",
+        },
+      });
+    }
 
-    // Deterministic: list projects
+    // --------- Handle COMPONENT_INFO intent (NEW) ----------
+    if (rawIntent.type === "COMPONENT_INFO" || detectedComponent) {
+      if (!detectedComponent) {
+        return res.status(200).json({
+          text: "Which component would you like to learn about? You can ask about any component like the Robocoders Brain, IR Sensor, Servo Motor, RGB LED, etc.",
+          debug: { intent: rawIntent, detectedComponent: null },
+        });
+      }
+      
+      const componentInfo = componentsMap[detectedComponent];
+      if (componentInfo) {
+        const response = formatComponentInfo(componentInfo);
+        return res.status(200).json({
+          text: response,
+          debug: {
+            intent: rawIntent,
+            detectedComponent,
+            kbMode: "deterministic_component",
+          },
+        });
+      }
+    }
+
+    // --------- Handle LIST_PROJECTS intent ----------
     if (rawIntent.type === "LIST_PROJECTS") {
       return res.status(200).json({
         text:
-          "Robocoders Kit projects/modules:\n\n" +
-          projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n"),
+          `The Robocoders Kit includes ${projectsSummary.totalCount} exciting projects:\n\n` +
+          projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n") +
+          "\n\nTell me which project you'd like to learn more about!",
         debug: {
           detectedProject: rawDetectedProject || null,
           intent: rawIntent,
@@ -187,26 +204,24 @@ if (detectedComponent) {
       });
     }
 
-    // Deterministic: project videos
+    // --------- Handle PROJECT_VIDEOS intent ----------
     if (rawIntent.type === "PROJECT_VIDEOS") {
       if (!rawDetectedProject) {
         return res.status(200).json({
           text:
-            "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I’ll share all the relevant lesson videos for that project.",
+            "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I'll share all the relevant lesson videos for that project.",
           debug: { detectedProject: null, intent: rawIntent },
         });
       }
-
       const videos = lessonsByProject[rawDetectedProject] || [];
       if (!videos.length) {
         return res.status(200).json({
           text:
             `I found the project "${rawDetectedProject}", but no lesson videos are mapped for it in the knowledge file.\n` +
-            "If you share the lesson links for this project, I’ll add them into the KB mapping.",
+            "If you share the lesson links for this project, I'll add them into the KB mapping.",
           debug: { detectedProject: rawDetectedProject, intent: rawIntent, videosFound: 0 },
         });
       }
-
       const out =
         `Lesson videos for ${rawDetectedProject}:\n\n` +
         videos
@@ -219,7 +234,6 @@ if (detectedComponent) {
             );
           })
           .join("\n\n");
-
       return res.status(200).json({
         text: out,
         debug: {
@@ -231,355 +245,675 @@ if (detectedComponent) {
       });
     }
 
-    // OpenAI key
+    // --------- OpenAI key ----------
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
-      return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
+      return res
+        .status(500)
+        .json({ error: "OPENAI_API_KEY is not set in env." });
     }
 
-    // Planner (best effort)
+    // --------- Planner (ONLY for GENERAL) ----------
     let plannedUserText = rawUserText;
     try {
       plannedUserText = await planChatPrompt(rawUserText, apiKey);
-    } catch (e) {
+    } catch (plannerErr) {
       plannedUserText = rawUserText;
     }
 
-    const detectedProject = rawDetectedProject || detectProject(plannedUserText, projectNames, kb);
+    // Re-run detection using planned text if raw didn't detect
+    const detectedProject =
+      rawDetectedProject || detectProject(plannedUserText, projectNames);
     const intent = rawIntent;
 
-    const projectContext = detectedProject ? projectsByName[detectedProject] || null : null;
-
+    // --------- Build grounded context for model ----------
+    const projectContext = detectedProject
+      ? projectsByName[detectedProject] || null
+      : null;
     const groundedContext = buildGroundedContext({
       detectedProject,
       projectContext,
+      lessonsByProject,
       canonicalPinsText,
       safetyText,
-      lessonsForProject: detectedProject ? lessonsByProject[detectedProject] || [] : [],
-      intent,
-      attachment,
+      kitOverview,
+      componentsSummary,
+      projectsSummary,
     });
 
-    const system = buildSystemPrompt();
+    // --------- System Prompt ----------
+    const systemPrompt = buildSystemPrompt(groundedContext);
 
-    const trimmedHistory = Array.isArray(history)
-      ? history
-          .slice(-10)
-          .filter((x) => x && typeof x.content === "string" && typeof x.role === "string")
-      : [];
+    // --------- Prepare messages for OpenAI ----------
+    const systemMsg = { role: "system", content: systemPrompt };
+    const conversationMsgs = buildConversationHistory(history);
+    const userMsg = { role: "user", content: plannedUserText };
 
-    const payload = {
-      model: "gpt-4o-mini",
-      temperature: 0.1,
-      messages: [
-        { role: "system", content: system },
-        { role: "system", content: groundedContext },
-        ...trimmedHistory,
-        { role: "user", content: plannedUserText },
-      ],
-    };
+    const messages = [systemMsg, ...conversationMsgs, userMsg];
 
-    const resp = await fetch(OPENAI_CHAT_URL, {
+    // --------- Call OpenAI ----------
+    const r = await fetch(OPENAI_CHAT_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
         "Content-Type": "application/json",
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.7,
+        max_tokens: 800,
+        messages,
+      }),
     });
 
-    if (!resp.ok) {
-      const errText = await resp.text().catch(() => "");
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
       return res.status(500).json({
-        error: `OpenAI error status=${resp.status}`,
-        details: errText.slice(0, 2000),
+        error: "OpenAI API error",
+        details: t.slice(0, 800),
       });
     }
 
-    const data = await resp.json();
-    const answer = data?.choices?.[0]?.message?.content?.trim() || "I couldn’t generate a response.";
+    const data = await r.json();
+    const assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
 
     return res.status(200).json({
-      text: answer,
+      text: assistantReply,
       debug: {
         detectedProject: detectedProject || null,
+        detectedComponent: detectedComponent || null,
         intent,
-        kbMode: "grounded-context",
-        plannerUsed: plannedUserText !== rawUserText,
+        kbMode: "llm",
+        plannedPrompt: plannedUserText !== rawUserText ? plannedUserText : null,
       },
     });
-  } catch (e) {
+  } catch (err) {
+    console.error("Playground handler error:", err);
     return res.status(500).json({
-      error: "Server error",
-      details: String(e?.message || e),
+      error: "Internal server error",
+      message: String(err?.message || err).slice(0, 500),
     });
   }
-};
-
-/* ---------------- Helpers ---------------- */
-
-function buildSystemPrompt() {
-  return `
-You are the Robocoders Kit assistant for children aged 8–14 and parents.
-
-Hard rules:
-- Only answer from the provided Grounded Context. If info is missing, say what is missing and ask for the exact project/module name or the missing detail.
-- Never mix projects. If the user asks Candle Lamp, do not give Mood Lamp content (and vice versa).
-- Never invent pins. If pin info is not present in Grounded Context, say you don’t have it.
-- If user asks for materials/components of a project, provide only that project's Components Used (do not dump the full kit list).
-- If user asks for lesson videos or “not working” troubleshooting: do NOT guess random links. Only share links listed in Grounded Context.
-- Safety: Do not discuss sexual content, pregnancy, “how babies are made”, romantic/valentines content, horror movies, or any adult topics. Politely refuse and redirect to Robocoders help.
-
-Style:
-- Simple, calm, step-by-step.
-- If it’s a troubleshooting question: suggest order = Connections first, then Build, then Coding, then Working, then Introduction.
-`.trim();
 }
 
+/* -------------------- buildIndexes -------------------- */
 function buildIndexes(kb) {
-  if (!kb.pages && Array.isArray(kb.contents)) {
-    kb.pages = kb.contents.map((c) => ({ text: `${c.name}: ${c.description}` }));
-  }
+  const projectNames = extractProjectNames(kb);
+  const projectsByName = {};
+  const lessonsByProject = {};
 
-  const projectNames = [];
-  const candidates = kb?.canonical?.projects || kb?.projects || kb?.modules || kb?.glossary?.projects || [];
-
-  if (Array.isArray(candidates) && candidates.length) {
-    for (const p of candidates) {
-      const name = typeof p === "string" ? p : p?.name;
-      if (name && !projectNames.includes(name)) projectNames.push(name);
-    }
-  }
-
-  if (!projectNames.length && Array.isArray(kb?.pages)) {
-    for (const pg of kb.pages) {
-      const t = (pg?.text || "").trim();
-      const m = t.match(/Project Name\s*[\:\-]?\s*([^\n]+)/i);
-      if (m && m[1]) {
-        const name = m[1].trim();
-        if (name && !projectNames.includes(name)) projectNames.push(name);
-      }
-    }
-  }
-
-  // fallback list (only if KB is missing project list)
-  if (!projectNames.length) {
-    projectNames.push(
-      "Hello World!",
-      "Mood Lamp",
-      "Game Controller",
-      "Coin Counter",
-      "Smart Box",
-      "Musical Instrument",
-      "Toll Booth",
-      "Analog Meter",
-      "DJ Nights",
-      "Roll The Dice",
-      "Table Fan",
-      "Disco Lights",
-      "Motion Activated Wave Sensor",
-      "RGB Color Mixer",
-      "The Fruit Game",
-      "The Ping Pong Game",
-      "The UFO Shooter Game",
-      "The Extension Wire",
-      "Light Intensity Meter",
-      "Pulley LED",
-      "Candle Lamp"
+  for (const pName of projectNames) {
+    const projectBlock = extractProjectBlock(kb, pName);
+    const lessons = extractLessons(kb, pName);
+    projectsByName[pName] = projectBlock;
+    lessonsByProject[pName] = lessons.sort(
+      (a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName)
     );
   }
 
-  const projectsByName = {};
-  for (const name of projectNames) {
-    projectsByName[name] = extractProjectBlock(kb, name) || "";
-  }
+  const canonicalPinsText = extractCanonicalPins(kb);
+  const safetyText = extractSafety(kb);
+  const kitOverview = extractKitOverview(kb);
+  const componentsSummary = extractComponentsSummary(kb);
+  const projectsSummary = extractProjectsSummary(kb);
+  const componentsMap = extractComponentsMap(kb);
 
-  const lessonsByProject = {};
-  for (const name of projectNames) {
-    lessonsByProject[name] = extractLessons(kb, name);
-    lessonsByProject[name].sort((a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName));
-  }
-
-  const canonicalPinsText = extractCanonicalPins(kb) || "Canonical pin rules not found.";
-  const safetyText =
-    extractSafety(kb) ||
-    "Robocoders is low-voltage and kid-safe. No wall power. No cutting or soldering. Adult help allowed when needed.";
-
-  return { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText };
+  return {
+    projectNames,
+    projectsByName,
+    lessonsByProject,
+    canonicalPinsText,
+    safetyText,
+    kitOverview,
+    componentsSummary,
+    projectsSummary,
+    componentsMap,
+  };
 }
 
+/* -------------------- Intent Detection -------------------- */
 function detectIntent(text) {
-  const t = text.toLowerCase();
+  const lower = String(text || "").toLowerCase();
 
-  const wantsList = t.includes("projects") || t.includes("modules") || t.includes("all project") || t.includes("all module");
-  if (wantsList && (t.includes("what are") || t.includes("list") || t.includes("give"))) return { type: "LIST_PROJECTS" };
+  // Kit overview
+  if (
+    /what.*(is|in|about|contains?).*kit/i.test(lower) ||
+    /tell me about.*kit/i.test(lower) ||
+    /kit.*overview/i.test(lower) ||
+    /what.*robocoders/i.test(lower)
+  ) {
+    return { type: "KIT_OVERVIEW" };
+  }
 
-  const videoWords = ["video", "videos", "lesson", "lessons", "link", "youtube"];
-  const troubleWords = ["not working", "doesn't work", "not responding", "stuck", "problem", "issue", "error"];
+  // Components list
+  if (
+    /what.*(components?|parts?|pieces?).*kit/i.test(lower) ||
+    /list.*components?/i.test(lower) ||
+    /show.*components?/i.test(lower) ||
+    /components?.*list/i.test(lower)
+  ) {
+    return { type: "COMPONENTS_LIST" };
+  }
 
-  if (videoWords.some((w) => t.includes(w)) || troubleWords.some((w) => t.includes(w))) {
+  // Component info
+  if (
+    /what.*(is|does).*(?:robocoders brain|ir sensor|ldr|potentiometer|servo|motor|rgb|led)/i.test(lower) ||
+    /tell me about.*(?:robocoders brain|ir sensor|ldr|potentiometer|servo|motor|rgb|led)/i.test(lower) ||
+    /how.*(works?|use).*(?:robocoders brain|ir sensor|ldr|potentiometer|servo|motor|rgb|led)/i.test(lower)
+  ) {
+    return { type: "COMPONENT_INFO" };
+  }
+
+  // List projects
+  if (
+    /(?:list|show|what are|tell me).*(?:projects?|modules?)/i.test(lower) ||
+    /how many projects?/i.test(lower) ||
+    /all projects?/i.test(lower)
+  ) {
+    return { type: "LIST_PROJECTS" };
+  }
+
+  // Project videos
+  if (
+    /(?:video|lesson|tutorial|how to (?:build|make|create)).*(?:project|module)/i.test(lower) ||
+    /show.*videos?/i.test(lower) ||
+    /(?:project|module).*(?:video|lesson)/i.test(lower)
+  ) {
     return { type: "PROJECT_VIDEOS" };
   }
 
   return { type: "GENERAL" };
 }
 
-function detectProject(text, projectNames, kb) {
-  const t = text.toLowerCase();
-
-  // exact project name match
-  for (const p of projectNames) {
-    if (t.includes(p.toLowerCase())) return p;
+/* -------------------- Project Detection -------------------- */
+function detectProject(text, projectNames) {
+  const lower = String(text || "").toLowerCase();
+  for (const pName of projectNames) {
+    const pLower = pName.toLowerCase();
+    if (lower.includes(pLower)) {
+      return pName;
+    }
+    // Try without special chars
+    const pSimple = pLower.replace(/[^a-z0-9]+/g, " ").trim();
+    const tSimple = lower.replace(/[^a-z0-9]+/g, " ").trim();
+    if (tSimple.includes(pSimple)) {
+      return pName;
+    }
   }
+  return null;
+}
 
-  // alias match
-  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
-  for (const p of projects) {
-    if (Array.isArray(p.aliases)) {
-      for (const a of p.aliases) {
-        if (t.includes(String(a).toLowerCase())) return p.name;
+/* -------------------- Component Detection (NEW) -------------------- */
+function detectComponent(text, componentsMap) {
+  const lower = String(text || "").toLowerCase();
+  
+  // Check each component name
+  for (const [componentId, componentData] of Object.entries(componentsMap)) {
+    const componentName = (componentData.name || "").toLowerCase();
+    if (componentName && lower.includes(componentName)) {
+      return componentId;
+    }
+    
+    // Also check common variations
+    const variations = getComponentVariations(componentName);
+    for (const variation of variations) {
+      if (lower.includes(variation)) {
+        return componentId;
       }
     }
   }
-
-  return null;
-}
-function detectComponent(text, kb) {
-  const t = text.toLowerCase();
-
-  const list =
-    Array.isArray(kb?.components)
-      ? kb.components
-      : Array.isArray(kb?.contents)
-      ? kb.contents
-      : [];
-
-  for (const c of list) {
-    const name = String(c.name || c.id || "").toLowerCase();
-    if (name && t.includes(name)) {
-      return {
-        name: c.name || c.id,
-        description: c.description || c.desc || "No description available."
-      };
-    }
-  }
-
+  
   return null;
 }
 
-function buildGroundedContext({ detectedProject, projectContext, canonicalPinsText, safetyText, lessonsForProject, intent, attachment }) {
-  const lines = [];
+function getComponentVariations(name) {
+  const variations = [name];
+  
+  // Common variations
+  if (name.includes("robocoders brain")) variations.push("brain", "controller", "main board");
+  if (name.includes("ir sensor")) variations.push("infrared", "ir", "proximity sensor");
+  if (name.includes("ldr")) variations.push("light sensor", "light dependent resistor");
+  if (name.includes("potentiometer")) variations.push("knob", "pot", "dial");
+  if (name.includes("servo motor")) variations.push("servo");
+  if (name.includes("dc motor")) variations.push("motor");
+  if (name.includes("rgb led")) variations.push("rgb", "color led");
+  
+  return variations;
+}
 
-  lines.push("Grounded Context (authoritative):");
-  lines.push("");
-  lines.push("Safety:");
-  lines.push(safetyText);
-  lines.push("");
-  lines.push("Canonical Brain / Pins / Ports rules:");
-  lines.push(canonicalPinsText);
-  lines.push("");
+/* -------------------- Context Building -------------------- */
+function buildGroundedContext(opts) {
+  const {
+    detectedProject,
+    projectContext,
+    lessonsByProject,
+    canonicalPinsText,
+    safetyText,
+    kitOverview,
+    componentsSummary,
+    projectsSummary,
+  } = opts;
 
-  if (attachment && attachment.kind === "image") {
-    lines.push("User attached an image.");
-    lines.push("If the user asks about the image, ask what project this photo is from and what is not working.");
-    lines.push("");
+  const sections = [];
+
+  // Kit overview
+  sections.push("=== KIT OVERVIEW ===\n" + kitOverview);
+
+  // Safety
+  if (safetyText) {
+    sections.push("=== SAFETY RULES ===\n" + safetyText);
   }
 
+  // Canonical pins
+  if (canonicalPinsText) {
+    sections.push("=== PORT MAPPINGS ===\n" + canonicalPinsText);
+  }
+
+  // Components summary
+  if (componentsSummary) {
+    sections.push(
+      "=== COMPONENTS SUMMARY ===\n" +
+      `Total Components: ${componentsSummary.totalCount}\n` +
+      `Categories available: ${Object.keys(componentsSummary.categories || {}).join(", ")}`
+    );
+  }
+
+  // Projects summary
+  if (projectsSummary) {
+    sections.push(
+      "=== PROJECTS SUMMARY ===\n" +
+      `Total Projects: ${projectsSummary.totalCount}\n` +
+      `Available: ${(projectsSummary.projectList || []).slice(0, 10).join(", ")}...`
+    );
+  }
+
+  // Detected project context
   if (detectedProject && projectContext) {
-    lines.push(`Project in focus: ${detectedProject}`);
-    lines.push("");
-    lines.push("Project details (use only this for this project):");
-    lines.push(projectContext);
-    lines.push("");
-  } else {
-    lines.push("No project selected yet.");
-    lines.push("If the user question is project-specific, ask for the exact project/module name.");
-    lines.push("");
+    sections.push(
+      `=== PROJECT: ${detectedProject} ===\n${projectContext}`
+    );
+
+    const lessons = lessonsByProject[detectedProject] || [];
+    if (lessons.length) {
+      sections.push(
+        `=== LESSONS FOR ${detectedProject} ===\n` +
+        lessons
+          .map(
+            (l) =>
+              `- ${l.lessonName}\n  ${l.explainLine || ""}\n  Videos: ${l.videoLinks.join(", ")}`
+          )
+          .join("\n\n")
+      );
+    }
   }
 
-  if (intent?.type === "PROJECT_VIDEOS" && detectedProject) {
-    lines.push("Lesson videos for this project (only these links are allowed):");
-    if (!lessonsForProject.length) {
-      lines.push("(No lesson videos found in KB for this project.)");
-    } else {
-      for (const l of lessonsForProject) {
-        lines.push(`- ${l.lessonName}`);
-        if (l.explainLine) lines.push(` Why: ${l.explainLine}`);
-        for (const u of l.videoLinks || []) lines.push(` Link: ${u}`);
+  return sections.join("\n\n");
+}
+
+function buildSystemPrompt(groundedContext) {
+  return `You are Be Cre8v AI, a helpful and encouraging assistant for the Robocoders Kit.
+
+Your role:
+- Help children aged 8-14 learn electronics, coding, and creative project building
+- Provide clear, simple explanations suitable for kids
+- Be encouraging, friendly, and enthusiastic
+- Use the knowledge base information provided below to answer questions accurately
+- If you don't know something, admit it honestly and suggest where to find the information
+
+Important guidelines:
+- Keep explanations simple and fun
+- Use examples and analogies kids can relate to
+- Encourage creativity and experimentation
+- Always prioritize safety
+- Be patient and supportive
+- Use positive, empowering language
+
+KNOWLEDGE BASE:
+${groundedContext}
+
+Remember: Base your answers on the knowledge base provided. If information is not in the knowledge base, say so honestly.`;
+}
+
+function buildConversationHistory(history) {
+  const msgs = [];
+  for (const h of history || []) {
+    if (h?.role === "user" && h?.content) {
+      msgs.push({ role: "user", content: String(h.content) });
+    } else if (h?.role === "assistant" && h?.content) {
+      msgs.push({ role: "assistant", content: String(h.content) });
+    }
+  }
+  return msgs;
+}
+
+/* -------------------- Extraction Functions -------------------- */
+function extractProjectNames(kb) {
+  // Try projectsSummary first
+  if (kb?.projectsSummary?.projectList) {
+    return kb.projectsSummary.projectList.filter(Boolean);
+  }
+  
+  // Try canonical projects
+  if (kb?.canonical?.projects && Array.isArray(kb.canonical.projects)) {
+    return kb.canonical.projects.map(p => p.name || p).filter(Boolean);
+  }
+  
+  // Try pages extraction
+  if (Array.isArray(kb?.pages)) {
+    const names = new Set();
+    for (const page of kb.pages) {
+      if (page?.type === "project" && page?.projectName) {
+        names.add(page.projectName);
+      }
+      const text = page?.text || "";
+      const match = text.match(/Project Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i);
+      if (match && match[1]) {
+        names.add(match[1].trim());
       }
     }
-    lines.push("");
+    if (names.size > 0) {
+      return Array.from(names);
+    }
   }
+  
+  // Fallback to hardcoded list
+  return [
+    "Hello World!",
+    "Mood Lamp",
+    "Game Controller",
+    "Coin Counter",
+    "Smart Box",
+    "Musical Instrument",
+    "Toll Booth",
+    "Analog Meter",
+    "DJ Nights",
+    "Roll The Dice",
+    "Table Fan",
+    "Disco Lights",
+    "Motion Activated Wave Sensor",
+    "RGB Color Mixer",
+    "The Fruit Game",
+    "The Ping Pong Game",
+    "The UFO Shooter Game",
+    "The Extension Wire",
+    "Light Intensity Meter",
+    "Pulley LED",
+    "Candle Lamp",
+  ];
+}
 
+function extractKitOverview(kb) {
+  if (kb?.overview) {
+    const o = kb.overview;
+    const parts = [];
+    if (o.kitName) parts.push(`Kit: ${o.kitName}`);
+    if (o.description) parts.push(o.description);
+    if (o.whatIsInside) parts.push(`\nWhat's Inside:\n${o.whatIsInside}`);
+    if (o.keyFeatures) {
+      parts.push(`\nKey Features:\n${o.keyFeatures.map(f => `- ${f}`).join("\n")}`);
+    }
+    if (o.totalProjects) parts.push(`\nTotal Projects: ${o.totalProjects}`);
+    if (o.totalComponents) parts.push(`Total Components: ${o.totalComponents}`);
+    if (o.ageRange) parts.push(`Age Range: ${o.ageRange}`);
+    return parts.join("\n");
+  }
+  
+  return "The Robocoders Kit is an educational electronics and coding kit for children aged 8-14. It includes 21 exciting projects and 92 components to learn physical computing, Visual Block Coding, and creative project building.";
+}
+
+function extractComponentsSummary(kb) {
+  if (kb?.componentsSummary) {
+    return kb.componentsSummary;
+  }
+  if (kb?.glossary?.components) {
+    return {
+      totalCount: Object.keys(kb.glossary.components).length,
+      components: kb.glossary.components,
+    };
+  }
+  return {
+    totalCount: 92,
+    description: "The kit includes various sensors, actuators, LEDs, motors, structural components, and craft materials.",
+    categories: {},
+  };
+}
+
+function extractProjectsSummary(kb) {
+  if (kb?.projectsSummary) {
+    return kb.projectsSummary;
+  }
+  if (kb?.canonical?.projects) {
+    return {
+      totalCount: kb.canonical.projects.length,
+      projectList: kb.canonical.projects,
+    };
+  }
+  return {
+    totalCount: 21,
+    projectList: [],
+  };
+}
+
+// NEW: Extract components map for component detection
+function extractComponentsMap(kb) {
+  const componentsMap = {};
+  
+  // Try glossary.components first
+  if (kb?.glossary?.components) {
+    return kb.glossary.components;
+  }
+  
+  // Try pages with type "component"
+  if (Array.isArray(kb?.pages)) {
+    for (const page of kb.pages) {
+      if (page?.type === "component" && page?.componentId && page?.componentName) {
+        componentsMap[page.componentId] = {
+          name: page.componentName,
+          description: extractDescriptionFromText(page.text),
+          id: page.componentId,
+        };
+      }
+    }
+  }
+  
+  return componentsMap;
+}
+
+function extractDescriptionFromText(text) {
+  const match = String(text || "").match(/Description:\s*([^\n]+(?:\n(?!Component|Type|Usage)[^\n]+)*)/i);
+  return match ? match[1].trim() : "";
+}
+
+// NEW: Format component info for display
+function formatComponentInfo(componentData) {
+  const lines = [];
+  lines.push(`**${componentData.name}**\n`);
+  if (componentData.description) {
+    lines.push(componentData.description);
+  }
+  if (componentData.usage) {
+    lines.push(`\n**How to use it:**\n${componentData.usage}`);
+  }
+  if (componentData.ports) {
+    lines.push(`\n**Connects to:**\n${componentData.ports}`);
+  }
+  lines.push("\n\nWould you like to know which projects use this component?");
+  return lines.join("\n");
+}
+
+function formatComponentsList(componentsSummary) {
+  const lines = [];
+  lines.push(`The Robocoders Kit contains ${componentsSummary.totalCount || 92} components including:\n`);
+  
+  if (componentsSummary.categories) {
+    const cats = componentsSummary.categories;
+    if (cats.controller) {
+      lines.push(`**Controller (${cats.controller.count}):**`);
+      lines.push(`- ${cats.controller.components.join(", ")}`);
+      lines.push("");
+    }
+    if (cats.sensors) {
+      lines.push(`**Sensors (${cats.sensors.count}):**`);
+      lines.push(`- ${cats.sensors.components.join(", ")}`);
+      lines.push("");
+    }
+    if (cats.actuators) {
+      lines.push(`**Actuators (${cats.actuators.count}):**`);
+      lines.push(`- ${cats.actuators.components.join(", ")}`);
+      lines.push("");
+    }
+    if (cats.lights) {
+      lines.push(`**Lights (${cats.lights.count}):**`);
+      lines.push(`- ${cats.lights.components.join(", ")}`);
+      lines.push("");
+    }
+    if (cats.power) {
+      lines.push(`**Power (${cats.power.count}):**`);
+      lines.push(`- ${cats.power.components.join(", ")}`);
+      lines.push("");
+    }
+    if (cats.structural) {
+      lines.push(`**Structural Components (${cats.structural.count}):**`);
+      lines.push(`- ${cats.structural.description}`);
+      lines.push("");
+    }
+    if (cats.craft) {
+      lines.push(`**Craft Materials (${cats.craft.count}):**`);
+      lines.push(`- ${cats.craft.components.join(", ")}`);
+      lines.push("");
+    }
+    if (cats.mechanical) {
+      lines.push(`**Mechanical Parts (${cats.mechanical.count}):**`);
+      lines.push(`- ${cats.mechanical.components.join(", ")}`);
+      lines.push("");
+    }
+    if (cats.wiring) {
+      lines.push(`**Wiring (${cats.wiring.count}):**`);
+      lines.push(`- ${cats.wiring.description}`);
+      lines.push("");
+    }
+  }
+  
+  lines.push("\nWould you like to know more about any specific component?");
   return lines.join("\n");
 }
 
 function extractProjectBlock(kb, projectName) {
-  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
- const components =
-  Array.isArray(kb?.components)
-    ? kb.components
-    : Array.isArray(kb?.contents)
-    ? kb.contents
-    : [];
-
-const componentMap = {};
-for (const c of components) {
-  const key = String(c.id || c.name).toLowerCase();
-  componentMap[key] = {
-    name: c.name || c.id,
-    description: c.description || c.desc || ""
-  };
-}
-
-
-  const project = projects.find(
-    (p) =>
-      p.name === projectName ||
-      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
-  );
-
-  if (!project) return null;
-
-  let text = "";
-  text += `Project Name: ${project.name}\n`;
-  if (project.difficulty) text += `Difficulty: ${project.difficulty}\n`;
-  if (project.estimated_time) text += `Estimated Time: ${project.estimated_time}\n`;
-
-  if (Array.isArray(project.components_used)) {
-    const readable = project.components_used.map((id) => {
-  const key = String(id).toLowerCase();
-  return componentMap[key]?.name || id;
-});
-
-    text += `Components Used: ${readable.join(", ")}\n`;
+  // Try pages first
+  if (Array.isArray(kb?.pages)) {
+    const norm = (s) => s.toLowerCase();
+    const pNorm = norm(projectName);
+    
+    for (const page of kb.pages) {
+      if (page?.type === "project" && norm(page.projectName || "") === pNorm) {
+        return sanitizeChunk(page.text || "");
+      }
+    }
+    
+    // Try text-based search
+    const pages = kb.pages
+      .map((pg) => (pg?.text ? String(pg.text) : ""))
+      .filter(Boolean);
+    let start = -1;
+    for (let i = 0; i < pages.length; i++) {
+      const txt = pages[i].toLowerCase();
+      if (txt.includes("project name") && txt.includes(pNorm)) {
+        start = i;
+        break;
+      }
+    }
+    if (start >= 0) {
+      const chunk = pages.slice(start, start + 6).join("\n\n");
+      return sanitizeChunk(chunk);
+    }
   }
-
-  return text.trim();
+  
+  // Try structured projects
+  const p =
+    (kb?.projects && kb.projects[projectName]) ||
+    (Array.isArray(kb?.projects)
+      ? kb.projects.find((x) => x?.name === projectName)
+      : null);
+  if (p) {
+    const parts = [];
+    if (p.description) parts.push(p.description);
+    if (p.componentsUsed)
+      parts.push("Components Used:\n" + p.componentsUsed.join("\n"));
+    if (p.connections)
+      parts.push("Connections:\n" + p.connections.join("\n"));
+    if (p.steps) parts.push("Build Steps:\n" + p.steps.join("\n"));
+    return sanitizeChunk(parts.join("\n\n"));
+  }
+  return "";
 }
 
 function extractLessons(kb, projectName) {
-  const projects = Array.isArray(kb?.projects) ? kb.projects : [];
-  const project = projects.find(
-    (p) =>
-      p.name === projectName ||
-      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
-  );
-
-  if (!project || !Array.isArray(project.lessons)) return [];
-
-  return project.lessons.map((l) => ({
-    lessonName: l.lesson_name,
-    videoLinks: l.videoLinks || [],
-    explainLine: l.explainLine || null,
-  }));
+  const lessons = [];
+  
+  // Try pages extraction
+  if (Array.isArray(kb?.pages)) {
+    const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
+    const p = projectName.toLowerCase();
+    for (let i = 0; i < pages.length; i++) {
+      const txt = pages[i];
+      const low = txt.toLowerCase();
+      if (low.includes("project:") || low.includes("project :")) {
+        if (!low.includes(p)) continue;
+        const blocks = txt.split(/Lesson ID\s*[:\-]/i);
+        for (let b = 1; b < blocks.length; b++) {
+          const block = "Lesson ID:" + blocks[b];
+          const lessonName =
+            matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
+            matchLine(block, /Lesson Name\s*:\s*([^\n]+)/i) ||
+            "";
+          const links = [];
+          const linkMatches = block.match(/https?:\/\/[^\s\)]+/gi) || [];
+          for (const u of linkMatches) {
+            links.push(u.replace(/[\,\)\]]+$/g, ""));
+          }
+          const explainLine =
+            matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)(?:When the AI|$)/i) ||
+            matchLine(block, /What this lesson helps with\s*\(AI explanation line\)\s*:\s*([\s\S]*?)(?:When the AI|$)/i) ||
+            "";
+          if (lessonName && links.length) {
+            lessons.push({
+              lessonName: lessonName.trim(),
+              videoLinks: uniq(links),
+              explainLine: cleanExplain(explainLine),
+            });
+          }
+        }
+      }
+    }
+  }
+  
+  // Try structured lessons
+  if (!lessons.length && kb?.lessons && kb.lessons[projectName]) {
+    for (const l of kb.lessons[projectName]) {
+      lessons.push({
+        lessonName: l.lessonName,
+        videoLinks: Array.isArray(l.videoLinks)
+          ? l.videoLinks
+          : l.videoLink
+          ? [l.videoLink]
+          : [],
+        explainLine: l.explainLine || "",
+      });
+    }
+  }
+  return dedupeLessons(lessons);
 }
 
 function extractCanonicalPins(kb) {
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-    const idx = pages.findIndex((t) => t.toLowerCase().includes("fixed port mappings"));
-    if (idx >= 0) return sanitizeChunk(pages.slice(idx, idx + 3).join("\n\n"));
+    const idx = pages.findIndex((t) =>
+      t.toLowerCase().includes("fixed port mappings")
+    );
+    if (idx >= 0) {
+      const chunk = pages.slice(idx, idx + 3).join("\n\n");
+      return sanitizeChunk(chunk);
+    }
   }
   return "";
 }
@@ -588,11 +922,15 @@ function extractSafety(kb) {
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
     const idx = pages.findIndex((t) => t.toLowerCase().includes("global safety"));
-    if (idx >= 0) return sanitizeChunk(pages.slice(idx, idx + 2).join("\n\n"));
+    if (idx >= 0) {
+      const chunk = pages.slice(idx, idx + 2).join("\n\n");
+      return sanitizeChunk(chunk);
+    }
   }
   return "";
 }
 
+/* -------------------- Utility Functions -------------------- */
 function lessonRank(lessonName = "") {
   const n = String(lessonName || "").toLowerCase();
   if (n.includes("connection")) return 1;
@@ -609,4 +947,41 @@ function sanitizeChunk(s) {
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function matchLine(text, regex) {
+  const m = String(text || "").match(regex);
+  if (!m) return "";
+  return (m[1] || "").trim();
+}
+
+function uniq(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const x of arr || []) {
+    const k = String(x).trim();
+    if (!k || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
+}
+
+function cleanExplain(s) {
+  return String(s || "")
+    .replace(/\n+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function dedupeLessons(lessons) {
+  const out = [];
+  const seen = new Set();
+  for (const l of lessons || []) {
+    const key = (l.lessonName || "").toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(l);
+  }
+  return out;
 }
