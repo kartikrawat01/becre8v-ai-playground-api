@@ -3,8 +3,21 @@
 // Payload formats supported:
 // - { input, messages, attachment } (current frontend)
 // - { message, history } (older format)
+//
+// IMPORTANT:
+// This version is ESM (fixes “module.exports is not defined / CommonJS vs ESM” crashes on Vercel when package.json has "type":"module").
+// If your project is CommonJS (no "type":"module"), then replace the last line `export default handler;` with `module.exports = handler;`
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+
+/* ---------------- fetch polyfill (Node < 18 safety) ---------------- */
+
+async function getFetch() {
+  if (typeof globalThis.fetch === "function") return globalThis.fetch.bind(globalThis);
+  // fallback for older runtimes
+  const undici = await import("undici");
+  return undici.fetch;
+}
 
 /* ---------------- CORS helpers ---------------- */
 
@@ -20,10 +33,10 @@ function origins() {
 // - Origin missing but Referer is allowed (some environments show Origin:null)
 function isAllowedOrigin(req) {
   const list = origins();
-  if (!list.length) return true; // if not set, allow all (not recommended, but avoids lockout)
+  if (!list.length) return { ok: true, by: "env-empty-allow-all", value: "*" }; // avoids lockout
 
-  const origin = (req.headers.origin || "").trim();
-  const referer = (req.headers.referer || "").trim();
+  const origin = String(req.headers?.origin || "").trim();
+  const referer = String(req.headers?.referer || "").trim();
 
   if (origin && list.some((a) => origin.startsWith(a))) return { ok: true, by: "origin", value: origin };
   if (!origin && referer && list.some((a) => referer.startsWith(a))) return { ok: true, by: "referer", value: referer };
@@ -32,7 +45,7 @@ function isAllowedOrigin(req) {
 }
 
 function setCors(res, req) {
-  const origin = (req.headers.origin || "").trim();
+  const origin = String(req.headers?.origin || "").trim();
   const allow = isAllowedOrigin(req);
 
   res.setHeader("Vary", "Origin");
@@ -42,6 +55,9 @@ function setCors(res, req) {
   // If origin is present and allowed, echo it back
   if (allow.ok && origin) {
     res.setHeader("Access-Control-Allow-Origin", origin);
+  } else if (allow.ok && !origin) {
+    // if Origin is absent (server-to-server / some environments), allow broadly
+    res.setHeader("Access-Control-Allow-Origin", "*");
   }
 
   return allow;
@@ -64,8 +80,8 @@ Rules:
 - Do not add adult/unsafe content.
 `.trim();
 
-async function planChatPrompt(userText, apiKey) {
-  const r = await fetch(OPENAI_CHAT_URL, {
+async function planChatPrompt(userText, apiKey, fetchFn) {
+  const r = await fetchFn(OPENAI_CHAT_URL, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${apiKey}`,
@@ -93,7 +109,9 @@ async function planChatPrompt(userText, apiKey) {
 
 /* ---------------- Main handler ---------------- */
 
-module.exports = async function handler(req, res) {
+async function handler(req, res) {
+  const fetchFn = await getFetch();
+
   // 1) CORS preflight
   if (req.method === "OPTIONS") {
     setCors(res, req);
@@ -105,8 +123,8 @@ module.exports = async function handler(req, res) {
   if (!allow.ok) {
     return res.status(403).json({
       error: "Forbidden origin",
-      seenOrigin: (req.headers.origin || null),
-      seenReferer: (req.headers.referer || null),
+      seenOrigin: req.headers?.origin || null,
+      seenReferer: req.headers?.referer || null,
       allowedOriginEnv: process.env.ALLOWED_ORIGIN || "",
       allowedOriginsParsed: origins(),
     });
@@ -118,7 +136,15 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const body = req.body || {};
+    // Body parsing safety: sometimes req.body is a string depending on platform/config
+    let body = req.body || {};
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        body = {};
+      }
+    }
 
     const message =
       typeof body.message === "string"
@@ -147,7 +173,7 @@ module.exports = async function handler(req, res) {
       return res.status(500).json({ error: "KNOWLEDGE_URL is not set in env." });
     }
 
-    const kbResp = await fetch(knowledgeUrl, { cache: "no-store" });
+    const kbResp = await fetchFn(knowledgeUrl, { cache: "no-store" });
     if (!kbResp.ok) {
       return res.status(500).json({
         error: `Failed to fetch knowledge JSON. status=${kbResp.status}`,
@@ -161,15 +187,15 @@ module.exports = async function handler(req, res) {
     const rawIntent = detectIntent(rawUserText);
     const detectedComponent = detectComponent(rawUserText, kb);
 
-if (detectedComponent) {
-  return res.status(200).json({
-    text: `${detectedComponent.name}:\n${detectedComponent.description}`,
-    debug: {
-      detectedComponent: detectedComponent.name,
-      kbMode: "component-lookup",
-    },
-  });
-}
+    if (detectedComponent) {
+      return res.status(200).json({
+        text: `${detectedComponent.name}:\n${detectedComponent.description}`,
+        debug: {
+          detectedComponent: detectedComponent.name,
+          kbMode: "component-lookup",
+        },
+      });
+    }
 
     const rawDetectedProject = detectProject(rawUserText, projectNames, kb);
 
@@ -240,8 +266,8 @@ if (detectedComponent) {
     // Planner (best effort)
     let plannedUserText = rawUserText;
     try {
-      plannedUserText = await planChatPrompt(rawUserText, apiKey);
-    } catch (e) {
+      plannedUserText = await planChatPrompt(rawUserText, apiKey, fetchFn);
+    } catch {
       plannedUserText = rawUserText;
     }
 
@@ -279,7 +305,7 @@ if (detectedComponent) {
       ],
     };
 
-    const resp = await fetch(OPENAI_CHAT_URL, {
+    const resp = await fetchFn(OPENAI_CHAT_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -314,7 +340,7 @@ if (detectedComponent) {
       details: String(e?.message || e),
     });
   }
-};
+}
 
 /* ---------------- Helpers ---------------- */
 
@@ -346,9 +372,7 @@ function buildIndexes(kb) {
 
   if (Array.isArray(candidates) && candidates.length) {
     for (const p of candidates) {
-      const name = typeof p === "string"
-  ? p
-  : p?.name || p?.project_name;
+      const name = typeof p === "string" ? p : p?.name || p?.project_name;
       if (name && !projectNames.includes(name)) projectNames.push(name);
     }
   }
@@ -446,22 +470,22 @@ function detectProject(text, projectNames, kb) {
 
   return null;
 }
+
 function detectComponent(text, kb) {
   const t = text.toLowerCase();
 
-  const list =
-    Array.isArray(kb?.components)
-      ? kb.components
-      : Array.isArray(kb?.contents)
-      ? kb.contents
-      : [];
+  const list = Array.isArray(kb?.components)
+    ? kb.components
+    : Array.isArray(kb?.contents)
+    ? kb.contents
+    : [];
 
   for (const c of list) {
     const name = String(c.name || c.id || "").toLowerCase();
     if (name && t.includes(name)) {
       return {
         name: c.name || c.id,
-        description: c.description || c.desc || "No description available."
+        description: c.description || c.desc || "No description available.",
       };
     }
   }
@@ -469,7 +493,15 @@ function detectComponent(text, kb) {
   return null;
 }
 
-function buildGroundedContext({ detectedProject, projectContext, canonicalPinsText, safetyText, lessonsForProject, intent, attachment }) {
+function buildGroundedContext({
+  detectedProject,
+  projectContext,
+  canonicalPinsText,
+  safetyText,
+  lessonsForProject,
+  intent,
+  attachment,
+}) {
   const lines = [];
 
   lines.push("Grounded Context (authoritative):");
@@ -518,59 +550,56 @@ function buildGroundedContext({ detectedProject, projectContext, canonicalPinsTe
 
 function extractProjectBlock(kb, projectName) {
   const projects = Array.isArray(kb?.projects) ? kb.projects : [];
- const components =
-  Array.isArray(kb?.components)
+  const components = Array.isArray(kb?.components)
     ? kb.components
     : Array.isArray(kb?.contents)
     ? kb.contents
     : [];
 
-const componentMap = {};
-for (const c of components) {
-  const key = String(c.id || c.name).toLowerCase();
-  componentMap[key] = {
-    name: c.name || c.id,
-    description: c.description || c.desc || ""
-  };
-}
-
+  const componentMap = {};
+  for (const c of components) {
+    const key = String(c.id || c.name || "").toLowerCase();
+    if (!key) continue;
+    componentMap[key] = {
+      name: c.name || c.id,
+      description: c.description || c.desc || "",
+    };
+  }
 
   const project = projects.find(
     (p) =>
       p.name === projectName ||
-      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
+      (Array.isArray(p.aliases) &&
+        p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
   );
 
   if (!project) return null;
 
- let text = "";
-text += `Project Name: ${project.name || project.project_name}\n`;
-if (project.difficulty) text += `Difficulty: ${project.difficulty}\n`;
-if (project.estimated_time) text += `Estimated Time: ${project.estimated_time}\n`;
+  let text = "";
+  text += `Project Name: ${project.name || project.project_name}\n`;
+  if (project.difficulty) text += `Difficulty: ${project.difficulty}\n`;
+  if (project.estimated_time) text += `Estimated Time: ${project.estimated_time}\n`;
 
-if (project.description)
-  text += `\nProject Description:\n${project.description}\n`;
+  if (project.description) text += `\nProject Description:\n${project.description}\n`;
 
-if (Array.isArray(project.components_used)) {
-  const readable = project.components_used.map((id) => {
-    const key = String(id).toLowerCase();
-    return componentMap[key]?.name || id;
-  });
-  text += `\nComponents Used:\n- ${readable.join("\n- ")}\n`;
-}
+  if (Array.isArray(project.components_used)) {
+    const readable = project.components_used.map((id) => {
+      const key = String(id).toLowerCase();
+      return componentMap[key]?.name || id;
+    });
+    text += `\nComponents Used:\n- ${readable.join("\n- ")}\n`;
+  }
 
-if (Array.isArray(project.build_steps)) {
-  text += `\nStep-by-Step Build:\n`;
-  project.build_steps.forEach((s, i) => {
-    text += `${i + 1}. ${s}\n`;
-  });
-}
+  if (Array.isArray(project.build_steps)) {
+    text += `\nStep-by-Step Build:\n`;
+    project.build_steps.forEach((s, i) => {
+      text += `${i + 1}. ${s}\n`;
+    });
+  }
 
-if (project.working)
-  text += `\nHow it Works:\n${project.working}\n`;
+  if (project.working) text += `\nHow it Works:\n${project.working}\n`;
 
-return text.trim();
-
+  return text.trim();
 }
 
 function extractLessons(kb, projectName) {
@@ -578,25 +607,17 @@ function extractLessons(kb, projectName) {
   const project = projects.find(
     (p) =>
       p.name === projectName ||
-      (Array.isArray(p.aliases) && p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
+      (Array.isArray(p.aliases) &&
+        p.aliases.some((a) => String(a).toLowerCase() === projectName.toLowerCase()))
   );
 
   if (!project || !Array.isArray(project.lessons)) return [];
 
   return project.lessons.map((l) => ({
-  lessonName: l.lesson_name || l.LessonName,
-  videoLinks:
-    l.videoLinks ||
-    l.video_url ||
-    l.VideoLinks ||
-    [],
-  explainLine:
-    l.explainLine ||
-    l.what_this_helps ||
-    l.description ||
-    null,
-}));
-
+    lessonName: l.lesson_name || l.LessonName || "",
+    videoLinks: l.videoLinks || l.video_url || l.VideoLinks || [],
+    explainLine: l.explainLine || l.what_this_helps || l.description || null,
+  }));
 }
 
 function extractCanonicalPins(kb) {
@@ -634,3 +655,5 @@ function sanitizeChunk(s) {
     .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
+
+export default handler;
