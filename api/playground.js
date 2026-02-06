@@ -1,7 +1,8 @@
 // /api/playground.js
-// Robocoders AI Playground (chat endpoint) — Enhanced v3
-// - Improved JSON structure compatibility
-// - Better data extraction and fallback logic
+// Robocoders AI Playground (chat endpoint) — Enhanced v4 CORRECTED
+// - Fixed intent detection issues
+// - Improved project and component matching
+// - Better handling of ambiguous queries
 // - Enhanced conversational quality
 // - Grounded context with KB data
 
@@ -139,7 +140,7 @@ export default async function handler(req, res) {
     } = buildIndexes(kb);
 
     // --------- Intent detection (deterministic) ----------
-    const rawIntent = detectIntent(rawUserText);
+    const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
     const rawDetectedProject = detectProject(rawUserText, projectNames);
     const detectedComponent = detectComponent(rawUserText, componentsMap);
 
@@ -166,7 +167,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // --------- Handle COMPONENT_INFO intent (NEW) ----------
+    // --------- Handle COMPONENT_INFO intent (IMPROVED) ----------
     if (rawIntent.type === "COMPONENT_INFO" || detectedComponent) {
       if (!detectedComponent) {
         return res.status(200).json({
@@ -371,16 +372,16 @@ function buildIndexes(kb) {
   };
 }
 
-/* -------------------- Intent Detection -------------------- */
-function detectIntent(text) {
-  const lower = String(text || "").toLowerCase();
+/* -------------------- Intent Detection (IMPROVED) -------------------- */
+function detectIntent(text, projectNames, componentsMap) {
+  const lower = String(text || "").toLowerCase().trim();
 
   // Kit overview
   if (
     /what.*(is|in|about|contains?).*kit/i.test(lower) ||
     /tell me about.*kit/i.test(lower) ||
     /kit.*overview/i.test(lower) ||
-    /what.*robocoders/i.test(lower)
+    (/what.*robocoders/i.test(lower) && !/brain/i.test(lower))
   ) {
     return { type: "KIT_OVERVIEW" };
   }
@@ -395,12 +396,26 @@ function detectIntent(text) {
     return { type: "COMPONENTS_LIST" };
   }
 
-  // Component info
-  if (
-    /what.*(is|does).*(?:robocoders brain|ir sensor|ldr|potentiometer|servo|motor|rgb|led)/i.test(lower) ||
-    /tell me about.*(?:robocoders brain|ir sensor|ldr|potentiometer|servo|motor|rgb|led)/i.test(lower) ||
-    /how.*(works?|use).*(?:robocoders brain|ir sensor|ldr|potentiometer|servo|motor|rgb|led)/i.test(lower)
-  ) {
+  // IMPROVED: Component info detection
+  // Check if asking ABOUT a component (not a project that USES it)
+  const componentKeywords = Object.keys(componentsMap).map(id => 
+    componentsMap[id].name?.toLowerCase()
+  ).filter(Boolean);
+  
+  const hasComponentMention = componentKeywords.some(comp => lower.includes(comp));
+  const isAskingAboutComponent = hasComponentMention && (
+    /what.*(is|does)/i.test(lower) ||
+    /tell me about/i.test(lower) ||
+    /how.*(works?|use)/i.test(lower) ||
+    /explain/i.test(lower)
+  );
+  
+  // CRITICAL FIX: Don't trigger component intent if asking about a PROJECT
+  const isAskingAboutProject = projectNames.some(proj => 
+    lower.includes(proj.toLowerCase())
+  );
+  
+  if (isAskingAboutComponent && !isAskingAboutProject) {
     return { type: "COMPONENT_INFO" };
   }
 
@@ -425,58 +440,129 @@ function detectIntent(text) {
   return { type: "GENERAL" };
 }
 
-/* -------------------- Project Detection -------------------- */
+/* -------------------- Project Detection (IMPROVED) -------------------- */
 function detectProject(text, projectNames) {
-  const lower = String(text || "").toLowerCase();
+  const lower = String(text || "").toLowerCase().trim();
+  
+  // Create scoring system for best match
+  let bestMatch = null;
+  let bestScore = 0;
+  
   for (const pName of projectNames) {
     const pLower = pName.toLowerCase();
-    if (lower.includes(pLower)) {
+    let score = 0;
+    
+    // Exact match gets highest score
+    if (lower === pLower) {
       return pName;
     }
-    // Try without special chars
-    const pSimple = pLower.replace(/[^a-z0-9]+/g, " ").trim();
-    const tSimple = lower.replace(/[^a-z0-9]+/g, " ").trim();
+    
+    // Full name included in query
+    if (lower.includes(pLower)) {
+      score = pLower.length * 2; // Longer matches score higher
+    }
+    
+    // Check for word-by-word match (handles spaces and special chars)
+    const pWords = pLower.split(/\s+/);
+    const tWords = lower.split(/\s+/);
+    const matchedWords = pWords.filter(w => tWords.includes(w));
+    
+    if (matchedWords.length > 0) {
+      score += matchedWords.length * 3;
+      
+      // Bonus if all words match
+      if (matchedWords.length === pWords.length) {
+        score += 10;
+      }
+    }
+    
+    // Try simplified match (remove special chars)
+    const pSimple = pLower.replace(/[^a-z0-9]+/g, "");
+    const tSimple = lower.replace(/[^a-z0-9]+/g, "");
     if (tSimple.includes(pSimple)) {
-      return pName;
+      score += pSimple.length;
+    }
+    
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = pName;
     }
   }
-  return null;
+  
+  // Only return match if score is significant enough
+  return bestScore >= 3 ? bestMatch : null;
 }
 
-/* -------------------- Component Detection (NEW) -------------------- */
+/* -------------------- Component Detection (IMPROVED) -------------------- */
 function detectComponent(text, componentsMap) {
-  const lower = String(text || "").toLowerCase();
+  const lower = String(text || "").toLowerCase().trim();
+  
+  let bestMatch = null;
+  let bestScore = 0;
   
   // Check each component name
   for (const [componentId, componentData] of Object.entries(componentsMap)) {
     const componentName = (componentData.name || "").toLowerCase();
-    if (componentName && lower.includes(componentName)) {
+    if (!componentName) continue;
+    
+    let score = 0;
+    
+    // Exact match
+    if (lower === componentName) {
       return componentId;
     }
     
-    // Also check common variations
+    // Full component name in query
+    if (lower.includes(componentName)) {
+      score = componentName.length * 2;
+    }
+    
+    // Check variations
     const variations = getComponentVariations(componentName);
     for (const variation of variations) {
       if (lower.includes(variation)) {
-        return componentId;
+        score += variation.length;
       }
+    }
+    
+    if (score > bestScore) {
+      bestScore = score;
+      bestMatch = componentId;
     }
   }
   
-  return null;
+  // Only return if score is significant
+  return bestScore >= 3 ? bestMatch : null;
 }
 
 function getComponentVariations(name) {
   const variations = [name];
   
   // Common variations
-  if (name.includes("robocoders brain")) variations.push("brain", "controller", "main board");
-  if (name.includes("ir sensor")) variations.push("infrared", "ir", "proximity sensor");
-  if (name.includes("ldr")) variations.push("light sensor", "light dependent resistor");
-  if (name.includes("potentiometer")) variations.push("knob", "pot", "dial");
-  if (name.includes("servo motor")) variations.push("servo");
-  if (name.includes("dc motor")) variations.push("motor");
-  if (name.includes("rgb led")) variations.push("rgb", "color led");
+  if (name.includes("robocoders brain")) {
+    variations.push("brain", "controller", "main board", "robocoders");
+  }
+  if (name.includes("ir sensor")) {
+    variations.push("infrared", "ir", "proximity sensor");
+  }
+  if (name.includes("ldr")) {
+    variations.push("light sensor", "light dependent resistor");
+  }
+  if (name.includes("potentiometer")) {
+    variations.push("knob", "pot", "dial");
+  }
+  if (name.includes("servo motor")) {
+    variations.push("servo");
+  }
+  if (name.includes("dc motor")) {
+    variations.push("motor");
+  }
+  if (name.includes("rgb led")) {
+    variations.push("rgb", "color led");
+  }
+  if (name.includes("keys pcb")) {
+    variations.push("keys", "buttons", "button panel");
+  }
   
   return variations;
 }
@@ -499,9 +585,9 @@ function buildGroundedContext(opts) {
   // Kit overview
   sections.push("=== KIT OVERVIEW ===\n" + kitOverview);
 
-  // Safety
+  // Safety (ENHANCED)
   if (safetyText) {
-    sections.push("=== SAFETY RULES ===\n" + safetyText);
+    sections.push("=== SAFETY RULES ===\n" + safetyText + "\n\nIMPORTANT SAFETY NOTES:\n- It is SAFE to plug and unplug sensors and components while the Robocoders Brain is powered on.\n- The system uses low voltage (5V from USB), so there is no risk of electric shock.\n- However, always handle components gently to avoid physical damage.\n- Do not force connections - they should fit smoothly.");
   }
 
   // Canonical pins
@@ -567,6 +653,9 @@ Important guidelines:
 - Always prioritize safety
 - Be patient and supportive
 - Use positive, empowering language
+- When asked about SAFETY: It is SAFE to plug/unplug sensors while the Robocoders Brain is on (low voltage 5V USB)
+- When asked about PROJECTS: Focus on the specific project mentioned, not on components used in that project
+- When asked about COMPONENTS: Provide component-specific information only
 
 KNOWLEDGE BASE:
 ${groundedContext}
@@ -694,7 +783,7 @@ function extractProjectsSummary(kb) {
   };
 }
 
-// NEW: Extract components map for component detection
+// IMPROVED: Extract components map for component detection
 function extractComponentsMap(kb) {
   const componentsMap = {};
   
@@ -724,7 +813,7 @@ function extractDescriptionFromText(text) {
   return match ? match[1].trim() : "";
 }
 
-// NEW: Format component info for display
+// Format component info for display
 function formatComponentInfo(componentData) {
   const lines = [];
   lines.push(`**${componentData.name}**\n`);
