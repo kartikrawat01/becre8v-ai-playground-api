@@ -168,7 +168,7 @@ export default async function handler(req, res) {
     }
 
     // --------- Handle COMPONENT_INFO intent (IMPROVED) ----------
-    if (rawIntent.type === "COMPONENT_INFO" || detectedComponent) {
+    if (rawIntent.type === "COMPONENT_INFO" && detectedComponent && !rawDetectedProject) {
       if (!detectedComponent) {
         return res.status(200).json({
           text: "Which component would you like to learn about? You can ask about any component like the Robocoders Brain, IR Sensor, Servo Motor, RGB LED, etc.",
@@ -191,7 +191,7 @@ export default async function handler(req, res) {
     }
 
     // --------- Handle LIST_PROJECTS intent ----------
-    if (rawIntent.type === "LIST_PROJECTS") {
+    if (rawIntent.type === "LIST_PROJECTS" && !rawDetectedProject) {
       return res.status(200).json({
         text:
           `The Robocoders Kit includes ${projectsSummary.totalCount} exciting projects:\n\n` +
@@ -382,7 +382,9 @@ function detectIntent(text, projectNames, componentsMap) {
     /tell me about.*kit/i.test(lower) ||
     /kit.*overview/i.test(lower) ||
     (/what.*robocoders/i.test(lower) && !/brain/i.test(lower))
-  ) {
+  &&
+  !projectNames.some(proj => lower.includes(proj.toLowerCase())))    //changed
+  {
     return { type: "KIT_OVERVIEW" };
   }
 
@@ -540,7 +542,7 @@ function getComponentVariations(name) {
   
   // Common variations
   if (name.includes("robocoders brain")) {
-    variations.push("brain", "controller", "main board", "robocoders");
+    variations.push("brain", "main board", "robocoders");
   }
   if (name.includes("ir sensor")) {
     variations.push("infrared", "ir", "proximity sensor");
