@@ -907,45 +907,59 @@ function extractProjectBlock(kb, projectName) {
 
 function extractLessons(kb, projectName) {
   const lessons = [];
-  
-  // Try pages extraction
+
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
     const p = projectName.toLowerCase();
+    let inProject = false;
+
     for (let i = 0; i < pages.length; i++) {
       const txt = pages[i];
       const low = txt.toLowerCase();
-      if (low.includes("project:") || low.includes("project :")) {
-        if (!low.includes(p)) continue;
-        const blocks = txt.split(/Lesson ID\s*[:\-]/i);
-        for (let b = 1; b < blocks.length; b++) {
-          const block = "Lesson ID:" + blocks[b];
-          const lessonName =
-            matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
-            matchLine(block, /Lesson Name\s*:\s*([^\n]+)/i) ||
-            "";
-          const links = [];
-          const linkMatches = block.match(/https?:\/\/[^\s\)]+/gi) || [];
-          for (const u of linkMatches) {
-            links.push(u.replace(/[\,\)\]]+$/g, ""));
-          }
-          const explainLine =
-            matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)(?:When the AI|$)/i) ||
-            matchLine(block, /What this lesson helps with\s*\(AI explanation line\)\s*:\s*([\s\S]*?)(?:When the AI|$)/i) ||
-            "";
-          if (lessonName && links.length) {
-            lessons.push({
-              lessonName: lessonName.trim(),
-              videoLinks: uniq(links),
-              explainLine: cleanExplain(explainLine),
-            });
-          }
+
+      if (
+        low.includes("project:") ||
+        low.includes("project :") ||
+        low.includes("project name")
+      ) {
+        inProject = low.includes(p);
+      }
+
+      if (!inProject) continue;
+
+      const blocks = txt.split(
+        /(Lesson ID\s*[:\-]|Build\s*\d+|Coding\s*Part\s*\d+)/i
+      );
+
+      for (let b = 1; b < blocks.length; b++) {
+        const block = blocks[b];
+
+        const lessonName =
+          matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
+          matchLine(block, /(Build\s*\d+)/i) ||
+          matchLine(block, /(Coding\s*Part\s*\d+)/i) ||
+          "";
+
+        const links =
+          block.match(/https?:\/\/[^\s\]\)\}\n]+/gi) || [];
+
+        const explainLine =
+          matchLine(
+            block,
+            /What this lesson helps with.*?:\s*([\s\S]*?)(?:When the AI|$)/i
+          ) || "";
+
+        if (lessonName && links.length) {
+          lessons.push({
+            lessonName: lessonName.trim(),
+            videoLinks: uniq(links),
+            explainLine: cleanExplain(explainLine),
+          });
         }
       }
     }
   }
-  
-  // Try structured lessons
+
   if (!lessons.length && kb?.lessons && kb.lessons[projectName]) {
     for (const l of kb.lessons[projectName]) {
       lessons.push({
@@ -959,8 +973,10 @@ function extractLessons(kb, projectName) {
       });
     }
   }
+
   return dedupeLessons(lessons);
 }
+
 
 function extractCanonicalPins(kb) {
   if (Array.isArray(kb?.pages)) {
