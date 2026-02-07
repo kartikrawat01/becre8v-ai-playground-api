@@ -611,7 +611,8 @@ function buildGroundedContext(opts) {
     sections.push(
       "=== PROJECTS SUMMARY ===\n" +
       `Total Projects: ${projectsSummary.totalCount}\n` +
-      `Available: ${(projectsSummary.projectList || []).slice(0, 10).join(", ")}...`
+     `Available Projects: ${projectsSummary.projectList.join(", ")}`
+
     );
   }
 
@@ -679,35 +680,7 @@ function buildConversationHistory(history) {
 
 /* -------------------- Extraction Functions -------------------- */
 function extractProjectNames(kb) {
-  // Try projectsSummary first
-  if (kb?.projectsSummary?.projectList) {
-    return kb.projectsSummary.projectList.filter(Boolean);
-  }
-  
-  // Try canonical projects
-  if (kb?.canonical?.projects && Array.isArray(kb.canonical.projects)) {
-    return kb.canonical.projects.map(p => p.name || p).filter(Boolean);
-  }
-  
-  // Try pages extraction
-  if (Array.isArray(kb?.pages)) {
-    const names = new Set();
-    for (const page of kb.pages) {
-      if (page?.type === "project" && page?.projectName) {
-        names.add(page.projectName);
-      }
-      const text = page?.text || "";
-      const match = text.match(/Project Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i);
-      if (match && match[1]) {
-        names.add(match[1].trim());
-      }
-    }
-    if (names.size > 0) {
-      return Array.from(names);
-    }
-  }
-  
-  // Fallback to hardcoded list
+  // ✅ ALWAYS use canonical full list (21 projects)
   return [
     "Hello World!",
     "Mood Lamp",
@@ -732,6 +705,8 @@ function extractProjectNames(kb) {
     "Candle Lamp",
   ];
 }
+
+
 
 function extractKitOverview(kb) {
   if (kb?.overview) {
@@ -770,18 +745,10 @@ function extractComponentsSummary(kb) {
 }
 
 function extractProjectsSummary(kb) {
-  if (kb?.projectsSummary) {
-    return kb.projectsSummary;
-  }
-  if (kb?.canonical?.projects) {
-    return {
-      totalCount: kb.canonical.projects.length,
-      projectList: kb.canonical.projects,
-    };
-  }
+  const projectList = extractProjectNames(kb);
   return {
-    totalCount: 21,
-    projectList: [],
+    totalCount: projectList.length,
+    projectList,
   };
 }
 
