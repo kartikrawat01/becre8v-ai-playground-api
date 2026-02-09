@@ -142,9 +142,10 @@ export default async function handler(req, res) {
 
 
     // --------- Intent detection (deterministic) ----------
-    const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
-    const rawDetectedProject = detectProject(rawUserText, projectNames);
-    const detectedComponent = detectComponent(rawUserText, componentsMap);
+  const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
+const rawDetectedProject = detectProject(rawUserText, projectNames);
+let detectedComponent = detectComponent(rawUserText, componentsMap);
+
 
     // --------- Handle KIT_OVERVIEW intent ----------
     if (rawIntent.type === "KIT_OVERVIEW") {
@@ -167,29 +168,6 @@ export default async function handler(req, res) {
           kbMode: "deterministic_components",
         },
       });
-    }
-
-    // --------- Handle COMPONENT_INFO intent (IMPROVED) ----------
-    if (rawIntent.type === "COMPONENT_INFO" && detectedComponent && !rawDetectedProject) {
-      if (!detectedComponent) {
-        return res.status(200).json({
-          text: "Which component would you like to learn about? You can ask about any component like the Robocoders Brain, IR Sensor, Servo Motor, RGB LED, etc.",
-          debug: { intent: rawIntent, detectedComponent: null },
-        });
-      }
-      
-      const componentInfo = componentsMap[detectedComponent];
-      if (componentInfo) {
-        const response = formatComponentInfo(componentInfo);
-        return res.status(200).json({
-          text: response,
-          debug: {
-            intent: rawIntent,
-            detectedComponent,
-            kbMode: "deterministic_component",
-          },
-        });
-      }
     }
 
     // --------- Handle LIST_PROJECTS intent ----------
@@ -272,7 +250,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // --------- OpenAI key ----------
+
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       return res
@@ -280,7 +258,7 @@ export default async function handler(req, res) {
         .json({ error: "OPENAI_API_KEY is not set in env." });
     }
 
-    // --------- Planner (ONLY for GENERAL) ----------
+  
     let plannedUserText = rawUserText;
     try {
       plannedUserText = await planChatPrompt(rawUserText, apiKey);
@@ -288,10 +266,77 @@ export default async function handler(req, res) {
       plannedUserText = rawUserText;
     }
 
-    // Re-run detection using planned text if raw didn't detect
-    const detectedProject =
-      rawDetectedProject || detectProject(plannedUserText, projectNames);
-    const intent = rawIntent;
+
+const { lastProject, lastComponent } = resolveContextFromHistory(
+  history,
+  projectNames,
+  componentsMap
+);
+
+const detectedProject =
+  rawDetectedProject ||
+  detectProject(plannedUserText, projectNames) ||
+  lastProject;
+
+detectedComponent =
+  detectComponent(plannedUserText, componentsMap) || detectedComponent || lastComponent;
+
+const intent = rawIntent;
+
+if (intent.type === "COMPONENT_INFO" && !detectedProject) {
+
+ const supportReason = detectSupportFailure({
+  userText: rawUserText,
+  intent,
+  detectedProject: null,
+  projectContext: null,
+});
+
+
+  if (
+    supportReason &&
+    supportConfig?.enabled &&
+    supportConfig.show_when?.includes(supportReason)
+  ) {
+    let supportText =
+      `⚠️ **Need more help?**\n` +
+      `${supportConfig.message}\n\n` +
+      `📧 Email: ${supportConfig.contact.email}\n` +
+      `📞 Phone: ${supportConfig.contact.phone}\n` +
+      `⏰ Hours: ${supportConfig.contact.hours}`;
+
+    return res.status(200).json({
+      text: supportText,
+      debug: {
+        intent: rawIntent,
+        supportTriggered: true,
+        supportReason,
+      },
+    });
+  }
+
+if (!detectedComponent) {
+  return res.status(200).json({
+    text:
+      "Can you tell me which component you are talking about?\n" +
+      "For example: IR Sensor, LDR, Servo Motor.\n\n" +
+      "If a part is missing or damaged, I can also help you contact support.",
+    debug: { intent, detectedComponent: null },
+  });
+}
+  const componentInfo = componentsMap[detectedComponent];
+  if (componentInfo) {
+    const response = formatComponentInfo(componentInfo);
+    return res.status(200).json({
+      text: response,
+      debug: {
+        intent: rawIntent,
+        detectedComponent,
+        kbMode: "deterministic_component",
+      },
+    });
+  }
+}
 
     // --------- Build grounded context for model ----------
     const projectContext = detectedProject
@@ -344,39 +389,16 @@ export default async function handler(req, res) {
     const data = await r.json();
     const assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
 
-const supportReason = detectSupportFailure({
-  userText: rawUserText,
-  intent,
-  detectedProject,
-  projectContext,
-});
-
-let finalText = assistantReply;
-
-if (
-  supportReason &&
-  supportConfig?.enabled &&
-  supportConfig.show_when?.includes(supportReason)
-) {
-  finalText +=
-    `\n\n⚠️ **Need more help?**\n` +
-    `${supportConfig.message}\n\n` +
-    `📧 Email: ${supportConfig.contact.email}\n` +
-    `📞 Phone: ${supportConfig.contact.phone}\n` +
-    `⏰ Hours: ${supportConfig.contact.hours}`;
-}
-
-return res.status(200).json({
-  text: finalText,
+    return res.status(200).json({
+  text: assistantReply,
   debug: {
     detectedProject: detectedProject || null,
     detectedComponent: detectedComponent || null,
     intent,
     kbMode: "llm",
-    supportTriggered: Boolean(supportReason),
-    supportReason,
   },
 });
+
 
   } catch (err) {
     console.error("Playground handler error:", err);
@@ -588,6 +610,31 @@ function detectComponent(text, componentsMap) {
   
   // Only return if score is significant
   return bestScore >= 3 ? bestMatch : null;
+}
+function resolveContextFromHistory(history, projectNames, componentsMap) {
+  let lastProject = null;
+  let lastComponent = null;
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+    if (!msg?.content) continue;
+
+    const text = String(msg.content);
+
+    if (!lastProject) {
+      const p = detectProject(text, projectNames);
+      if (p) lastProject = p;
+    }
+
+    if (!lastComponent) {
+      const c = detectComponent(text, componentsMap);
+      if (c) lastComponent = c;
+    }
+
+    if (lastProject && lastComponent) break;
+  }
+
+  return { lastProject, lastComponent };
 }
 
 function getComponentVariations(name) {
@@ -1145,21 +1192,36 @@ function dedupeLessons(lessons) {
 function detectSupportFailure({ userText, intent, detectedProject, projectContext }) {
   const lower = String(userText || "").toLowerCase();
 
-  // Only for troubleshooting-type messages
+  // 🚨 DIRECT SUPPORT REQUEST (USER ASKING TO CONTACT SUPPORT)
+  if (
+    /contact support|customer care|help desk|call support|reach support|support number|support email/i.test(
+      lower
+    )
+  ) {
+    return "USER_REQUESTED_SUPPORT";
+  }
+
+  // 🚨 PART MISSING
+  if (/missing|lost|not included|part nahi|component missing|part missing/i.test(lower)) {
+    return "PART_MISSING";
+  }
+
+  // 🚨 PART FAULT / DAMAGED
+  if (
+    /faulty|not working part|defective|damaged part|broken part|burn|smoke|heat|melt|short/i.test(
+      lower
+    )
+  ) {
+    return "HARDWARE_DAMAGED";
+  }
+
+  // Soft troubleshooting keywords
   if (!/(not working|issue|problem|error|doesn'?t work|failed)/i.test(lower)) {
     return null;
   }
 
   if (detectedProject && !projectContext) {
     return "ISSUE_NOT_IN_KB";
-  }
-
-  if (/missing|lost|not included|part nahi|part missing/i.test(lower)) {
-    return "PART_MISSING";
-  }
-
-  if (/burn|smoke|heat|melt|damage|short/i.test(lower)) {
-    return "HARDWARE_DAMAGED";
   }
 
   if (intent?.type === "GENERAL") {
