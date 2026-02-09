@@ -930,6 +930,38 @@ function extractProjectBlock(kb, projectName) {
 }
 
 function extractLessons(kb, projectName) {
+
+  // ✅ PRIORITY 1: structured lessons (JSON)
+  if (Array.isArray(kb?.lessons) && kb.lessons.length > 0) {
+    const lessons = [];
+
+   for (const l of kb.lessons) {
+  if (l.project !== projectName) continue;
+
+  const links = Array.isArray(l.video_url)
+    ? uniq(l.video_url)
+    : [l.video_url];
+
+  // 🔹 har video ko alag lesson treat karo
+  links.forEach((link, i) => {
+    lessons.push({
+      lessonName:
+        links.length > 1
+          ? `${l.lesson_name} - Part ${i + 1}`
+          : l.lesson_name,
+      videoLinks: [link],
+      explainLine: "",
+    });
+  });
+}
+
+
+    // ⛔ IMPORTANT: agar structured lessons mil gaye
+    // text-based parsing NAHI chalega
+    return dedupeLessons(lessons);
+  }
+
+  // 🔽 FALLBACK: text-based extraction (ONLY if JSON lessons missing)
   const lessons = [];
 
   if (Array.isArray(kb?.pages)) {
@@ -984,23 +1016,8 @@ function extractLessons(kb, projectName) {
     }
   }
 
-  if (!lessons.length && kb?.lessons && kb.lessons[projectName]) {
-    for (const l of kb.lessons[projectName]) {
-      lessons.push({
-        lessonName: l.lessonName,
-        videoLinks: Array.isArray(l.videoLinks)
-          ? l.videoLinks
-          : l.videoLink
-          ? [l.videoLink]
-          : [],
-        explainLine: l.explainLine || "",
-      });
-    }
-  }
-
   return dedupeLessons(lessons);
 }
-
 
 function extractCanonicalPins(kb) {
   if (Array.isArray(kb?.pages)) {
@@ -1075,11 +1092,18 @@ function cleanExplain(s) {
 function dedupeLessons(lessons) {
   const out = [];
   const seen = new Set();
+
   for (const l of lessons || []) {
-    const key = (l.lessonName || "").toLowerCase();
+    const key =
+      (l.lessonName || "").toLowerCase() +
+      "::" +
+      (l.videoLinks || []).join(",");
+
     if (!key || seen.has(key)) continue;
+
     seen.add(key);
     out.push(l);
   }
+
   return out;
 }
