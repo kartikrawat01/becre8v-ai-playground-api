@@ -210,32 +210,14 @@ let detectedComponent = detectComponent(rawUserText, componentsMap);
 
       const links = v.videoLinks || [];
 
-      // 🔹 Split CODING lessons into parts
-      if (/coding/i.test(v.lessonName) && links.length > 1) {
-        return links
-          .map((link, i) =>
-            `${idx + 1}.${i + 1} ${v.lessonName} - Coding Part ${i + 1}\nLinks:\n- ${link}`
-          )
-          .join("\n\n");
-      }
+const linksText = links.map((u) => `- ${u}`).join("\n");
 
-      // 🔹 Split BUILD lessons into parts
-      if (/build/i.test(v.lessonName) && links.length > 1) {
-        return links
-          .map((link, i) =>
-            `${idx + 1}.${i + 1} ${v.lessonName} - Build Part ${i + 1}\nLinks:\n- ${link}`
-          )
-          .join("\n\n");
-      }
+return (
+  `${idx + 1}. ${v.lessonName}\n` +
+  `${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}` +
+  `Links:\n${linksText}`
+);
 
-      // 🔹 Normal lesson
-      const linksText = links.map((u) => `- ${u}`).join("\n");
-
-      return (
-        `${idx + 1}. ${v.lessonName}\n` +
-        `${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}` +
-        `Links:\n${linksText}`
-      );
     })
     .join("\n\n");
 
@@ -607,9 +589,9 @@ function detectComponent(text, componentsMap) {
       bestMatch = componentId;
     }
   }
-  
-  // Only return if score is significant
-  return bestScore >= 3 ? bestMatch : null;
+
+return bestScore >= 2 ? bestMatch : null;
+
 }
 function resolveContextFromHistory(history, projectNames, componentsMap) {
   let lastProject = null;
@@ -1013,7 +995,6 @@ function extractProjectBlock(kb, projectName) {
 
 function extractLessons(kb, projectName) {
 
-  // ✅ PRIORITY 1: structured lessons (JSON)
   if (Array.isArray(kb?.lessons) && kb.lessons.length > 0) {
     const lessons = [];
 
@@ -1021,10 +1002,9 @@ function extractLessons(kb, projectName) {
   if (l.project !== projectName) continue;
 
   const links = Array.isArray(l.video_url)
-    ? uniq(l.video_url)
-    : [l.video_url];
+  ? uniq(l.video_url.map(u => String(u).trim()))
+  : [String(l.video_url || "").trim()];
 
-  // 🔹 har video ko alag lesson treat karo
   links.forEach((link, i) => {
     lessons.push({
       lessonName:
