@@ -823,6 +823,33 @@ function extractComponentsMap(kb) {
   
   return componentsMap;
 }
+function extractComponentsMap(kb) {
+  // ...existing code...
+}
+
+// <-- ADD extractSupport HERE -->
+function extractSupport(kb) {
+  if (kb?.support) {
+    return {
+      enabled: kb.support.enabled || false,
+      message: kb.support.message || "Contact support for help.",
+      contact: {
+        email: kb.support.email || "support@example.com",
+        phone: kb.support.phone || "",
+        hours: kb.support.hours || "",
+      },
+    };
+  }
+  return {
+    enabled: false,
+    message: "",
+    contact: { email: "", phone: "", hours: "" },
+  };
+}
+
+function extractDescriptionFromText(text) {
+  // ...existing code...
+}
 
 function extractDescriptionFromText(text) {
   const match = String(text || "").match(/Description:\s*([^\n]+(?:\n(?!Component|Type|Usage)[^\n]+)*)/i);
@@ -965,7 +992,7 @@ function extractLessons(kb, projectName) {
     ? uniq(l.video_url)
     : [l.video_url];
 
-  // 🔹 har video ko alag lesson treat karo
+
 lessons.push({
   lessonName: l.lesson_name,
   videoLinks: uniq(Array.isArray(l.video_url) ? l.video_url : [l.video_url]),
@@ -975,12 +1002,10 @@ lessons.push({
 }
 
 
-    // ⛔ IMPORTANT: agar structured lessons mil gaye
-    // text-based parsing NAHI chalega
     return dedupeLessons(lessons);
   }
 
-  // 🔽 FALLBACK: text-based extraction (ONLY if JSON lessons missing)
+
   const lessons = [];
 
   if (Array.isArray(kb?.pages)) {
