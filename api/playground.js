@@ -141,7 +141,10 @@ export default async function handler(req, res) {
 
     // --------- Intent detection (deterministic) ----------
     const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
-    const rawDetectedProject = detectProject(rawUserText, projectNames);
+    const rawDetectedProject =
+     detectProject(rawUserText, projectNames) ||
+     detectProjectFromHistory(history, projectNames);
+
     const detectedComponent = detectComponent(rawUserText, componentsMap);
 
     // --------- Handle KIT_OVERVIEW intent ----------
@@ -230,25 +233,6 @@ export default async function handler(req, res) {
 
       const links = v.videoLinks || [];
 
-      // 🔹 Split CODING lessons into parts
-      if (/coding/i.test(v.lessonName) && links.length > 1) {
-        return links
-          .map((link, i) =>
-            `${idx + 1}.${i + 1} ${v.lessonName} - Coding Part ${i + 1}\nLinks:\n- ${link}`
-          )
-          .join("\n\n");
-      }
-
-      // 🔹 Split BUILD lessons into parts
-      if (/build/i.test(v.lessonName) && links.length > 1) {
-        return links
-          .map((link, i) =>
-            `${idx + 1}.${i + 1} ${v.lessonName} - Build Part ${i + 1}\nLinks:\n- ${link}`
-          )
-          .join("\n\n");
-      }
-
-      // 🔹 Normal lesson
       const linksText = links.map((u) => `- ${u}`).join("\n");
 
       return (
@@ -342,16 +326,39 @@ export default async function handler(req, res) {
     const data = await r.json();
     const assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
 
-    return res.status(200).json({
-      text: assistantReply,
-      debug: {
-        detectedProject: detectedProject || null,
-        detectedComponent: detectedComponent || null,
-        intent,
-        kbMode: "llm",
-        plannedPrompt: plannedUserText !== rawUserText ? plannedUserText : null,
-      },
-    });
+  let finalReply = assistantReply;
+
+// ----------------- SUPPORT FALLBACK -----------------
+const supportConfig = componentsSummary?.supportConfig || null; // get from buildIndexes
+
+const needsSupport = supportConfig?.enabled && /i am not sure|i don’t know|cannot find|not in the knowledge|missing part|broken|damaged/i.test(assistantReply.toLowerCase());
+
+if (needsSupport) {
+  finalReply += `
+
+---
+
+🛟 **Need more help?**
+${supportConfig.message}
+
+📧 Email: ${supportConfig.contact.email}
+📞 Phone: ${supportConfig.contact.phone}
+⏰ Hours: ${supportConfig.contact.hours}`;
+}
+
+
+return res.status(200).json({
+  text: finalReply,
+  debug: {
+    detectedProject: detectedProject || null,
+    detectedComponent: detectedComponent || null,
+    intent,
+    kbMode: "llm",
+    plannedPrompt: plannedUserText !== rawUserText ? plannedUserText : null,
+    supportTriggered: needsSupport || false,
+  },
+});
+
   } catch (err) {
     console.error("Playground handler error:", err);
     return res.status(500).json({
@@ -382,6 +389,7 @@ function buildIndexes(kb) {
   const componentsSummary = extractComponentsSummary(kb);
   const projectsSummary = extractProjectsSummary(kb);
   const componentsMap = extractComponentsMap(kb);
+  const supportConfig = extractSupport(kb); 
 
   return {
     projectNames,
@@ -393,7 +401,9 @@ function buildIndexes(kb) {
     componentsSummary,
     projectsSummary,
     componentsMap,
+    supportConfig, 
   };
+
 }
 
 /* -------------------- Intent Detection (IMPROVED) -------------------- */
@@ -517,6 +527,19 @@ function detectProject(text, projectNames) {
   
   // Only return match if score is significant enough
   return bestScore >= 3 ? bestMatch : null;
+}
+function detectProjectFromHistory(history, projectNames) {
+  if (!Array.isArray(history)) return null;
+
+  for (let i = history.length - 1; i >= 0; i--) {
+    const msg = history[i];
+
+    if (msg?.role === "user" && typeof msg.content === "string") {
+      const found = detectProject(msg.content, projectNames);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 /* -------------------- Component Detection (IMPROVED) -------------------- */
@@ -943,16 +966,12 @@ function extractLessons(kb, projectName) {
     : [l.video_url];
 
   // 🔹 har video ko alag lesson treat karo
-  links.forEach((link, i) => {
-    lessons.push({
-      lessonName:
-        links.length > 1
-          ? `${l.lesson_name} - Part ${i + 1}`
-          : l.lesson_name,
-      videoLinks: [link],
-      explainLine: "",
-    });
-  });
+lessons.push({
+  lessonName: l.lesson_name,
+  videoLinks: uniq(Array.isArray(l.video_url) ? l.video_url : [l.video_url]),
+  explainLine: l.explainLine || "",
+});
+
 }
 
 
