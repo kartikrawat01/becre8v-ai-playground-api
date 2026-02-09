@@ -128,23 +128,22 @@ export default async function handler(req, res) {
 
     // --------- Build indexes ----------
     const {
-      projectNames,
-      projectsByName,
-      lessonsByProject,
-      canonicalPinsText,
-      safetyText,
-      kitOverview,
-      componentsSummary,
-      projectsSummary,
-      componentsMap,
-    } = buildIndexes(kb);
+  projectNames,
+  projectsByName,
+  lessonsByProject,
+  canonicalPinsText,
+  safetyText,
+  kitOverview,
+  componentsSummary,
+  projectsSummary,
+  componentsMap,
+  supportConfig,
+} = buildIndexes(kb);
+
 
     // --------- Intent detection (deterministic) ----------
     const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
-    const rawDetectedProject =
-     detectProject(rawUserText, projectNames) ||
-     detectProjectFromHistory(history, projectNames);
-
+    const rawDetectedProject = detectProject(rawUserText, projectNames);
     const detectedComponent = detectComponent(rawUserText, componentsMap);
 
     // --------- Handle KIT_OVERVIEW intent ----------
@@ -233,6 +232,25 @@ export default async function handler(req, res) {
 
       const links = v.videoLinks || [];
 
+      // 🔹 Split CODING lessons into parts
+      if (/coding/i.test(v.lessonName) && links.length > 1) {
+        return links
+          .map((link, i) =>
+            `${idx + 1}.${i + 1} ${v.lessonName} - Coding Part ${i + 1}\nLinks:\n- ${link}`
+          )
+          .join("\n\n");
+      }
+
+      // 🔹 Split BUILD lessons into parts
+      if (/build/i.test(v.lessonName) && links.length > 1) {
+        return links
+          .map((link, i) =>
+            `${idx + 1}.${i + 1} ${v.lessonName} - Build Part ${i + 1}\nLinks:\n- ${link}`
+          )
+          .join("\n\n");
+      }
+
+      // 🔹 Normal lesson
       const linksText = links.map((u) => `- ${u}`).join("\n");
 
       return (
@@ -326,36 +344,37 @@ export default async function handler(req, res) {
     const data = await r.json();
     const assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
 
-  let finalReply = assistantReply;
+const supportReason = detectSupportFailure({
+  userText: rawUserText,
+  intent,
+  detectedProject,
+  projectContext,
+});
 
-// ----------------- SUPPORT FALLBACK -----------------
-const supportConfig = componentsSummary?.supportConfig || null; // get from buildIndexes
+let finalText = assistantReply;
 
-const needsSupport = supportConfig?.enabled && /i am not sure|i don’t know|cannot find|not in the knowledge|missing part|broken|damaged/i.test(assistantReply.toLowerCase());
-
-if (needsSupport) {
-  finalReply += `
-
----
-
-🛟 **Need more help?**
-${supportConfig.message}
-
-📧 Email: ${supportConfig.contact.email}
-📞 Phone: ${supportConfig.contact.phone}
-⏰ Hours: ${supportConfig.contact.hours}`;
+if (
+  supportReason &&
+  supportConfig?.enabled &&
+  supportConfig.show_when?.includes(supportReason)
+) {
+  finalText +=
+    `\n\n⚠️ **Need more help?**\n` +
+    `${supportConfig.message}\n\n` +
+    `📧 Email: ${supportConfig.contact.email}\n` +
+    `📞 Phone: ${supportConfig.contact.phone}\n` +
+    `⏰ Hours: ${supportConfig.contact.hours}`;
 }
 
-
 return res.status(200).json({
-  text: finalReply,
+  text: finalText,
   debug: {
     detectedProject: detectedProject || null,
     detectedComponent: detectedComponent || null,
     intent,
     kbMode: "llm",
-    plannedPrompt: plannedUserText !== rawUserText ? plannedUserText : null,
-    supportTriggered: needsSupport || false,
+    supportTriggered: Boolean(supportReason),
+    supportReason,
   },
 });
 
@@ -389,20 +408,20 @@ function buildIndexes(kb) {
   const componentsSummary = extractComponentsSummary(kb);
   const projectsSummary = extractProjectsSummary(kb);
   const componentsMap = extractComponentsMap(kb);
-  const supportConfig = extractSupport(kb); 
+const supportConfig = extractSupportConfig(kb);
 
-  return {
-    projectNames,
-    projectsByName,
-    lessonsByProject,
-    canonicalPinsText,
-    safetyText,
-    kitOverview,
-    componentsSummary,
-    projectsSummary,
-    componentsMap,
-    supportConfig, 
-  };
+return {
+  projectNames,
+  projectsByName,
+  lessonsByProject,
+  canonicalPinsText,
+  safetyText,
+  kitOverview,
+  componentsSummary,
+  projectsSummary,
+  componentsMap,
+  supportConfig,
+};
 
 }
 
@@ -527,19 +546,6 @@ function detectProject(text, projectNames) {
   
   // Only return match if score is significant enough
   return bestScore >= 3 ? bestMatch : null;
-}
-function detectProjectFromHistory(history, projectNames) {
-  if (!Array.isArray(history)) return null;
-
-  for (let i = history.length - 1; i >= 0; i--) {
-    const msg = history[i];
-
-    if (msg?.role === "user" && typeof msg.content === "string") {
-      const found = detectProject(msg.content, projectNames);
-      if (found) return found;
-    }
-  }
-  return null;
 }
 
 /* -------------------- Component Detection (IMPROVED) -------------------- */
@@ -798,6 +804,12 @@ function extractProjectsSummary(kb) {
     projectList,
   };
 }
+function extractSupportConfig(kb) {
+  if (kb?.support?.enabled) {
+    return kb.support;
+  }
+  return null;
+}
 
 // IMPROVED: Extract components map for component detection
 function extractComponentsMap(kb) {
@@ -822,33 +834,6 @@ function extractComponentsMap(kb) {
   }
   
   return componentsMap;
-}
-function extractComponentsMap(kb) {
-  // ...existing code...
-}
-
-// <-- ADD extractSupport HERE -->
-function extractSupport(kb) {
-  if (kb?.support) {
-    return {
-      enabled: kb.support.enabled || false,
-      message: kb.support.message || "Contact support for help.",
-      contact: {
-        email: kb.support.email || "support@example.com",
-        phone: kb.support.phone || "",
-        hours: kb.support.hours || "",
-      },
-    };
-  }
-  return {
-    enabled: false,
-    message: "",
-    contact: { email: "", phone: "", hours: "" },
-  };
-}
-
-function extractDescriptionFromText(text) {
-  // ...existing code...
 }
 
 function extractDescriptionFromText(text) {
@@ -992,20 +977,26 @@ function extractLessons(kb, projectName) {
     ? uniq(l.video_url)
     : [l.video_url];
 
-
-lessons.push({
-  lessonName: l.lesson_name,
-  videoLinks: uniq(Array.isArray(l.video_url) ? l.video_url : [l.video_url]),
-  explainLine: l.explainLine || "",
-});
-
+  // 🔹 har video ko alag lesson treat karo
+  links.forEach((link, i) => {
+    lessons.push({
+      lessonName:
+        links.length > 1
+          ? `${l.lesson_name} - Part ${i + 1}`
+          : l.lesson_name,
+      videoLinks: [link],
+      explainLine: "",
+    });
+  });
 }
 
 
+    // ⛔ IMPORTANT: agar structured lessons mil gaye
+    // text-based parsing NAHI chalega
     return dedupeLessons(lessons);
   }
 
-
+  // 🔽 FALLBACK: text-based extraction (ONLY if JSON lessons missing)
   const lessons = [];
 
   if (Array.isArray(kb?.pages)) {
@@ -1150,4 +1141,30 @@ function dedupeLessons(lessons) {
   }
 
   return out;
+}
+function detectSupportFailure({ userText, intent, detectedProject, projectContext }) {
+  const lower = String(userText || "").toLowerCase();
+
+  // Only for troubleshooting-type messages
+  if (!/(not working|issue|problem|error|doesn'?t work|failed)/i.test(lower)) {
+    return null;
+  }
+
+  if (detectedProject && !projectContext) {
+    return "ISSUE_NOT_IN_KB";
+  }
+
+  if (/missing|lost|not included|part nahi|part missing/i.test(lower)) {
+    return "PART_MISSING";
+  }
+
+  if (/burn|smoke|heat|melt|damage|short/i.test(lower)) {
+    return "HARDWARE_DAMAGED";
+  }
+
+  if (intent?.type === "GENERAL") {
+    return "AI_CANNOT_RESOLVE";
+  }
+
+  return null;
 }
