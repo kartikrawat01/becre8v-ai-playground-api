@@ -224,17 +224,41 @@ export default async function handler(req, res) {
         });
       }
       const out =
-        `Lesson videos for ${rawDetectedProject}:\n\n` +
-        videos
-          .map((v, idx) => {
-            const links = (v.videoLinks || []).map((u) => `- ${u}`).join("\n");
-            return (
-              `${idx + 1}. ${v.lessonName}\n` +
-              `${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}` +
-              `Links:\n${links}`
-            );
-          })
+  `Lesson videos for ${rawDetectedProject}:\n\n` +
+  videos
+    .map((v, idx) => {
+
+      const links = v.videoLinks || [];
+
+      // 🔹 Split CODING lessons into parts
+      if (/coding/i.test(v.lessonName) && links.length > 1) {
+        return links
+          .map((link, i) =>
+            `${idx + 1}.${i + 1} ${v.lessonName} - Coding Part ${i + 1}\nLinks:\n- ${link}`
+          )
           .join("\n\n");
+      }
+
+      // 🔹 Split BUILD lessons into parts
+      if (/build/i.test(v.lessonName) && links.length > 1) {
+        return links
+          .map((link, i) =>
+            `${idx + 1}.${i + 1} ${v.lessonName} - Build Part ${i + 1}\nLinks:\n- ${link}`
+          )
+          .join("\n\n");
+      }
+
+      // 🔹 Normal lesson
+      const linksText = links.map((u) => `- ${u}`).join("\n");
+
+      return (
+        `${idx + 1}. ${v.lessonName}\n` +
+        `${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}` +
+        `Links:\n${linksText}`
+      );
+    })
+    .join("\n\n");
+
       return res.status(200).json({
         text: out,
         debug: {
