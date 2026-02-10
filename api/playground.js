@@ -1,3 +1,4 @@
+
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
 function origins() {
@@ -337,7 +338,8 @@ if (
     }
 
     const data = await r.json();
-    const assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
+   let assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
+assistantReply = assistantReply.replace(/\*\*(.*?)\*\*/g, "$1");
 
     return res.status(200).json({
   text: assistantReply,
@@ -1088,11 +1090,6 @@ function lessonRank(lessonName = "") {
 
 function sanitizeChunk(s) {
   return String(s || "")
-    // remove markdown bold/italic stars
-    .replace(/\*\*(.*?)\*\*/g, "$1")
-    .replace(/\*(.*?)\*/g, "$1")
-
-    // clean formatting
     .replace(/\u0000/g, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
