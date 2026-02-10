@@ -264,61 +264,37 @@ detectedComponent =
   detectComponent(plannedUserText, componentsMap) || detectedComponent || lastComponent;
 
 const intent = rawIntent;
-
-if (intent.type === "COMPONENT_INFO" && !detectedProject) {
-
- const supportReason = detectSupportFailure({
+const supportReason = detectSupportFailure({
   userText: rawUserText,
   intent,
-  detectedProject: null,
-  projectContext: null,
+  detectedProject,
+  projectContext: detectedProject ? projectsByName[detectedProject] : null,
+  detectedComponent,
+  componentsMap
 });
 
 
-  if (
-    supportReason &&
-    supportConfig?.enabled &&
-    supportConfig.show_when?.includes(supportReason)
-  ) {
-    let supportText =
-      `⚠️ **Need more help?**\n` +
-      `${supportConfig.message}\n\n` +
-      `📧 Email: ${supportConfig.contact.email}\n` +
-      `📞 Phone: ${supportConfig.contact.phone}\n` +
-      `⏰ Hours: ${supportConfig.contact.hours}`;
-
-    return res.status(200).json({
-      text: supportText,
-      debug: {
-        intent: rawIntent,
-        supportTriggered: true,
-        supportReason,
-      },
-    });
-  }
-
-if (!detectedComponent) {
+if (
+  supportReason &&
+  supportConfig?.enabled &&
+  supportConfig.show_when?.includes(supportReason)
+) {
   return res.status(200).json({
     text:
-      "Can you tell me which component you are talking about?\n" +
-      "For example: IR Sensor, LDR, Servo Motor.\n\n" +
-      "If a part is missing or damaged, I can also help you contact support.",
-    debug: { intent, detectedComponent: null },
+      `⚠️ **Need help?**\n\n${supportConfig.message}\n\n` +
+      `📧 ${supportConfig.contact.email}\n` +
+      `📞 ${supportConfig.contact.phone}\n` +
+      `⏰ ${supportConfig.contact.hours}`,
+    debug: {
+      supportTriggered: true,
+      supportReason,
+      detectedProject,
+      detectedComponent,
+      intent
+    }
   });
 }
-  const componentInfo = componentsMap[detectedComponent];
-  if (componentInfo) {
-    const response = formatComponentInfo(componentInfo);
-    return res.status(200).json({
-      text: response,
-      debug: {
-        intent: rawIntent,
-        detectedComponent,
-        kbMode: "deterministic_component",
-      },
-    });
-  }
-}
+
 
     // --------- Build grounded context for model ----------
     const projectContext = detectedProject
@@ -1169,42 +1145,46 @@ function dedupeLessons(lessons) {
 
   return out;
 }
-function detectSupportFailure({ userText, intent, detectedProject, projectContext }) {
+function detectSupportFailure({
+  userText,
+  intent,
+  detectedProject,
+  projectContext,
+  detectedComponent,
+  componentsMap
+}) {
   const lower = String(userText || "").toLowerCase();
 
-  // 🚨 DIRECT SUPPORT REQUEST (USER ASKING TO CONTACT SUPPORT)
-  if (
-    /contact support|customer care|help desk|call support|reach support|support number|support email/i.test(
-      lower
-    )
-  ) {
+  // User directly wants support
+  if (/contact|customer|support|help desk|call|email|number/i.test(lower)) {
     return "USER_REQUESTED_SUPPORT";
   }
 
-  // 🚨 PART MISSING
-  if (/missing|lost|not included|part nahi|component missing|part missing/i.test(lower)) {
+  // Missing part
+  if (/missing|not in kit|not included|lost|part nahi|component missing|nahi mila/i.test(lower)) {
     return "PART_MISSING";
   }
 
-  // 🚨 PART FAULT / DAMAGED
-  if (
-    /faulty|not working part|defective|damaged part|broken part|burn|smoke|heat|melt|short/i.test(
-      lower
-    )
-  ) {
+  // Broken / damaged
+  if (/broken|damaged|burn|melt|smoke|dead|faulty|not working part/i.test(lower)) {
     return "HARDWARE_DAMAGED";
   }
 
-  // Soft troubleshooting keywords
-  if (!/(not working|issue|problem|error|doesn'?t work|failed)/i.test(lower)) {
-    return null;
+  // Unknown component name
+  if (
+    /sensor|motor|sheet|board|wire|led|plastic|card|wheel|fan|blade/i.test(lower) &&
+    !detectedComponent
+  ) {
+    return "UNKNOWN_COMPONENT";
   }
 
+  // Project mentioned but not in KB
   if (detectedProject && !projectContext) {
-    return "ISSUE_NOT_IN_KB";
+    return "PROJECT_NOT_IN_KB";
   }
 
-  if (intent?.type === "GENERAL") {
+  // AI cannot resolve
+  if (intent.type === "GENERAL") {
     return "AI_CANNOT_RESOLVE";
   }
 
