@@ -1,10 +1,4 @@
-// /api/playground.js
-// Robocoders AI Playground (chat endpoint) — Enhanced v4 CORRECTED
-// - Fixed intent detection issues
-// - Improved project and component matching
-// - Better handling of ambiguous queries
-// - Enhanced conversational quality
-// - Grounded context with KB data
+
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
@@ -1147,46 +1141,43 @@ function dedupeLessons(lessons) {
 }
 function detectSupportFailure({
   userText,
-  intent,
   detectedProject,
   projectContext,
-  detectedComponent,
-  componentsMap
+  detectedComponent
 }) {
   const lower = String(userText || "").toLowerCase();
 
-  // User directly wants support
-  if (/contact|customer|support|help desk|call|email|number/i.test(lower)) {
+
+  if (/contact|customer support|support team|call|email|phone|helpline/i.test(lower)) {
     return "USER_REQUESTED_SUPPORT";
   }
 
-  // Missing part
-  if (/missing|not in kit|not included|lost|part nahi|component missing|nahi mila/i.test(lower)) {
+
+  if (
+    /missing|not in kit|not included|lost|component missing|nahi mila|gayab/i.test(lower)
+  ) {
     return "PART_MISSING";
   }
 
-  // Broken / damaged
-  if (/broken|damaged|burn|melt|smoke|dead|faulty|not working part/i.test(lower)) {
+  if (
+    /broken|damaged|burnt|burned|melted|smoke|dead|faulty|cracked|not powering/i.test(lower)
+  ) {
     return "HARDWARE_DAMAGED";
   }
 
-  // Unknown component name
   if (
-    /sensor|motor|sheet|board|wire|led|plastic|card|wheel|fan|blade/i.test(lower) &&
-    !detectedComponent
+    /sensor|motor|board|wire|led|wheel|fan|blade|battery|switch|sheet/i.test(lower) &&
+    !detectedComponent &&
+    !detectedProject
   ) {
     return "UNKNOWN_COMPONENT";
   }
 
-  // Project mentioned but not in KB
+
   if (detectedProject && !projectContext) {
     return "PROJECT_NOT_IN_KB";
   }
 
-  // AI cannot resolve
-  if (intent.type === "GENERAL") {
-    return "AI_CANNOT_RESOLVE";
-  }
-
   return null;
 }
+
