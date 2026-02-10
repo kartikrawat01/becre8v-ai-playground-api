@@ -166,7 +166,7 @@ let detectedComponent = detectComponent(rawUserText, componentsMap);
     if (rawIntent.type === "LIST_PROJECTS" && !rawDetectedProject) {
       return res.status(200).json({
         text:
-          `The Robocoders Kit includes ${projectsSummary.totalCount} exciting projects:\n\n` +
+          `There are 50 projects, out of which ${projectsSummary.totalCount} are live. One project per week shall be launched.\n\nHere are the ${projectsSummary.totalCount} live projects:\n\n` +
           projectNames.map((p, i) => `${i + 1}. ${p}`).join("\n") +
           "\n\nTell me which project you'd like to learn more about!",
         debug: {
@@ -337,7 +337,14 @@ if (
     }
 
     const data = await r.json();
-    const assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
+   let assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
+
+assistantReply = assistantReply.replace(/\*\*(.*?)\*\*/g, "$1");
+
+assistantReply = assistantReply.replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1");
+
+assistantReply = assistantReply.replace(/\n{3,}/g, "\n\n");
+
 
     return res.status(200).json({
   text: assistantReply,
@@ -359,7 +366,6 @@ if (
   }
 }
 
-/* -------------------- buildIndexes -------------------- */
 function buildIndexes(kb) {
   const projectNames = extractProjectNames(kb);
   const projectsByName = {};
@@ -660,7 +666,7 @@ function buildGroundedContext(opts) {
   if (projectsSummary) {
     sections.push(
       "=== PROJECTS SUMMARY ===\n" +
-      `Total Projects: ${projectsSummary.totalCount}\n` +
+      `There are 50 projects, out of which ${projectsSummary.totalCount} are live. One project per week shall be launched.\n` +
      `Available Projects: ${projectsSummary.projectList.join(", ")}`
 
     );
@@ -709,6 +715,7 @@ Important guidelines:
 - When asked about SAFETY: It is SAFE to plug/unplug sensors while the Robocoders Brain is on (low voltage 5V USB)
 - When asked about PROJECTS: Focus on the specific project mentioned, not on components used in that project
 - When asked about COMPONENTS: Provide component-specific information only
+- When asked about PROJECT COUNT: Always say "There are 50 projects, out of which 21 are live. One project per week shall be launched."
 
 KNOWLEDGE BASE:
 ${groundedContext}
@@ -1088,11 +1095,6 @@ function lessonRank(lessonName = "") {
 
 function sanitizeChunk(s) {
   return String(s || "")
-    // remove markdown bold/italic stars
-    .replace(/\*\*(.*?)\*\*/g, "$1")
-    .replace(/\*(.*?)\*/g, "$1")
-
-    // clean formatting
     .replace(/\u0000/g, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
@@ -1183,4 +1185,3 @@ function detectSupportFailure({
 
   return null;
 }
-
