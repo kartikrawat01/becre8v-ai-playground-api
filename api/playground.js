@@ -1,4 +1,10 @@
-
+// /api/playground.js
+// Robocoders AI Playground (chat endpoint) — Enhanced v4 CORRECTED
+// - Fixed intent detection issues
+// - Improved project and component matching
+// - Better handling of ambiguous queries
+// - Enhanced conversational quality
+// - Grounded context with KB data
 
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
@@ -122,24 +128,21 @@ export default async function handler(req, res) {
 
     // --------- Build indexes ----------
     const {
-  projectNames,
-  projectsByName,
-  lessonsByProject,
-  canonicalPinsText,
-  safetyText,
-  kitOverview,
-  componentsSummary,
-  projectsSummary,
-  componentsMap,
-  supportConfig,
-} = buildIndexes(kb);
-
+      projectNames,
+      projectsByName,
+      lessonsByProject,
+      canonicalPinsText,
+      safetyText,
+      kitOverview,
+      componentsSummary,
+      projectsSummary,
+      componentsMap,
+    } = buildIndexes(kb);
 
     // --------- Intent detection (deterministic) ----------
-  const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
-const rawDetectedProject = detectProject(rawUserText, projectNames);
-let detectedComponent = detectComponent(rawUserText, componentsMap);
-
+    const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
+    const rawDetectedProject = detectProject(rawUserText, projectNames);
+    const detectedComponent = detectComponent(rawUserText, componentsMap);
 
     // --------- Handle KIT_OVERVIEW intent ----------
     if (rawIntent.type === "KIT_OVERVIEW") {
@@ -162,6 +165,29 @@ let detectedComponent = detectComponent(rawUserText, componentsMap);
           kbMode: "deterministic_components",
         },
       });
+    }
+
+    // --------- Handle COMPONENT_INFO intent (IMPROVED) ----------
+    if (rawIntent.type === "COMPONENT_INFO" && detectedComponent && !rawDetectedProject) {
+      if (!detectedComponent) {
+        return res.status(200).json({
+          text: "Which component would you like to learn about? You can ask about any component like the Robocoders Brain, IR Sensor, Servo Motor, RGB LED, etc.",
+          debug: { intent: rawIntent, detectedComponent: null },
+        });
+      }
+      
+      const componentInfo = componentsMap[detectedComponent];
+      if (componentInfo) {
+        const response = formatComponentInfo(componentInfo);
+        return res.status(200).json({
+          text: response,
+          debug: {
+            intent: rawIntent,
+            detectedComponent,
+            kbMode: "deterministic_component",
+          },
+        });
+      }
     }
 
     // --------- Handle LIST_PROJECTS intent ----------
@@ -198,23 +224,17 @@ let detectedComponent = detectComponent(rawUserText, componentsMap);
         });
       }
       const out =
-  `Lesson videos for ${rawDetectedProject}:\n\n` +
-  videos
-    .map((v, idx) => {
-
-      const links = v.videoLinks || [];
-
-const linksText = links.map((u) => `- ${u}`).join("\n");
-
-return (
-  `${idx + 1}. ${v.lessonName}\n` +
-  `${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}` +
-  `Links:\n${linksText}`
-);
-
-    })
-    .join("\n\n");
-
+        `Lesson videos for ${rawDetectedProject}:\n\n` +
+        videos
+          .map((v, idx) => {
+            const links = (v.videoLinks || []).map((u) => `- ${u}`).join("\n");
+            return (
+              `${idx + 1}. ${v.lessonName}\n` +
+              `${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}` +
+              `Links:\n${links}`
+            );
+          })
+          .join("\n\n");
       return res.status(200).json({
         text: out,
         debug: {
@@ -226,7 +246,7 @@ return (
       });
     }
 
-
+    // --------- OpenAI key ----------
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       return res
@@ -234,7 +254,7 @@ return (
         .json({ error: "OPENAI_API_KEY is not set in env." });
     }
 
-  
+    // --------- Planner (ONLY for GENERAL) ----------
     let plannedUserText = rawUserText;
     try {
       plannedUserText = await planChatPrompt(rawUserText, apiKey);
@@ -242,53 +262,10 @@ return (
       plannedUserText = rawUserText;
     }
 
-
-const { lastProject, lastComponent } = resolveContextFromHistory(
-  history,
-  projectNames,
-  componentsMap
-);
-
-const detectedProject =
-  rawDetectedProject ||
-  detectProject(plannedUserText, projectNames) ||
-  lastProject;
-
-detectedComponent =
-  detectComponent(plannedUserText, componentsMap) || detectedComponent || lastComponent;
-
-const intent = rawIntent;
-const supportReason = detectSupportFailure({
-  userText: rawUserText,
-  intent,
-  detectedProject,
-  projectContext: detectedProject ? projectsByName[detectedProject] : null,
-  detectedComponent,
-  componentsMap
-});
-
-
-if (
-  supportReason &&
-  supportConfig?.enabled &&
-  supportConfig.show_when?.includes(supportReason)
-) {
-  return res.status(200).json({
-    text:
-      `⚠️ **Need help?**\n\n${supportConfig.message}\n\n` +
-      `📧 ${supportConfig.contact.email}\n` +
-      `📞 ${supportConfig.contact.phone}\n` +
-      `⏰ ${supportConfig.contact.hours}`,
-    debug: {
-      supportTriggered: true,
-      supportReason,
-      detectedProject,
-      detectedComponent,
-      intent
-    }
-  });
-}
-
+    // Re-run detection using planned text if raw didn't detect
+    const detectedProject =
+      rawDetectedProject || detectProject(plannedUserText, projectNames);
+    const intent = rawIntent;
 
     // --------- Build grounded context for model ----------
     const projectContext = detectedProject
@@ -342,16 +319,15 @@ if (
     const assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
 
     return res.status(200).json({
-  text: assistantReply,
-  debug: {
-    detectedProject: detectedProject || null,
-    detectedComponent: detectedComponent || null,
-    intent,
-    kbMode: "llm",
-  },
-});
-
-
+      text: assistantReply,
+      debug: {
+        detectedProject: detectedProject || null,
+        detectedComponent: detectedComponent || null,
+        intent,
+        kbMode: "llm",
+        plannedPrompt: plannedUserText !== rawUserText ? plannedUserText : null,
+      },
+    });
   } catch (err) {
     console.error("Playground handler error:", err);
     return res.status(500).json({
@@ -382,21 +358,20 @@ function buildIndexes(kb) {
   const componentsSummary = extractComponentsSummary(kb);
   const projectsSummary = extractProjectsSummary(kb);
   const componentsMap = extractComponentsMap(kb);
-const supportConfig = extractSupportConfig(kb);
+  const supportInfo = extractSupportInfo(kb);
 
-return {
-  projectNames,
-  projectsByName,
-  lessonsByProject,
-  canonicalPinsText,
-  safetyText,
-  kitOverview,
-  componentsSummary,
-  projectsSummary,
-  componentsMap,
-  supportConfig,
-};
-
+  return {
+    projectNames,
+    projectsByName,
+    lessonsByProject,
+    canonicalPinsText,
+    safetyText,
+    kitOverview,
+    componentsSummary,
+    projectsSummary,
+    componentsMap,
+    supportInfo
+  };
 }
 
 /* -------------------- Intent Detection (IMPROVED) -------------------- */
@@ -559,34 +534,9 @@ function detectComponent(text, componentsMap) {
       bestMatch = componentId;
     }
   }
-
-return bestScore >= 2 ? bestMatch : null;
-
-}
-function resolveContextFromHistory(history, projectNames, componentsMap) {
-  let lastProject = null;
-  let lastComponent = null;
-
-  for (let i = history.length - 1; i >= 0; i--) {
-    const msg = history[i];
-    if (!msg?.content) continue;
-
-    const text = String(msg.content);
-
-    if (!lastProject) {
-      const p = detectProject(text, projectNames);
-      if (p) lastProject = p;
-    }
-
-    if (!lastComponent) {
-      const c = detectComponent(text, componentsMap);
-      if (c) lastComponent = c;
-    }
-
-    if (lastProject && lastComponent) break;
-  }
-
-  return { lastProject, lastComponent };
+  
+  // Only return if score is significant
+  return bestScore >= 3 ? bestMatch : null;
 }
 
 function getComponentVariations(name) {
@@ -663,8 +613,7 @@ function buildGroundedContext(opts) {
     sections.push(
       "=== PROJECTS SUMMARY ===\n" +
       `Total Projects: ${projectsSummary.totalCount}\n` +
-     `Available Projects: ${projectsSummary.projectList.join(", ")}`
-
+      `Available: ${(projectsSummary.projectList || []).slice(0, 10).join(", ")}...`
     );
   }
 
@@ -686,6 +635,14 @@ function buildGroundedContext(opts) {
           .join("\n\n")
       );
     }
+  }
+  if (supportInfo) {
+    sections.push(
+      "=== SUPPORT CONTACT ===\n" +
+      `${supportInfo.message}\n` +
+      `Email: ${supportInfo.email}\n` +
+      `Phone: ${supportInfo.phone}`
+    );
   }
 
   return sections.join("\n\n");
@@ -732,7 +689,35 @@ function buildConversationHistory(history) {
 
 /* -------------------- Extraction Functions -------------------- */
 function extractProjectNames(kb) {
-  // ✅ ALWAYS use canonical full list (21 projects)
+  // Try projectsSummary first
+  if (kb?.projectsSummary?.projectList) {
+    return kb.projectsSummary.projectList.filter(Boolean);
+  }
+  
+  // Try canonical projects
+  if (kb?.canonical?.projects && Array.isArray(kb.canonical.projects)) {
+    return kb.canonical.projects.map(p => p.name || p).filter(Boolean);
+  }
+  
+  // Try pages extraction
+  if (Array.isArray(kb?.pages)) {
+    const names = new Set();
+    for (const page of kb.pages) {
+      if (page?.type === "project" && page?.projectName) {
+        names.add(page.projectName);
+      }
+      const text = page?.text || "";
+      const match = text.match(/Project Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i);
+      if (match && match[1]) {
+        names.add(match[1].trim());
+      }
+    }
+    if (names.size > 0) {
+      return Array.from(names);
+    }
+  }
+  
+  // Fallback to hardcoded list
   return [
     "Hello World!",
     "Mood Lamp",
@@ -757,8 +742,6 @@ function extractProjectNames(kb) {
     "Candle Lamp",
   ];
 }
-
-
 
 function extractKitOverview(kb) {
   if (kb?.overview) {
@@ -797,17 +780,19 @@ function extractComponentsSummary(kb) {
 }
 
 function extractProjectsSummary(kb) {
-  const projectList = extractProjectNames(kb);
-  return {
-    totalCount: projectList.length,
-    projectList,
-  };
-}
-function extractSupportConfig(kb) {
-  if (kb?.support?.enabled) {
-    return kb.support;
+  if (kb?.projectsSummary) {
+    return kb.projectsSummary;
   }
-  return null;
+  if (kb?.canonical?.projects) {
+    return {
+      totalCount: kb.canonical.projects.length,
+      projectList: kb.canonical.projects,
+    };
+  }
+  return {
+    totalCount: 21,
+    projectList: [],
+  };
 }
 
 // IMPROVED: Extract components map for component detection
@@ -964,90 +949,59 @@ function extractProjectBlock(kb, projectName) {
 }
 
 function extractLessons(kb, projectName) {
-
-  if (Array.isArray(kb?.lessons) && kb.lessons.length > 0) {
-    const lessons = [];
-
-   for (const l of kb.lessons) {
-  if (l.project !== projectName) continue;
-
-  const links = Array.isArray(l.video_url)
-  ? uniq(l.video_url.map(u => String(u).trim()))
-  : [String(l.video_url || "").trim()];
-
-  links.forEach((link, i) => {
-    lessons.push({
-      lessonName:
-        links.length > 1
-          ? `${l.lesson_name} - Part ${i + 1}`
-          : l.lesson_name,
-      videoLinks: [link],
-      explainLine: "",
-    });
-  });
-}
-
-
-    // ⛔ IMPORTANT: agar structured lessons mil gaye
-    // text-based parsing NAHI chalega
-    return dedupeLessons(lessons);
-  }
-
-  // 🔽 FALLBACK: text-based extraction (ONLY if JSON lessons missing)
   const lessons = [];
-
+  
+  // Try pages extraction
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
     const p = projectName.toLowerCase();
-    let inProject = false;
-
     for (let i = 0; i < pages.length; i++) {
       const txt = pages[i];
       const low = txt.toLowerCase();
-
-      if (
-        low.includes("project:") ||
-        low.includes("project :") ||
-        low.includes("project name")
-      ) {
-        inProject = low.includes(p);
-      }
-
-      if (!inProject) continue;
-
-      const blocks = txt.split(
-        /(Lesson ID\s*[:\-]|Build\s*\d+|Coding\s*Part\s*\d+)/i
-      );
-
-      for (let b = 1; b < blocks.length; b++) {
-        const block = blocks[b];
-
-        const lessonName =
-          matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
-          matchLine(block, /(Build\s*\d+)/i) ||
-          matchLine(block, /(Coding\s*Part\s*\d+)/i) ||
-          "";
-
-        const links =
-          block.match(/https?:\/\/[^\s\]\)\}\n]+/gi) || [];
-
-        const explainLine =
-          matchLine(
-            block,
-            /What this lesson helps with.*?:\s*([\s\S]*?)(?:When the AI|$)/i
-          ) || "";
-
-        if (lessonName && links.length) {
-          lessons.push({
-            lessonName: lessonName.trim(),
-            videoLinks: uniq(links),
-            explainLine: cleanExplain(explainLine),
-          });
+      if (low.includes("project:") || low.includes("project :")) {
+        if (!low.includes(p)) continue;
+        const blocks = txt.split(/Lesson ID\s*[:\-]/i);
+        for (let b = 1; b < blocks.length; b++) {
+          const block = "Lesson ID:" + blocks[b];
+          const lessonName =
+            matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) ||
+            matchLine(block, /Lesson Name\s*:\s*([^\n]+)/i) ||
+            "";
+          const links = [];
+          const linkMatches = block.match(/https?:\/\/[^\s\)]+/gi) || [];
+          for (const u of linkMatches) {
+            links.push(u.replace(/[\,\)\]]+$/g, ""));
+          }
+          const explainLine =
+            matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)(?:When the AI|$)/i) ||
+            matchLine(block, /What this lesson helps with\s*\(AI explanation line\)\s*:\s*([\s\S]*?)(?:When the AI|$)/i) ||
+            "";
+          if (lessonName && links.length) {
+            lessons.push({
+              lessonName: lessonName.trim(),
+              videoLinks: uniq(links),
+              explainLine: cleanExplain(explainLine),
+            });
+          }
         }
       }
     }
   }
-
+  
+  // Try structured lessons
+  if (!lessons.length && kb?.lessons && kb.lessons[projectName]) {
+    for (const l of kb.lessons[projectName]) {
+      lessons.push({
+        lessonName: l.lessonName,
+        videoLinks: Array.isArray(l.videoLinks)
+          ? l.videoLinks
+          : l.videoLink
+          ? [l.videoLink]
+          : [],
+        explainLine: l.explainLine || "",
+      });
+    }
+  }
   return dedupeLessons(lessons);
 }
 
@@ -1075,6 +1029,9 @@ function extractSafety(kb) {
     }
   }
   return "";
+}
+function extractSupportInfo(kb) {
+  return kb?.support || null;
 }
 
 /* -------------------- Utility Functions -------------------- */
@@ -1124,60 +1081,11 @@ function cleanExplain(s) {
 function dedupeLessons(lessons) {
   const out = [];
   const seen = new Set();
-
   for (const l of lessons || []) {
-    const key =
-      (l.lessonName || "").toLowerCase() +
-      "::" +
-      (l.videoLinks || []).join(",");
-
+    const key = (l.lessonName || "").toLowerCase();
     if (!key || seen.has(key)) continue;
-
     seen.add(key);
     out.push(l);
   }
-
   return out;
 }
-function detectSupportFailure({
-  userText,
-  detectedProject,
-  projectContext,
-  detectedComponent
-}) {
-  const lower = String(userText || "").toLowerCase();
-
-
-  if (/contact|customer support|support team|call|email|phone|helpline/i.test(lower)) {
-    return "USER_REQUESTED_SUPPORT";
-  }
-
-
-  if (
-    /missing|not in kit|not included|lost|component missing|nahi mila|gayab/i.test(lower)
-  ) {
-    return "PART_MISSING";
-  }
-
-  if (
-    /broken|damaged|burnt|burned|melted|smoke|dead|faulty|cracked|not powering/i.test(lower)
-  ) {
-    return "HARDWARE_DAMAGED";
-  }
-
-  if (
-    /sensor|motor|board|wire|led|wheel|fan|blade|battery|switch|sheet/i.test(lower) &&
-    !detectedComponent &&
-    !detectedProject
-  ) {
-    return "UNKNOWN_COMPONENT";
-  }
-
-
-  if (detectedProject && !projectContext) {
-    return "PROJECT_NOT_IN_KB";
-  }
-
-  return null;
-}
-
