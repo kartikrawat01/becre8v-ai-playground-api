@@ -1088,6 +1088,11 @@ function lessonRank(lessonName = "") {
 
 function sanitizeChunk(s) {
   return String(s || "")
+    // remove markdown bold/italic stars
+    .replace(/\*\*(.*?)\*\*/g, "$1")
+    .replace(/\*(.*?)\*/g, "$1")
+
+    // clean formatting
     .replace(/\u0000/g, "")
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
