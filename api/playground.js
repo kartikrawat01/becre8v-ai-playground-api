@@ -1,4 +1,6 @@
-const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
+const GEMINI_CHAT_URL =
+  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent";
+
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -35,27 +37,43 @@ Rules:
 `.trim();
 
 async function planChatPrompt(userText, apiKey) {
-  const r = await fetch(OPENAI_CHAT_URL, {
+  const r = await fetch(
+  `${GEMINI_CHAT_URL}?key=${process.env.GEMINI_API_KEY}`,
+  {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: CHAT_PLANNER_PROMPT },
-        { role: "user", content: String(userText || "").trim() },
-      ],
-    }),
-  });
+      contents: [
+        {
+          role: "user",
+          parts: [
+            {
+              text: `${CHAT_PLANNER_PROMPT}
+
+  User message:
+  ${String(userText || "").trim()}
+  `,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.4,
+        },
+      }),
+    }
+  );
+
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     throw new Error("Planner error: " + t.slice(0, 800));
   }
   const data = await r.json();
-  const out = data?.choices?.[0]?.message?.content?.trim();
+  const out =
+  data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
+
   return out || String(userText || "").trim();
 }
 
@@ -225,11 +243,12 @@ return (
     }
 
 
-    const apiKey = process.env.OPENAI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY;
+
     if (!apiKey) {
       return res
         .status(500)
-        .json({ error: "OPENAI_API_KEY is not set in env." });
+        .json({ error: "GEMINI_API_KEY is not set in env." });
     }
 
   
@@ -314,19 +333,25 @@ if (
     const messages = [systemMsg, ...conversationMsgs, userMsg];
 
     // --------- Call OpenAI ----------
-    const r = await fetch(OPENAI_CHAT_URL, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        model: "gpt-4o-mini",
+    const r = await fetch(
+  `${GEMINI_CHAT_URL}?key=${process.env.GEMINI_API_KEY}`,
+  {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      contents: messages.map(m => ({
+        role: m.role === "assistant" ? "model" : "user",
+        parts: [{ text: m.content }],
+      })),
+      generationConfig: {
         temperature: 0.7,
-        max_tokens: 800,
-        messages,
-      }),
-    });
+      },
+    }),
+  }
+);
+
 
     if (!r.ok) {
       const t = await r.text().catch(() => "");
@@ -337,7 +362,9 @@ if (
     }
 
     const data = await r.json();
-   let assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
+   let assistantReply =
+  data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+
 
 assistantReply = assistantReply.replace(/\*\*(.*?)\*\*/g, "$1");
 
