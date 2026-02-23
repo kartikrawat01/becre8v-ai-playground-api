@@ -313,19 +313,27 @@ if (
     let userContent = [{ type: "text", text: plannedUserText }];
     
     // If an image was uploaded, add it to the content array
-    if (attachment) {
-      userContent.push({
-        type: "image_url",
-        image_url: {
-          url: attachment, // Expects base64 data URL
-        },
-      });
-    }
+   if (attachment) {
+  let imageUrl = attachment;
+
+  // If raw base64 string without data prefix
+  if (!attachment.startsWith("data:")) {
+    imageUrl = `data:image/png;base64,${attachment}`;
+  }
+
+  userContent.push({
+    type: "image_url",
+    image_url: {
+      url: imageUrl,
+    },
+  });
+}
 
     const userMsg = { role: "user", content: userContent };
 
     const messages = [systemMsg, ...conversationMsgs, userMsg];
-
+// DEBUG: Check what we are sending to OpenAI
+console.log("Sending to OpenAI:", JSON.stringify(messages, null, 2));
     // --------- Call OpenAI ----------
     const r = await fetch(OPENAI_CHAT_URL, {
       method: "POST",
@@ -336,7 +344,7 @@ if (
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.7,
-        max_tokens: 800,
+        max_tokens: 1000,
         messages,
       }),
     });
