@@ -1,6 +1,11 @@
-const GEMINI_CHAT_URL =
-  "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent";
+import multer from "multer";
 
+const upload = multer({
+  storage: multer.memoryStorage(), // keeps file in memory
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB safety
+});
+
+const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "")
@@ -37,45 +42,30 @@ Rules:
 `.trim();
 
 async function planChatPrompt(userText, apiKey) {
-  const r = await fetch(
-  `${GEMINI_CHAT_URL}?key=${process.env.GEMINI_API_KEY}`,
-  {
+  const r = await fetch(OPENAI_CHAT_URL, {
     method: "POST",
     headers: {
+      Authorization: `Bearer ${apiKey}`,
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      contents: [
-        {
-          role: "user",
-          parts: [
-            {
-              text: `${CHAT_PLANNER_PROMPT}
-
-  User message:
-  ${String(userText || "").trim()}
-  `,
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.4,
-        },
-      }),
-    }
-  );
-
+      model: "gpt-4o-mini",
+      temperature: 0.4,
+      messages: [
+        { role: "system", content: CHAT_PLANNER_PROMPT },
+        { role: "user", content: String(userText || "").trim() },
+      ],
+    }),
+  });
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     throw new Error("Planner error: " + t.slice(0, 800));
   }
   const data = await r.json();
-  const out =
-  data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim();
-
+  const out = data?.choices?.[0]?.message?.content?.trim();
   return out || String(userText || "").trim();
 }
+
 
 /* -------------------- Handler -------------------- */
 export default async function handler(req, res) {
@@ -98,29 +88,44 @@ export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed. Use POST." });
   }
+  await new Promise((resolve, reject) => {
+    upload.single("file")(req, res, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
 
   try {
-    // ---- Accept both payload shapes ----
     const body = req.body || {};
-    const message =
-      typeof body.message === "string"
-        ? body.message
-        : typeof body.input === "string"
-        ? body.input
-        : "";
-    const history = Array.isArray(body.history)
-      ? body.history
-      : Array.isArray(body.messages)
-      ? body.messages
-      : [];
-    const attachment = body.attachment || null;
+    // ---- Accept both payload shapes ----
+    let message = "";
 
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Missing message/input string." });
+    if (typeof body.message === "string") {
+      message = body.message.trim();
+    } else if (typeof body.input === "string") {
+      message = body.input.trim();
+    }
+    let history = [];
+
+    if (typeof body.messages === "string") {
+      try {
+        history = JSON.parse(body.messages);
+      } catch {
+        history = [];
+      }
+    } else if (Array.isArray(body.messages)) {
+      history = body.messages;
+    }
+    
+
+    // Allow text-only, image-only, or both
+    if (!message && !req.file) {
+      return res.status(400).json({
+        error: "Please type a message or upload an image to continue 🙂"
+      });
     }
 
-    const rawUserText = String(message || "").trim();
-
+    const rawUserText = message || "Please look at the uploaded image and help me.";
     // --------- Load KB ----------
     const knowledgeUrl = process.env.KNOWLEDGE_URL;
     if (!knowledgeUrl) {
@@ -243,18 +248,20 @@ return (
     }
 
 
-    const apiKey = process.env.GEMINI_API_KEY;
-
+    const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) {
       return res
         .status(500)
-        .json({ error: "GEMINI_API_KEY is not set in env." });
+        .json({ error: "OPENAI_API_KEY is not set in env." });
     }
 
   
     let plannedUserText = rawUserText;
     try {
-      plannedUserText = await planChatPrompt(rawUserText, apiKey);
+      // Only use the planner if there is NO file.
+      if (!req.file) {
+        plannedUserText = await planChatPrompt(rawUserText, apiKey);
+      }
     } catch (plannerErr) {
       plannedUserText = rawUserText;
     }
@@ -328,30 +335,37 @@ if (
     // --------- Prepare messages for OpenAI ----------
     const systemMsg = { role: "system", content: systemPrompt };
     const conversationMsgs = buildConversationHistory(history);
-    const userMsg = { role: "user", content: plannedUserText };
+
+    // --- START OF IMAGE HANDLING FIX ---
+    let userMsgContent = [{ type: "text", text: plannedUserText }];
+
+    if (req.file) {
+      const base64Image = req.file.buffer.toString('base64');
+      userMsgContent.push({
+        type: "image_url",
+        image_url: { url: `data:${req.file.mimetype};base64,${base64Image}` }
+      });
+    }
+
+    const userMsg = { role: "user", content: userMsgContent };
+    // --- END OF IMAGE HANDLING FIX ---
 
     const messages = [systemMsg, ...conversationMsgs, userMsg];
 
     // --------- Call OpenAI ----------
-    const r = await fetch(
-  `${GEMINI_CHAT_URL}?key=${process.env.GEMINI_API_KEY}`,
-  {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify({
-      contents: messages.map(m => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }],
-      })),
-      generationConfig: {
-        temperature: 0.7,
+    const r = await fetch(OPENAI_CHAT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
       },
-    }),
-  }
-);
-
+      body: JSON.stringify({
+        model: "gpt-4o-mini",
+        temperature: 0.7,
+        max_tokens: 800,
+        messages,
+      }),
+    });
 
     if (!r.ok) {
       const t = await r.text().catch(() => "");
@@ -362,9 +376,7 @@ if (
     }
 
     const data = await r.json();
-   let assistantReply =
-  data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
-
+   let assistantReply = data?.choices?.[0]?.message?.content?.trim() || "";
 
 assistantReply = assistantReply.replace(/\*\*(.*?)\*\*/g, "$1");
 
