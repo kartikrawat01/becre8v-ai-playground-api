@@ -18,7 +18,11 @@ function allow(res, origin) {
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (!origin) return false;
+  // If no origin header (e.g. same-origin, Postman, server-to-server), allow through
+  if (!origin) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    return true;
+  }
   const list = origins();
   if (!list.length || list.some((a) => origin.startsWith(a))) {
     res.setHeader("Access-Control-Allow-Origin", origin);
@@ -77,8 +81,6 @@ export default async function handler(req, res) {
     return res.status(204).end();
   }
 
-  allow(res, origin);
-  
   // 2) Allowlist origin
   if (!allow(res, origin)) {
     return res
