@@ -309,7 +309,20 @@ if (
     // --------- Prepare messages for OpenAI ----------
     const systemMsg = { role: "system", content: systemPrompt };
     const conversationMsgs = buildConversationHistory(history);
-    const userMsg = { role: "user", content: plannedUserText };
+    // --------- Prepare user message (with Vision support) ----------
+    let userContent = [{ type: "text", text: plannedUserText }];
+    
+    // If an image was uploaded, add it to the content array
+    if (attachment) {
+      userContent.push({
+        type: "image_url",
+        image_url: {
+          url: attachment, // Expects base64 data URL
+        },
+      });
+    }
+
+    const userMsg = { role: "user", content: userContent };
 
     const messages = [systemMsg, ...conversationMsgs, userMsg];
 
