@@ -76,6 +76,8 @@ export default async function handler(req, res) {
     allow(res, origin);
     return res.status(204).end();
   }
+
+  allow(res, origin);
   
   // 2) Allowlist origin
   if (!allow(res, origin)) {
@@ -765,10 +767,12 @@ Remember: Base your answers on the knowledge base provided. If information is no
 function buildConversationHistory(history) {
   const msgs = [];
   for (const h of history || []) {
-    if (h?.role === "user" && h?.content) {
-      msgs.push({ role: "user", content: String(h.content) });
-    } else if (h?.role === "assistant" && h?.content) {
-      msgs.push({ role: "assistant", content: String(h.content) });
+    if (h?.content) {
+      // Don't use String() here, as it breaks image data arrays
+      msgs.push({ 
+        role: h.role, 
+        content: h.content 
+      });
     }
   }
   return msgs;
