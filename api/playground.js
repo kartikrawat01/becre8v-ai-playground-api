@@ -97,11 +97,21 @@ export default async function handler(req, res) {
       : [];
     const attachment = body.attachment || null;
 
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Missing message/input string." });
-    }
+   // Allow empty message IF an image is attached
+if (
+  (typeof message !== "string" || !message.trim()) &&
+  !attachment
+) {
+  return res.status(400).json({
+    error: "Missing message or image input."
+  });
+}
 
-    const rawUserText = String(message || "").trim();
+    const rawUserText =
+  String(message || "").trim() ||
+  (attachment
+    ? "Analyze the uploaded image and describe what you see in detail."
+    : "");
 
     // --------- Load KB ----------
     const knowledgeUrl = process.env.KNOWLEDGE_URL;
@@ -310,7 +320,14 @@ if (
     const systemMsg = { role: "system", content: systemPrompt };
     const conversationMsgs = buildConversationHistory(history);
     // --------- Prepare user message (with Vision support) ----------
-    let userContent = [{ type: "text", text: plannedUserText }];
+    let userContent = [];
+
+if (plannedUserText && plannedUserText.trim()) {
+  userContent.push({
+    type: "text",
+    text: plannedUserText
+  });
+}
     
     // If an image was uploaded, add it to the content array
    if (attachment) {
