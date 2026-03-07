@@ -82,10 +82,53 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
     type: m.metadata?.type || "general",
     projectName: m.metadata?.projectName || null,
     patternImage: m.metadata?.patternImage || null,
-    boardPosition: m.metadata?.boardPosition || null,   // ← for exact image matching
-    stickPosition: m.metadata?.stickPosition || null,   // ← for exact image matching
+    boardPosition: m.metadata?.boardPosition || null,
+    stickPosition: m.metadata?.stickPosition || null,
+    patternName: m.metadata?.patternName || null,   // ← needed for name-based matching
     score: m.score,
   }));
+}
+
+// =============================================================================
+// Pattern name lookup table — maps every known name/alias to an image filename
+// Update this whenever you add new patterns to spingenius.json
+// =============================================================================
+const PATTERN_NAME_MAP = [
+  {
+    image: "3-D.jpeg",
+    names: ["golden bubble ring", "magic bubble chain", "bubble chain", "golden rings", "bubble ring", "bubbles", "rings", "chain"]
+  },
+  {
+    image: "12-J.jpeg",
+    names: ["secret garden net", "magic garden fence", "garden net", "garden fence", "fishing net", "grid", "net", "lattice", "mesh", "woven"]
+  },
+  {
+    image: "6-N.jpeg",
+    names: ["princess lace crown", "royal crown", "lace crown", "crown", "lace", "princess crown", "fancy lace"]
+  },
+  {
+    image: "7-J.jpeg",
+    names: ["bouncy pink flower", "happy little flower", "pink flower", "flower", "floral", "rosette", "petals", "bouncy flower"]
+  },
+  {
+    image: "3-R.jpeg",
+    names: ["mystic dark whirlpool", "spinning galaxy swirl", "dark whirlpool", "whirlpool", "galaxy swirl", "spiral", "galaxy", "donut", "black hole", "swirl", "vortex"]
+  },
+  {
+    image: "10-A.jpeg",
+    names: ["golden sunshine spiderweb", "giant golden spiderweb", "golden spiderweb", "spiderweb", "sunshine spiderweb", "sun", "starburst", "mandala", "diamond web"]
+  },
+];
+
+// Returns the image filename if any known name matches the query text
+function findImageByPatternName(queryText) {
+  const q = queryText.toLowerCase();
+  for (const entry of PATTERN_NAME_MAP) {
+    if (entry.names.some(name => q.includes(name))) {
+      return entry.image;
+    }
+  }
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -240,36 +283,39 @@ export default async function handler(req, res) {
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}]\n${c.text}`).join("\n\n---\n\n");
         }
 
-        // ── EXACT PATTERN IMAGE MATCHING ─────────────────────────────────────
-        // Step 1: Only consider configuration chunks that have images
-        const configChunks = ragChunks.filter(
-          c => c.type === "configuration" && c.patternImage
-        );
-
-        // Step 2: Extract board/stick positions from what the user asked
+        // ── PATTERN IMAGE MATCHING — 3 strategies in priority order ──────────
+        const configChunks = ragChunks.filter(c => c.type === "configuration" && c.patternImage);
         const queryText = (plannedUserText || rawUserText).toLowerCase();
+
+        // Strategy 1: Board position match (e.g. "12-J", "7-J")
         const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-r])\b/i);
+        const askedBoard = boardMatch?.[1]?.toUpperCase();
+
+        // Strategy 2: Stick position match (e.g. "sticks 5-5", "5-5")
         const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]-[0-9])/i)
           || queryText.match(/\b([0-9]-[0-9])\b/);
-
-        const askedBoard = boardMatch?.[1]?.toUpperCase();  // e.g. "12-J"
-        const askedStick = stickMatch?.[1];                 // e.g. "5-5"
+        const askedStick = stickMatch?.[1];
 
         if (askedBoard || askedStick) {
-          // User asked about a specific config — return only that image
+          // Strategy 1 & 2: User mentioned board or stick position directly
           const exactChunk = configChunks.find(c => {
-            const boardOk = askedBoard
-              ? (c.boardPosition || "").toUpperCase() === askedBoard
-              : false;
-            const stickOk = askedStick
-              ? c.stickPosition === askedStick
-              : false;
+            const boardOk = askedBoard ? (c.boardPosition || "").toUpperCase() === askedBoard : false;
+            const stickOk = askedStick ? c.stickPosition === askedStick : false;
             return boardOk || stickOk;
           });
           patternImages = exactChunk?.patternImage ? [exactChunk.patternImage] : [];
+
         } else {
-          // No specific config asked — show images from retrieved config chunks
-          patternImages = configChunks.map(c => c.patternImage);
+          // Strategy 3: Pattern name / fun name match from PATTERN_NAME_MAP
+          const nameMatchedImage = findImageByPatternName(queryText);
+          if (nameMatchedImage) {
+            patternImages = [nameMatchedImage];
+          } else {
+            // Strategy 4: RAG semantic match — use top-scored config chunk
+            // (handles cases like "show me the flower pattern")
+            const topConfigChunk = configChunks[0];
+            patternImages = topConfigChunk?.patternImage ? [topConfigChunk.patternImage] : [];
+          }
         }
         // ─────────────────────────────────────────────────────────────────────
 
@@ -287,7 +333,7 @@ export default async function handler(req, res) {
       }
 
       const messages = [{ role: "system", content: systemPrompt }, ...buildConversationHistory(history), { role: "user", content: userContent }];
-      console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages.length);
+      console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages);
 
       const r = await fetch(OPENAI_CHAT_URL, {
         method: "POST",
@@ -342,13 +388,13 @@ Base your answers on the knowledge base provided. If information is not in the k
 }
 
 function buildSpinGeniusSystemPrompt(groundedContext) {
-  return `You are Be Cre8v AI, a friendly and knowledgeable assistant for the Spin Genius mechanical spirograph toy by Be Cre8v.
+  return `You are Be Cre8v AI, a friendly and fun assistant for the Spin Genius mechanical spirograph toy by Be Cre8v. You love talking to kids and use exciting, encouraging language!
 
 WHAT YOU CAN HELP WITH:
 - Explaining how Spin Genius works (gears, sticks, board positions)
 - Identifying what pattern a configuration creates (e.g. board 3-D, sticks 3-3)
 - Looking at a pattern image and suggesting which configuration made it
-- Describing patterns: shape, color, visual appearance, difficulty
+- Describing patterns using their fun kid-friendly names
 - Troubleshooting drawing issues
 - Suggesting configurations to try
 - Teaching geometry through spirograph patterns
@@ -356,37 +402,45 @@ WHAT YOU CAN HELP WITH:
 ABOUT PATTERN IMAGES:
 - You CANNOT generate or draw images yourself — you are a text AI
 - When a user asks to "generate an image" or "show me the pattern image", respond:
-  "I can't generate images myself, but the reference image for this pattern will appear automatically below my response if it's in my knowledge base! 🌀"
-- When a user UPLOADS a photo and asks what configuration made it, analyse the visual and match to patterns in the knowledge base
+  "I can't draw images myself, but the picture of this pattern will pop up automatically below my answer if it's in my knowledge base! 🌀"
+- When a user UPLOADS a photo and asks what configuration made it, analyse the visual and match to patterns
 
 STRICT OUT-OF-SCOPE RULE:
-Only redirect if the user asks about something CLEARLY unrelated to Spin Genius: Robocoders, electronics, LEDs, coding, sensors, motors.
-Do NOT redirect for: spirograph, drawing, gears, patterns, configurations, sticks, board positions, geometry, art, image questions about patterns.
-If truly out of scope say: "I'm the Spin Genius assistant! For other Be Cre8v products, switch from the dropdown above! 🌀"
+Only redirect if user asks about: Robocoders, electronics, LEDs, coding, sensors, motors.
+Do NOT redirect for: spirograph, drawing, gears, patterns, configurations, sticks, board positions, geometry, art, images of patterns.
+If truly out of scope: "I'm the Spin Genius assistant! For other Be Cre8v products, switch from the dropdown above! 🌀"
 
 PATTERN KNOWLEDGE BASE (retrieved from vector search):
 ${groundedContext || "No specific patterns retrieved. Use your general Spin Genius knowledge."}
 
 PATTERN LOOKUP RULES — VERY IMPORTANT:
-When a user asks about a specific configuration, ALWAYS answer with ALL of these fields:
+When a user asks about a specific configuration or pattern name, ALWAYS answer with ALL of these:
+  - Fun Name (e.g. "The Happy Little Flower 🌸")
   - Pattern Name
   - Board Position
   - Stick Position
   - Shape description
   - Colors
   - Difficulty level
-  - Note that the pattern image appears below automatically
+  - Tell them: "The pattern picture will appear below my response automatically! 🎨"
+
+PATTERN FUN NAMES (always use these when describing patterns to kids):
+  - Board 3-D,  Sticks 3-3 → "The Magic Bubble Chain 🫧"      (Golden Bubble Ring)
+  - Board 12-J, Sticks 5-5 → "The Magic Garden Fence 🌿"      (Secret Garden Net)
+  - Board 6-N,  Sticks 5-6 → "The Royal Crown 👑"             (Princess Lace Crown)
+  - Board 7-J,  Sticks 1-1 → "The Happy Little Flower 🌸"     (Bouncy Pink Flower)
+  - Board 3-R,  Sticks 4-2 → "The Spinning Galaxy Swirl 🌀"   (Mystic Dark Whirlpool)
+  - Board 10-A, Sticks 4-4 → "The Giant Golden Spiderweb ✨"  (Golden Sunshine Spiderweb)
 
 VISUAL PATTERN MATCHING (use when user uploads an image):
-Match the visual appearance to these patterns:
-  - Spiral / whirlpool / dense dark donut with tiny center hole → Board: 3-R, Sticks: 4-2, Pattern: Dark Whirlpool
-  - Flower with overlapping loopy petals, small and pink → Board: 7-J, Sticks: 1-1, Pattern: Pink Flower
-  - Golden spiderweb / sun with thin crossing lines, big white center → Board: 10-A, Sticks: 4-4, Pattern: Golden Spiderweb
-  - Chain of golden bubbles / rings in a big circle → Board: 3-D, Sticks: 3-3, Pattern: Golden Rings
-  - Orange crown / lace with petal loops on outer edge, big empty center → Board: 6-N, Sticks: 5-6, Pattern: Lace Crown
-  - Green grid / fishing net twisted into a circle with neat squares → Board: 12-J, Sticks: 5-5, Pattern: Garden Net
+  - Spiral / whirlpool / dense dark donut / black hole → Board: 3-R,  Sticks: 4-2 → "The Spinning Galaxy Swirl 🌀"
+  - Pink flower / overlapping loopy petals / rosette   → Board: 7-J,  Sticks: 1-1 → "The Happy Little Flower 🌸"
+  - Golden spiderweb / sun / diamond shapes            → Board: 10-A, Sticks: 4-4 → "The Giant Golden Spiderweb ✨"
+  - Chain of golden bubbles / linked rings             → Board: 3-D,  Sticks: 3-3 → "The Magic Bubble Chain 🫧"
+  - Orange crown / lace loops / open center            → Board: 6-N,  Sticks: 5-6 → "The Royal Crown 👑"
+  - Green grid / fishing net / woven squares           → Board: 12-J, Sticks: 5-5 → "The Magic Garden Fence 🌿"
 
-If configuration is not in knowledge base: "I don't have data for that exact configuration yet. Try it out — lower letters/numbers create denser patterns, higher positions create wider open designs! 🌀"`;
+If config not in knowledge base: "I don't have that one yet — try it out and discover your own secret pattern! Every new combo is a surprise 🎉"`;
 }
 
 // =============================================================================
