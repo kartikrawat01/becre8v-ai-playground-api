@@ -1,33 +1,12 @@
 // =============================================================================
 // Be Cre8v AI Backend — Multi-Product RAG (Robocoders + Spin Genius)
 // =============================================================================
-// ONE backend file handles BOTH products.
-// Product is selected by the frontend via { product: "robocoders" | "spingenius" }
-//
-// How it works:
-//   - Robocoders → queries Pinecone namespace "robocoders" + deterministic fast-paths
-//   - Spin Genius → queries Pinecone namespace "spingenius" + strict scope guardrail
-//
-// Env vars (Vercel dashboard):
-//   OPENAI_API_KEY
-//   PINECONE_API_KEY
-//   PINECONE_INDEX_HOST   ← https://robocoders-kb-xxxx.svc.aped-xxxx.pinecone.io
-//   KNOWLEDGE_URL         ← robocoders JSON URL (for deterministic fast-paths)
-//   ALLOWED_ORIGIN        ← comma-separated allowed origins
-// =============================================================================
-
 const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
 const OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings";
 const EMBED_MODEL = "text-embedding-3-small";
 
-// ---------------------------------------------------------------------------
-// CORS helpers (unchanged)
-// ---------------------------------------------------------------------------
 function origins() {
-  return (process.env.ALLOWED_ORIGIN || "")
-    .split(",")
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return (process.env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
 }
 
 function allow(res, origin) {
@@ -43,9 +22,6 @@ function allow(res, origin) {
   return false;
 }
 
-// ---------------------------------------------------------------------------
-// Prompt Planner (unchanged)
-// ---------------------------------------------------------------------------
 const CHAT_PLANNER_PROMPT = `
 You are Be Cre8v AI Conversation Planner.
 Rewrite the user's message into a clearer, more intelligent version BEFORE it is answered.
@@ -72,32 +48,22 @@ async function planChatPrompt(userText, apiKey) {
       ],
     }),
   });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error("Planner error: " + t.slice(0, 800));
-  }
+  if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Planner error: " + t.slice(0, 800)); }
   const data = await r.json();
   return data?.choices?.[0]?.message?.content?.trim() || String(userText || "").trim();
 }
 
-// ---------------------------------------------------------------------------
-// RAG helpers
-// ---------------------------------------------------------------------------
 async function embedText(text, apiKey) {
   const r = await fetch(OPENAI_EMBED_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: EMBED_MODEL, input: String(text || "").trim() }),
   });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error("Embedding error: " + t.slice(0, 800));
-  }
+  if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Embedding error: " + t.slice(0, 800)); }
   const data = await r.json();
   return data.data[0].embedding;
 }
 
-// ← KEY CHANGE: accepts namespace parameter
 async function queryPinecone(queryEmbedding, namespace, topK = 6) {
   const host = process.env.PINECONE_INDEX_HOST;
   const apiKey = process.env.PINECONE_API_KEY;
@@ -106,32 +72,22 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
   const r = await fetch(`${host}/query`, {
     method: "POST",
     headers: { "Api-Key": apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      vector: queryEmbedding,
-      topK,
-      includeMetadata: true,
-      namespace,           // ← queries only that product's vectors
-    }),
+    body: JSON.stringify({ vector: queryEmbedding, topK, includeMetadata: true, namespace }),
   });
-
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error("Pinecone query error: " + t.slice(0, 800));
-  }
+  if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Pinecone query error: " + t.slice(0, 800)); }
 
   const data = await r.json();
   return (data.matches || []).map((m) => ({
     text: m.metadata?.text || "",
     type: m.metadata?.type || "general",
     projectName: m.metadata?.projectName || null,
-    patternImage: m.metadata?.patternImage || null,  // ← spin genius image filename
+    patternImage: m.metadata?.patternImage || null,
+    boardPosition: m.metadata?.boardPosition || null,   // ← for exact image matching
+    stickPosition: m.metadata?.stickPosition || null,   // ← for exact image matching
     score: m.score,
   }));
 }
 
-// ---------------------------------------------------------------------------
-// Main Handler
-// ---------------------------------------------------------------------------
 export default async function handler(req, res) {
   const origin = req.headers.origin || "";
 
@@ -141,30 +97,22 @@ export default async function handler(req, res) {
 
   try {
     const body = req.body || {};
-
-    // ── Read product from request (default: robocoders) ─────────────────────
-    // Frontend sends: { message, product: "robocoders" | "spingenius", history }
     const product = (typeof body.product === "string" ? body.product : "robocoders").toLowerCase().trim();
-    const namespace = product; // Pinecone namespace = product name
-
-    const message = typeof body.message === "string" ? body.message
-      : typeof body.input === "string" ? body.input : "";
-    const history = Array.isArray(body.history) ? body.history
-      : Array.isArray(body.messages) ? body.messages : [];
+    const namespace = product;
+    const message = typeof body.message === "string" ? body.message : typeof body.input === "string" ? body.input : "";
+    const history = Array.isArray(body.history) ? body.history : Array.isArray(body.messages) ? body.messages : [];
     const attachment = body.attachment || null;
 
     if ((typeof message !== "string" || !message.trim()) && !attachment) {
       return res.status(400).json({ error: "Missing message or image input." });
     }
 
-    const rawUserText = String(message || "").trim() ||
-      (attachment ? "Analyze the uploaded image and describe what you see in detail." : "");
-
+    const rawUserText = String(message || "").trim() || (attachment ? "Analyze the uploaded image and describe what you see in detail." : "");
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
 
     // ========================================================================
-    // ROBOCODERS PATH — deterministic fast-paths + RAG
+    // ROBOCODERS PATH
     // ========================================================================
     if (product === "robocoders") {
       const knowledgeUrl = process.env.KNOWLEDGE_URL;
@@ -181,7 +129,6 @@ export default async function handler(req, res) {
       const rawDetectedProject = detectProject(rawUserText, projectNames);
       let detectedComponent = detectComponent(rawUserText, componentsMap);
 
-      // Deterministic fast-paths (no RAG, no LLM)
       if (rawIntent.type === "KIT_OVERVIEW") {
         return res.status(200).json({ text: kitOverview, debug: { intent: rawIntent, kbMode: "deterministic_overview", product } });
       }
@@ -210,7 +157,6 @@ export default async function handler(req, res) {
         return res.status(200).json({ text: out, debug: { intent: rawIntent, kbMode: "deterministic", product } });
       }
 
-      // Prompt planner
       let plannedUserText = rawUserText;
       try { plannedUserText = await planChatPrompt(rawUserText, apiKey); } catch (_) {}
 
@@ -218,7 +164,6 @@ export default async function handler(req, res) {
       const detectedProject = rawDetectedProject || detectProject(plannedUserText, projectNames) || lastProject;
       detectedComponent = detectComponent(plannedUserText, componentsMap) || detectedComponent || lastComponent;
 
-      // Support trigger
       const supportReason = detectSupportFailure({
         userText: rawUserText, intent: rawIntent, detectedProject,
         projectContext: detectedProject ? projectsByName[detectedProject] : null,
@@ -231,7 +176,6 @@ export default async function handler(req, res) {
         });
       }
 
-      // RAG — query "robocoders" namespace
       let ragContext = "";
       let ragChunks = [];
       try {
@@ -242,7 +186,7 @@ export default async function handler(req, res) {
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]\n${c.text}`).join("\n\n---\n\n");
         }
       } catch (ragErr) {
-        console.error("RAG error (falling back to deterministic context):", ragErr.message);
+        console.error("RAG error:", ragErr.message);
       }
 
       const projectContext = detectedProject ? projectsByName[detectedProject] || null : null;
@@ -265,10 +209,7 @@ export default async function handler(req, res) {
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.7, max_tokens: 1000, messages }),
       });
-      if (!r.ok) {
-        const t = await r.text().catch(() => "");
-        return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) });
-      }
+      if (!r.ok) { const t = await r.text().catch(() => ""); return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) }); }
       const data = await r.json();
       let reply = data?.choices?.[0]?.message?.content?.trim() || "";
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
@@ -280,16 +221,15 @@ export default async function handler(req, res) {
     }
 
     // ========================================================================
-    // SPIN GENIUS PATH — pure RAG, strict scope, image support
+    // SPIN GENIUS PATH
     // ========================================================================
     if (product === "spingenius") {
       let plannedUserText = rawUserText;
       try { plannedUserText = await planChatPrompt(rawUserText, apiKey); } catch (_) {}
 
-      // RAG — query "spingenius" namespace
       let ragContext = "";
       let ragChunks = [];
-      let patternImages = []; // collect image filenames from retrieved chunks
+      let patternImages = [];
 
       try {
         const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
@@ -298,12 +238,41 @@ export default async function handler(req, res) {
         if (ragChunks.length > 0) {
           ragContext = "=== RETRIEVED KNOWLEDGE ===\n" +
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}]\n${c.text}`).join("\n\n---\n\n");
-
-          // Collect pattern image filenames from chunks that have them
-          patternImages = ragChunks
-            .filter(c => c.patternImage)
-            .map(c => c.patternImage);
         }
+
+        // ── EXACT PATTERN IMAGE MATCHING ─────────────────────────────────────
+        // Step 1: Only consider configuration chunks that have images
+        const configChunks = ragChunks.filter(
+          c => c.type === "configuration" && c.patternImage
+        );
+
+        // Step 2: Extract board/stick positions from what the user asked
+        const queryText = (plannedUserText || rawUserText).toLowerCase();
+        const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-r])\b/i);
+        const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]-[0-9])/i)
+          || queryText.match(/\b([0-9]-[0-9])\b/);
+
+        const askedBoard = boardMatch?.[1]?.toUpperCase();  // e.g. "12-J"
+        const askedStick = stickMatch?.[1];                 // e.g. "5-5"
+
+        if (askedBoard || askedStick) {
+          // User asked about a specific config — return only that image
+          const exactChunk = configChunks.find(c => {
+            const boardOk = askedBoard
+              ? (c.boardPosition || "").toUpperCase() === askedBoard
+              : false;
+            const stickOk = askedStick
+              ? c.stickPosition === askedStick
+              : false;
+            return boardOk || stickOk;
+          });
+          patternImages = exactChunk?.patternImage ? [exactChunk.patternImage] : [];
+        } else {
+          // No specific config asked — show images from retrieved config chunks
+          patternImages = configChunks.map(c => c.patternImage);
+        }
+        // ─────────────────────────────────────────────────────────────────────
+
       } catch (ragErr) {
         console.error("Spin Genius RAG error:", ragErr.message);
       }
@@ -318,29 +287,25 @@ export default async function handler(req, res) {
       }
 
       const messages = [{ role: "system", content: systemPrompt }, ...buildConversationHistory(history), { role: "user", content: userContent }];
-      console.log("Product: spingenius | RAG chunks:", ragChunks.length);
+      console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages.length);
 
       const r = await fetch(OPENAI_CHAT_URL, {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
         body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.7, max_tokens: 1000, messages }),
       });
-      if (!r.ok) {
-        const t = await r.text().catch(() => "");
-        return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) });
-      }
+      if (!r.ok) { const t = await r.text().catch(() => ""); return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) }); }
       const data = await r.json();
       let reply = data?.choices?.[0]?.message?.content?.trim() || "";
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
 
       return res.status(200).json({
         text: reply,
-        patternImages,   // ← frontend uses this array to show pattern images
-        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map(c => c.type) },
+        patternImages,
+        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map(c => c.type), patternImagesReturned: patternImages },
       });
     }
 
-    // Unknown product
     return res.status(400).json({ error: `Unknown product: "${product}". Use "robocoders" or "spingenius".` });
 
   } catch (err) {
@@ -360,17 +325,13 @@ Your role:
 - Provide clear, simple explanations suitable for kids
 - Be encouraging, friendly, and enthusiastic
 - Use the knowledge base information provided below to answer questions accurately
-- If you don't know something, admit it honestly and suggest where to find the information
+- If you don't know something, admit it honestly
 
 Important guidelines:
 - Keep explanations simple and fun
 - Use examples and analogies kids can relate to
-- Encourage creativity and experimentation
 - Always prioritize safety
-- Be patient and supportive
-- Use positive, empowering language
 - When asked about SAFETY: It is SAFE to plug/unplug sensors while the Robocoders Brain is on (low voltage 5V USB)
-- When asked about PROJECTS: Focus on the specific project mentioned
 - When asked about PROJECT COUNT: Always say "There are 50 projects, out of which 21 are live. One project per week shall be launched."
 - STRICT SCOPE: If user asks about Spin Genius, spirograph, or drawing machines, say: "I'm the Robocoders assistant! For Spin Genius questions, switch the product from the dropdown above 🤖"
 
@@ -410,7 +371,7 @@ PATTERN LOOKUP RULES — VERY IMPORTANT:
 When a user asks about a specific configuration, ALWAYS answer with ALL of these fields:
   - Pattern Name
   - Board Position
-  - Stick Position  
+  - Stick Position
   - Shape description
   - Colors
   - Difficulty level
@@ -428,10 +389,8 @@ Match the visual appearance to these patterns:
 If configuration is not in knowledge base: "I don't have data for that exact configuration yet. Try it out — lower letters/numbers create denser patterns, higher positions create wider open designs! 🌀"`;
 }
 
-
-
 // =============================================================================
-// All Robocoders helper functions — UNCHANGED from your original chat.js
+// All Robocoders helper functions
 // =============================================================================
 function buildIndexes(kb) {
   const projectNames = extractProjectNames(kb);
