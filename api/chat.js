@@ -84,7 +84,7 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
     patternImage: m.metadata?.patternImage || null,
     boardPosition: m.metadata?.boardPosition || null,
     stickPosition: m.metadata?.stickPosition || null,
-    patternName: m.metadata?.patternName || null,   // ← needed for name-based matching
+    patternName: m.metadata?.patternName || null,
     score: m.score,
   }));
 }
@@ -120,7 +120,6 @@ const PATTERN_NAME_MAP = [
   },
 ];
 
-// Returns the image filename if any known name matches the query text
 function findImageByPatternName(queryText) {
   const q = queryText.toLowerCase();
   for (const entry of PATTERN_NAME_MAP) {
@@ -283,7 +282,7 @@ export default async function handler(req, res) {
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}]\n${c.text}`).join("\n\n---\n\n");
         }
 
-        // ── PATTERN IMAGE MATCHING — 3 strategies in priority order ──────────
+        // ── PATTERN IMAGE MATCHING — strategies in priority order ─────────────
         const configChunks = ragChunks.filter(c => c.type === "configuration" && c.patternImage);
         const queryText = (plannedUserText || rawUserText).toLowerCase();
 
@@ -297,22 +296,17 @@ export default async function handler(req, res) {
         const askedStick = stickMatch?.[1];
 
         if (askedBoard || askedStick) {
-          // Strategy 1 & 2: User mentioned board or stick position directly
           const exactChunk = configChunks.find(c => {
             const boardOk = askedBoard ? (c.boardPosition || "").toUpperCase() === askedBoard : false;
             const stickOk = askedStick ? c.stickPosition === askedStick : false;
             return boardOk || stickOk;
           });
           patternImages = exactChunk?.patternImage ? [exactChunk.patternImage] : [];
-
         } else {
-          // Strategy 3: Pattern name / fun name match from PATTERN_NAME_MAP
           const nameMatchedImage = findImageByPatternName(queryText);
           if (nameMatchedImage) {
             patternImages = [nameMatchedImage];
           } else {
-            // Strategy 4: RAG semantic match — use top-scored config chunk
-            // (handles cases like "show me the flower pattern")
             const topConfigChunk = configChunks[0];
             patternImages = topConfigChunk?.patternImage ? [topConfigChunk.patternImage] : [];
           }
@@ -393,7 +387,7 @@ function buildSpinGeniusSystemPrompt(groundedContext) {
 WHAT YOU CAN HELP WITH:
 - Explaining how Spin Genius works (gears, sticks, board positions)
 - Identifying what pattern a configuration creates (e.g. board 3-D, sticks 3-3)
-- Looking at a pattern image and suggesting which configuration made it
+- Looking at a pattern image and identifying the configuration that made it
 - Describing patterns using their fun kid-friendly names
 - Troubleshooting drawing issues
 - Suggesting configurations to try
@@ -403,7 +397,7 @@ ABOUT PATTERN IMAGES:
 - You CANNOT generate or draw images yourself — you are a text AI
 - When a user asks to "generate an image" or "show me the pattern image", respond:
   "I can't draw images myself, but the picture of this pattern will pop up automatically below my answer if it's in my knowledge base! 🌀"
-- When a user UPLOADS a photo and asks what configuration made it, analyse the visual and match to patterns
+- When a user UPLOADS a photo, identify by SHAPE and STRUCTURE ONLY — never by color
 
 STRICT OUT-OF-SCOPE RULE:
 Only redirect if user asks about: Robocoders, electronics, LEDs, coding, sensors, motors.
@@ -432,13 +426,58 @@ PATTERN FUN NAMES (always use these when describing patterns to kids):
   - Board 3-R,  Sticks 4-2 → "The Spinning Galaxy Swirl 🌀"   (Mystic Dark Whirlpool)
   - Board 10-A, Sticks 4-4 → "The Giant Golden Spiderweb ✨"  (Golden Sunshine Spiderweb)
 
-VISUAL PATTERN MATCHING (use when user uploads an image):
-  - Spiral / whirlpool / dense dark donut / black hole → Board: 3-R,  Sticks: 4-2 → "The Spinning Galaxy Swirl 🌀"
-  - Pink flower / overlapping loopy petals / rosette   → Board: 7-J,  Sticks: 1-1 → "The Happy Little Flower 🌸"
-  - Golden spiderweb / sun / diamond shapes            → Board: 10-A, Sticks: 4-4 → "The Giant Golden Spiderweb ✨"
-  - Chain of golden bubbles / linked rings             → Board: 3-D,  Sticks: 3-3 → "The Magic Bubble Chain 🫧"
-  - Orange crown / lace loops / open center            → Board: 6-N,  Sticks: 5-6 → "The Royal Crown 👑"
-  - Green grid / fishing net / woven squares           → Board: 12-J, Sticks: 5-5 → "The Magic Garden Fence 🌿"
+================================================================================
+VISUAL PATTERN MATCHING — SHAPE IS EVERYTHING, COLOR MEANS NOTHING
+================================================================================
+CRITICAL RULE: When a user uploads a pattern image, identify it by GEOMETRIC SHAPE ONLY.
+COLOR MUST BE COMPLETELY IGNORED. The exact same configuration always creates the same
+shape, but the color depends on the pen used. Do NOT use color to identify any pattern.
+
+IDENTIFY BY SHAPE — in this exact priority order:
+
+1. GRID / NET / MESH
+   → Board: 12-J, Sticks: 5-5 → "The Magic Garden Fence 🌿"
+   → SHAPE: neat lines crossing each other at angles forming tiny squares or rectangles,
+     arranged all the way around in a circle. Looks like a woven fence, basket, or fishing net.
+   → COLOR IRRELEVANT: same shape whether drawn in green, yellow, blue, red, or any color.
+
+2. FLOWER / OVERLAPPING PETALS
+   → Board: 7-J, Sticks: 1-1 → "The Happy Little Flower 🌸"
+   → SHAPE: several loopy petal shapes that all overlap and meet at the center. Small and compact.
+     Looks like a rosette or a doodle flower.
+   → COLOR IRRELEVANT: same shape whether drawn in pink, blue, or any color.
+
+3. CROWN / LACE BORDER
+   → Board: 6-N, Sticks: 5-6 → "The Royal Crown 👑"
+   → SHAPE: decorative loops only on the outer edge of the circle. The center is almost completely
+     empty — a very large open space. Looks like a lacy border or a crown viewed from above.
+   → COLOR IRRELEVANT: same shape whether drawn in orange, purple, or any color.
+
+4. DENSE SPIRAL / SOLID DONUT
+   → Board: 3-R, Sticks: 4-2 → "The Spinning Galaxy Swirl 🌀"
+   → SHAPE: many, many lines packed very tightly together forming what looks like a thick solid ring
+     or donut. Almost no empty space. Tiny hole at center. Looks dense and almost solid.
+   → COLOR IRRELEVANT: same shape whether drawn in dark or light colors.
+
+5. SPIDERWEB / STARBURST / RADIATING DIAMONDS
+   → Board: 10-A, Sticks: 4-4 → "The Giant Golden Spiderweb ✨"
+   → SHAPE: thin lines that radiate outward from the center like spokes of a wheel, crossing each
+     other to form diamond or rhombus shaped gaps. Large open circle in the middle. Looks like a
+     spiderweb or a starburst mandala.
+   → COLOR IRRELEVANT: same shape whether drawn in yellow, silver, or any color.
+
+6. BUBBLE CHAIN / LINKED LOOPS
+   → Board: 3-D, Sticks: 3-3 → "The Magic Bubble Chain 🫧"
+   → SHAPE: a series of round looping shapes linked together like a chain of bubbles or rings,
+     forming one large circle. Bubbly and loopy appearance.
+   → COLOR IRRELEVANT: same shape whether drawn in yellow, blue, or any color.
+
+HOW TO TELL GRID (12-J) FROM SPIDERWEB (10-A) — the most common confusion:
+  - GRID (12-J): lines cross at angles forming SQUARES or small rectangles. Like graph paper
+    bent into a circle. The spaces between lines are square-shaped.
+  - SPIDERWEB (10-A): lines radiate FROM THE CENTER outward like wheel spokes, forming
+    DIAMOND-shaped gaps. The spaces between lines are diamond or rhombus shaped.
+  - KEY TEST: Are the gaps between lines SQUARE? → Grid (12-J). Are the gaps DIAMOND-shaped? → Spiderweb (10-A).
 
 If config not in knowledge base: "I don't have that one yet — try it out and discover your own secret pattern! Every new combo is a surprise 🎉"`;
 }
