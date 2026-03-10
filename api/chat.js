@@ -435,8 +435,10 @@ module.exports = async function handler(req, res) {
       }
 
       try {
-        const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
-        ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
+        if (!grayscaleImageUrl) {
+          const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
+          ragChunks = await queryPinecone(queryEmbedding, "spingenius", 3);
+        }
 
         if (ragChunks.length > 0) {
           ragContext = "=== RETRIEVED KNOWLEDGE ===\n" +
@@ -447,13 +449,19 @@ module.exports = async function handler(req, res) {
         const queryText = (plannedUserText || rawUserText).toLowerCase();
 
         // Strategy 0: Grayscale image → dedicated vision classifier (temperature=0)
+        let classifiedPattern = null;
+
         if (grayscaleImageUrl) {
           try {
             const classified = await classifyPatternFromImage(grayscaleImageUrl, apiKey);
+            console.log("Detected board:", classified?.boardPosition);
+            console.log("Detected stick:", classified?.stickPosition);
             if (classified?.patternImage) {
               patternImages = [classified.patternImage];
+              classifiedPattern = classified;   // STORE THE RESULT
               console.log("Vision classifier result:", classified);
             }
+
           } catch (classifyErr) {
             console.error("Vision classifier error:", classifyErr.message);
           }
@@ -506,13 +514,22 @@ module.exports = async function handler(req, res) {
         }
       }
 
+    
+
       const messages = [{ role: "system", content: systemPrompt }, ...buildConversationHistory(history), { role: "user", content: userContent }];
       console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages);
-
+      
+      if (classifiedPattern) {
+        messages.unshift({
+          role: "system",
+          content: `The uploaded Spin Genius pattern has already been identified as Board ${classifiedPattern.boardPosition} and Stick ${classifiedPattern.stickPosition}. 
+      Do not identify another pattern. Only explain this pattern using the knowledge base.`
+        });
+      }
       const r = await fetch(OPENAI_CHAT_URL, {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.7, max_tokens: 1000, messages }),
+        body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0, max_tokens: 1000, messages }),
       });
       if (!r.ok) { const t = await r.text().catch(() => ""); return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) }); }
       const data = await r.json();
