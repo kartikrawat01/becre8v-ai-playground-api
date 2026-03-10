@@ -428,6 +428,7 @@ module.exports = async function handler(req, res) {
       let ragChunks = [];
       let patternImages = [];
       let grayscaleImageUrl = null;
+      let classifiedPattern = null;
 
       // Convert image to grayscale ONCE — used for both classifier and main GPT call
       if (attachment) {
@@ -449,7 +450,7 @@ module.exports = async function handler(req, res) {
         const queryText = (plannedUserText || rawUserText).toLowerCase();
 
         // Strategy 0: Grayscale image → dedicated vision classifier (temperature=0)
-        let classifiedPattern = null;
+        
 
         if (grayscaleImageUrl) {
           try {
