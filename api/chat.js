@@ -68,14 +68,12 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
   const host = process.env.PINECONE_INDEX_HOST;
   const apiKey = process.env.PINECONE_API_KEY;
   if (!host || !apiKey) throw new Error("PINECONE_INDEX_HOST or PINECONE_API_KEY not set in env.");
-
   const r = await fetch(`${host}/query`, {
     method: "POST",
     headers: { "Api-Key": apiKey, "Content-Type": "application/json" },
     body: JSON.stringify({ vector: queryEmbedding, topK, includeMetadata: true, namespace }),
   });
   if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Pinecone query error: " + t.slice(0, 800)); }
-
   const data = await r.json();
   return (data.matches || []).map((m) => ({
     text: m.metadata?.text || "",
@@ -84,53 +82,210 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
     patternImage: m.metadata?.patternImage || null,
     boardPosition: m.metadata?.boardPosition || null,
     stickPosition: m.metadata?.stickPosition || null,
-    patternName: m.metadata?.patternName || null,   // ← needed for name-based matching
+    patternName: m.metadata?.patternName || null,
     score: m.score,
   }));
 }
 
 // =============================================================================
-// Pattern name lookup table — maps every known name/alias to an image filename
-// Update this whenever you add new patterns to spingenius.json
+// IMAGE PREPROCESSING — Convert to grayscale before sending to GPT
+//
+// ROOT CAUSE OF COLOR MISIDENTIFICATION:
+// GPT-4o-mini uses color as a visual shortcut even when told not to in the prompt.
+// Prompt instructions alone cannot fully override the model's internal vision
+// processing which detects color automatically.
+//
+// THE FIX — Strip color BEFORE the API call:
+// By converting the image to grayscale using sharp, we physically eliminate all
+// color data. The model literally cannot see color because it does not exist in
+// the image. This permanently solves:
+//   Problem 1: Same pattern, different pen color → now correctly identified
+//   Problem 2: Two different patterns in same color → now distinguished by shape
+//
+// .normalise() boosts contrast so line structure is sharper and easier to analyse.
+// Falls back to original image if sharp fails — handler never crashes.
+// =============================================================================
+async function toGrayscaleBase64(imageData) {
+  try {
+    const sharp = require("sharp");
+    const base64 = imageData.startsWith("data:") ? imageData.split(",")[1] : imageData;
+    const inputBuffer = Buffer.from(base64, "base64");
+    const outputBuffer = await sharp(inputBuffer)
+      .grayscale()
+      .normalise()
+      .jpeg({ quality: 90 })
+      .toBuffer();
+    return "data:image/jpeg;base64," + outputBuffer.toString("base64");
+  } catch (err) {
+    console.warn("Grayscale conversion failed, using original:", err.message);
+    return imageData.startsWith("data:") ? imageData : `data:image/png;base64,${imageData}`;
+  }
+}
+
+// =============================================================================
+// Pattern name lookup table — shape-based names ONLY, zero color words
+// Rules:
+//   1. NO color words (no golden, pink, green, dark, black, orange, yellow etc.)
+//   2. 12-J listed BEFORE 10-A so "net","grid","mesh" match garden net first
+//   3. "spiral" alone removed from 3-R — it hijacked spiderweb queries
+//   4. Ambiguous single words removed: "sun", "bubbles", "rings", "chain"
+//   5. findImageByPatternName sorts names by length desc so longer phrases win
 // =============================================================================
 const PATTERN_NAME_MAP = [
   {
     image: "3-D.jpeg",
-    names: ["golden bubble ring", "magic bubble chain", "bubble chain", "golden rings", "bubble ring", "bubbles", "rings", "chain"]
+    names: [
+      "magic bubble chain", "bubble ring chain", "bubble chain",
+      "chain of linked loops", "chain of rings", "linked ring chain",
+      "loopy chain", "bubble ring", "ring chain"
+    ]
   },
   {
+    // Listed BEFORE 10-A so "net","grid","mesh" match here first
     image: "12-J.jpeg",
-    names: ["secret garden net", "magic garden fence", "garden net", "garden fence", "fishing net", "grid", "net", "lattice", "mesh", "woven"]
+    names: [
+      "magic garden fence", "secret garden net",
+      "circular grid", "circular net", "circular mesh",
+      "woven circle", "garden fence", "garden net",
+      "fishing net", "grid pattern", "net pattern",
+      "mesh pattern", "lattice pattern", "woven fence",
+      "square grid", "grid", "net", "lattice", "mesh", "woven"
+    ]
   },
   {
     image: "6-N.jpeg",
-    names: ["princess lace crown", "royal crown", "lace crown", "crown", "lace", "princess crown", "fancy lace"]
+    names: [
+      "princess lace crown", "royal crown", "lace crown",
+      "princess crown", "fancy lace", "lace border",
+      "crown pattern", "lace pattern", "open center crown",
+      "crown", "lace"
+    ]
   },
   {
     image: "7-J.jpeg",
-    names: ["bouncy pink flower", "happy little flower", "pink flower", "flower", "floral", "rosette", "petals", "bouncy flower"]
+    names: [
+      "happy little flower", "bouncy flower",
+      "overlapping petals", "loopy petals", "petal flower",
+      "rosette pattern", "loopy flower", "flower pattern",
+      "floral pattern", "flower", "rosette", "petals"
+    ]
   },
   {
     image: "3-R.jpeg",
-    names: ["mystic dark whirlpool", "spinning galaxy swirl", "dark whirlpool", "whirlpool", "galaxy swirl", "spiral", "galaxy", "donut", "black hole", "swirl", "vortex"]
+    names: [
+      "spinning galaxy swirl", "dense whirlpool",
+      "dense donut", "dense spiral", "packed spiral",
+      "solid ring", "solid donut", "tightly packed lines",
+      "thick donut", "thick ring", "whirlpool pattern",
+      "donut pattern", "whirlpool", "galaxy swirl",
+      "donut", "vortex", "swirl"
+    ]
   },
   {
     image: "10-A.jpeg",
-    names: ["golden sunshine spiderweb", "giant golden spiderweb", "golden spiderweb", "spiderweb", "sunshine spiderweb", "sun", "starburst", "mandala", "diamond web"]
+    names: [
+      "shining spiderweb", "spiderweb mandala",
+      "spiral web like structure", "spiral web like", "spiral web",
+      "web like structure", "web-like structure",
+      "radiating lines", "diamond gaps", "diamond shapes",
+      "starburst pattern", "mandala pattern",
+      "spoke pattern", "diamond web", "web pattern",
+      "spider web", "spiderweb", "web structure",
+      "starburst", "mandala"
+    ]
   },
 ];
 
-// Returns the image filename if any known name matches the query text
 function findImageByPatternName(queryText) {
   const q = queryText.toLowerCase();
   for (const entry of PATTERN_NAME_MAP) {
-    if (entry.names.some(name => q.includes(name))) {
-      return entry.image;
-    }
+    const sorted = [...entry.names].sort((a, b) => b.length - a.length);
+    if (sorted.some(name => q.includes(name))) return entry.image;
   }
   return null;
 }
 
+// =============================================================================
+// Vision Pattern Classifier
+// Receives a GRAYSCALE image — color already eliminated before this call.
+// temperature=0 + JSON-only output = deterministic, reliable classification.
+// =============================================================================
+const VISION_CLASSIFIER_PROMPT = `You are a Spin Genius pattern classifier. You will be shown a GRAYSCALE spirograph pattern image.
+
+Your ONLY job: identify which of the 6 known patterns is shown and return a JSON object.
+The image is grayscale on purpose — identify by GEOMETRY AND LINE STRUCTURE ONLY.
+
+THE 6 KNOWN PATTERNS:
+
+PATTERN A — Board 12-J, Sticks 5-5, Image: 12-J.jpeg
+  Structure: Lines cross forming a repeating GRID or MESH all the way around a circle.
+  Gap shape: SQUARE or rectangular.
+  Center hole: STAR-SHAPED / POLYGON with sharp pointed corners pointing inward.
+  Think: graph paper bent into a ring. Star-shaped center = strongest identifier.
+
+PATTERN B — Board 10-A, Sticks 4-4, Image: 10-A.jpeg
+  Structure: Thin lines RADIATE outward from center like wheel spokes.
+  Gap shape: DIAMOND or rhombus shaped.
+  Center hole: SMOOTH PERFECTLY ROUND — zero sharp corners, no star shape.
+
+PATTERN C — Board 7-J, Sticks 1-1, Image: 7-J.jpeg
+  Structure: Several loopy PETAL shapes overlapping, all meeting at center.
+  Small compact rosette / doodle flower shape.
+
+PATTERN D — Board 6-N, Sticks 5-6, Image: 6-N.jpeg
+  Structure: Decorative loops ONLY on the outer edge.
+  The entire center is a vast open empty space. Like a crown or lacy border.
+
+PATTERN E — Board 3-R, Sticks 4-2, Image: 3-R.jpeg
+  Structure: Lines packed SO tightly the ring looks nearly SOLID.
+  Thick dense donut. Almost no empty space in the ring anywhere.
+
+PATTERN F — Board 3-D, Sticks 3-3, Image: 3-D.jpeg
+  Structure: Round bubble loops LINKED together like a chain forming one large circle.
+
+DECISION STEPS — follow in order, stop at first match:
+1. Center hole has SHARP POINTED star/polygon corners?     → PATTERN A (12-J)
+2. Ring looks nearly solid, almost no gaps at all?         → PATTERN E (3-R)
+3. Lines radiate from center + diamond gaps + round hole?  → PATTERN B (10-A)
+4. Overlapping loopy petals meeting at center?             → PATTERN C (7-J)
+5. Loops only on outer edge, huge empty center?            → PATTERN D (6-N)
+6. Linked bubble/ring shapes in a chain circle?            → PATTERN F (3-D)
+
+Respond ONLY with valid JSON — no other text whatsoever:
+{"boardPosition":"12-J","stickPosition":"5-5","patternImage":"12-J.jpeg"}`;
+
+async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
+  const r = await fetch(OPENAI_CHAT_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0,
+      max_tokens: 60,
+      messages: [{
+        role: "user",
+        content: [
+          { type: "text", text: VISION_CLASSIFIER_PROMPT },
+          { type: "image_url", image_url: { url: grayscaleImageUrl } }
+        ]
+      }]
+    }),
+  });
+  if (!r.ok) return null;
+  const data = await r.json();
+  const raw = data?.choices?.[0]?.message?.content?.trim() || "";
+  try {
+    const clean = raw.replace(/```json|```/g, "").trim();
+    const parsed = JSON.parse(clean);
+    const known = ["12-J", "10-A", "7-J", "6-N", "3-R", "3-D"];
+    if (parsed?.boardPosition && known.includes(parsed.boardPosition)) return parsed;
+  } catch (_) {}
+  return null;
+}
+
+// =============================================================================
+// Handler
+// =============================================================================
 module.exports = async function handler(req, res) {
   const origin = req.headers.origin || "";
 
@@ -141,7 +296,6 @@ module.exports = async function handler(req, res) {
   try {
     const body = req.body || {};
     const product = (typeof body.product === "string" ? body.product : "robocoders").toLowerCase().trim();
-    const namespace = product;
     const message = typeof body.message === "string" ? body.message : typeof body.input === "string" ? body.input : "";
     const history = Array.isArray(body.history) ? body.history : Array.isArray(body.messages) ? body.messages : [];
     const attachment = body.attachment || null;
@@ -273,6 +427,12 @@ module.exports = async function handler(req, res) {
       let ragContext = "";
       let ragChunks = [];
       let patternImages = [];
+      let grayscaleImageUrl = null;
+
+      // Convert image to grayscale ONCE — used for both classifier and main GPT call
+      if (attachment) {
+        grayscaleImageUrl = await toGrayscaleBase64(attachment);
+      }
 
       try {
         const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
@@ -283,41 +443,47 @@ module.exports = async function handler(req, res) {
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}]\n${c.text}`).join("\n\n---\n\n");
         }
 
-        // ── PATTERN IMAGE MATCHING — 3 strategies in priority order ──────────
         const configChunks = ragChunks.filter(c => c.type === "configuration" && c.patternImage);
         const queryText = (plannedUserText || rawUserText).toLowerCase();
 
-        // Strategy 1: Board position match (e.g. "12-J", "7-J")
-        const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-r])\b/i);
-        const askedBoard = boardMatch?.[1]?.toUpperCase();
-
-        // Strategy 2: Stick position match (e.g. "sticks 5-5", "5-5")
-        const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]-[0-9])/i)
-          || queryText.match(/\b([0-9]-[0-9])\b/);
-        const askedStick = stickMatch?.[1];
-
-        if (askedBoard || askedStick) {
-          // Strategy 1 & 2: User mentioned board or stick position directly
-          const exactChunk = configChunks.find(c => {
-            const boardOk = askedBoard ? (c.boardPosition || "").toUpperCase() === askedBoard : false;
-            const stickOk = askedStick ? c.stickPosition === askedStick : false;
-            return boardOk || stickOk;
-          });
-          patternImages = exactChunk?.patternImage ? [exactChunk.patternImage] : [];
-
-        } else {
-          // Strategy 3: Pattern name / fun name match from PATTERN_NAME_MAP
-          const nameMatchedImage = findImageByPatternName(queryText);
-          if (nameMatchedImage) {
-            patternImages = [nameMatchedImage];
-          } else {
-            // Strategy 4: RAG semantic match — use top-scored config chunk
-            // (handles cases like "show me the flower pattern")
-            const topConfigChunk = configChunks[0];
-            patternImages = topConfigChunk?.patternImage ? [topConfigChunk.patternImage] : [];
+        // Strategy 0: Grayscale image → dedicated vision classifier (temperature=0)
+        if (grayscaleImageUrl) {
+          try {
+            const classified = await classifyPatternFromImage(grayscaleImageUrl, apiKey);
+            if (classified?.patternImage) {
+              patternImages = [classified.patternImage];
+              console.log("Vision classifier result:", classified);
+            }
+          } catch (classifyErr) {
+            console.error("Vision classifier error:", classifyErr.message);
           }
         }
-        // ─────────────────────────────────────────────────────────────────────
+
+        // Strategies 1-4: text-only path (no image, or classifier failed)
+        if (!grayscaleImageUrl || patternImages.length === 0) {
+          const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-r])\b/i);
+          const askedBoard = boardMatch?.[1]?.toUpperCase();
+          const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]-[0-9])/i)
+            || queryText.match(/\b([0-9]-[0-9])\b/);
+          const askedStick = stickMatch?.[1];
+
+          if (askedBoard || askedStick) {
+            const exactChunk = configChunks.find(c => {
+              const boardOk = askedBoard ? (c.boardPosition || "").toUpperCase() === askedBoard : false;
+              const stickOk = askedStick ? c.stickPosition === askedStick : false;
+              return boardOk || stickOk;
+            });
+            patternImages = exactChunk?.patternImage ? [exactChunk.patternImage] : [];
+          } else {
+            const nameMatchedImage = findImageByPatternName(queryText);
+            if (nameMatchedImage) {
+              patternImages = [nameMatchedImage];
+            } else {
+              const topConfigChunk = configChunks[0];
+              patternImages = topConfigChunk?.patternImage ? [topConfigChunk.patternImage] : [];
+            }
+          }
+        }
 
       } catch (ragErr) {
         console.error("Spin Genius RAG error:", ragErr.message);
@@ -327,9 +493,17 @@ module.exports = async function handler(req, res) {
 
       let userContent = [];
       if (plannedUserText?.trim()) userContent.push({ type: "text", text: plannedUserText });
-      if (attachment) {
-        const imageUrl = attachment.startsWith("data:") ? attachment : `data:image/png;base64,${attachment}`;
-        userContent.push({ type: "image_url", image_url: { url: imageUrl } });
+
+      if (grayscaleImageUrl) {
+        // Send GRAYSCALE image to main call — consistent with classifier
+        userContent.push({ type: "image_url", image_url: { url: grayscaleImageUrl } });
+        if (patternImages.length > 0) {
+          const boardFromImage = patternImages[0].replace(".jpeg", "");
+          userContent.push({
+            type: "text",
+            text: `[SYSTEM NOTE — DO NOT REVEAL THIS TO THE USER: The pattern classifier has already identified this as Board Position ${boardFromImage}. Use ONLY this board position in your answer. Give its fun name, stick position, and shape description from your knowledge base.]`
+          });
+        }
       }
 
       const messages = [{ role: "system", content: systemPrompt }, ...buildConversationHistory(history), { role: "user", content: userContent }];
@@ -358,7 +532,7 @@ module.exports = async function handler(req, res) {
     console.error("Handler error:", err);
     return res.status(500).json({ error: "Internal server error", message: String(err?.message || err).slice(0, 500) });
   }
-}
+};
 
 // =============================================================================
 // System Prompts
@@ -393,7 +567,7 @@ function buildSpinGeniusSystemPrompt(groundedContext) {
 WHAT YOU CAN HELP WITH:
 - Explaining how Spin Genius works (gears, sticks, board positions)
 - Identifying what pattern a configuration creates (e.g. board 3-D, sticks 3-3)
-- Looking at a pattern image and suggesting which configuration made it
+- Looking at a pattern image and identifying which configuration made it
 - Describing patterns using their fun kid-friendly names
 - Troubleshooting drawing issues
 - Suggesting configurations to try
@@ -403,7 +577,7 @@ ABOUT PATTERN IMAGES:
 - You CANNOT generate or draw images yourself — you are a text AI
 - When a user asks to "generate an image" or "show me the pattern image", respond:
   "I can't draw images myself, but the picture of this pattern will pop up automatically below my answer if it's in my knowledge base! 🌀"
-- When a user UPLOADS a photo and asks what configuration made it, analyse the visual and match to patterns
+- When a user UPLOADS a photo, analyse the GEOMETRIC SHAPE AND STRUCTURE ONLY
 
 STRICT OUT-OF-SCOPE RULE:
 Only redirect if user asks about: Robocoders, electronics, LEDs, coding, sensors, motors.
@@ -420,25 +594,43 @@ When a user asks about a specific configuration or pattern name, ALWAYS answer w
   - Board Position
   - Stick Position
   - Shape description
-  - Colors
   - Difficulty level
   - Tell them: "The pattern picture will appear below my response automatically! 🎨"
 
 PATTERN FUN NAMES (always use these when describing patterns to kids):
-  - Board 3-D,  Sticks 3-3 → "The Magic Bubble Chain 🫧"      (Golden Bubble Ring)
-  - Board 12-J, Sticks 5-5 → "The Magic Garden Fence 🌿"      (Secret Garden Net)
-  - Board 6-N,  Sticks 5-6 → "The Royal Crown 👑"             (Princess Lace Crown)
-  - Board 7-J,  Sticks 1-1 → "The Happy Little Flower 🌸"     (Bouncy Pink Flower)
-  - Board 3-R,  Sticks 4-2 → "The Spinning Galaxy Swirl 🌀"   (Mystic Dark Whirlpool)
-  - Board 10-A, Sticks 4-4 → "The Giant Golden Spiderweb ✨"  (Golden Sunshine Spiderweb)
+  - Board 3-D,  Sticks 3-3 → "The Magic Bubble Chain 🫧"    (Bubble Ring Chain)
+  - Board 12-J, Sticks 5-5 → "The Magic Garden Fence 🌿"    (Garden Net)
+  - Board 6-N,  Sticks 5-6 → "The Royal Crown 👑"           (Lace Crown)
+  - Board 7-J,  Sticks 1-1 → "The Happy Little Flower 🌸"   (Petal Flower)
+  - Board 3-R,  Sticks 4-2 → "The Spinning Galaxy Swirl 🌀" (Dense Whirlpool)
+  - Board 10-A, Sticks 4-4 → "The Shining Spiderweb ✨"     (Spiderweb Mandala)
 
-VISUAL PATTERN MATCHING (use when user uploads an image):
-  - Spiral / whirlpool / dense dark donut / black hole → Board: 3-R,  Sticks: 4-2 → "The Spinning Galaxy Swirl 🌀"
-  - Pink flower / overlapping loopy petals / rosette   → Board: 7-J,  Sticks: 1-1 → "The Happy Little Flower 🌸"
-  - Golden spiderweb / sun / diamond shapes            → Board: 10-A, Sticks: 4-4 → "The Giant Golden Spiderweb ✨"
-  - Chain of golden bubbles / linked rings             → Board: 3-D,  Sticks: 3-3 → "The Magic Bubble Chain 🫧"
-  - Orange crown / lace loops / open center            → Board: 6-N,  Sticks: 5-6 → "The Royal Crown 👑"
-  - Green grid / fishing net / woven squares           → Board: 12-J, Sticks: 5-5 → "The Magic Garden Fence 🌿"
+================================================================================
+RULE ZERO — COLOR DOES NOT EXIST IN THIS IMAGE
+================================================================================
+Every uploaded image is converted to grayscale before you see it.
+You are seeing ONLY line structure — no color information exists.
+Identify ONLY from geometry: line arrangement, gap shapes, center hole shape.
+
+================================================================================
+VISUAL ANALYSIS CHECKLIST — when image is uploaded
+================================================================================
+
+STEP 1 — CENTER HOLE (most reliable test):
+  Sharp pointed/star-shaped corners? → GARDEN NET  → Board 12-J, Sticks 5-5
+  Nearly solid ring, almost no hole? → WHIRLPOOL   → Board 3-R,  Sticks 4-2
+  Smooth perfectly round hole?       → Go to Step 2
+
+STEP 2 — LINE STRUCTURE:
+  Grid/mesh of crossing lines, square gaps?         → GARDEN NET   → Board 12-J
+  Spokes radiating from center, diamond gaps?       → SPIDERWEB    → Board 10-A
+  Overlapping loopy petals meeting at center?       → FLOWER       → Board 7-J
+  Loops only on outer edge, huge empty center?      → CROWN        → Board 6-N
+  Linked bubble loops forming a chain circle?       → BUBBLE CHAIN → Board 3-D
+
+STEP 3 — GARDEN NET vs SPIDERWEB tiebreaker:
+  Center has sharp pointed star corners? → GARDEN NET → Board 12-J
+  Center is smooth round circle?         → SPIDERWEB  → Board 10-A
 
 If config not in knowledge base: "I don't have that one yet — try it out and discover your own secret pattern! Every new combo is a surprise 🎉"`;
 }
