@@ -123,77 +123,82 @@ async function toGrayscaleBase64(imageData) {
 }
 
 // =============================================================================
-// Pattern name lookup table — shape-based names ONLY, zero color words
+// Pattern name lookup table — ALL 50 patterns, shape-based names ONLY
 // Rules:
-//   1. NO color words (no golden, pink, green, dark, black, orange, yellow etc.)
-//   2. 12-J listed BEFORE 10-A so "net","grid","mesh" match garden net first
-//   3. "spiral" alone removed from 3-R — it hijacked spiderweb queries
-//   4. Ambiguous single words removed: "sun", "bubbles", "rings", "chain"
-//   5. findImageByPatternName sorts names by length desc so longer phrases win
+//   1. NO color words (no golden, pink, green, dark, black etc.)
+//   2. Specific multi-word phrases listed before short single words
+//   3. 12-J listed BEFORE 10-A so "net","grid","mesh" match garden net first
+//   4. findImageByPatternName sorts names by length desc so longer phrases win
+//   5. For duplicate board positions (e.g. 10-Q, 9-B), both stickPositions map
+//      to the same image filename — image naming is handled by the knowledge base
 // =============================================================================
 const PATTERN_NAME_MAP = [
-  {
-    image: "3-D.jpeg",
-    names: [
-      "magic bubble chain", "bubble ring chain", "bubble chain",
-      "chain of linked loops", "chain of rings", "linked ring chain",
-      "loopy chain", "bubble ring", "ring chain"
-    ]
-  },
-  {
-    // Listed BEFORE 10-A so "net","grid","mesh" match here first
-    image: "12-J.jpeg",
-    names: [
-      "magic garden fence", "secret garden net",
-      "circular grid", "circular net", "circular mesh",
-      "woven circle", "garden fence", "garden net",
-      "fishing net", "grid pattern", "net pattern",
-      "mesh pattern", "lattice pattern", "woven fence",
-      "square grid", "grid", "net", "lattice", "mesh", "woven"
-    ]
-  },
-  {
-    image: "6-N.jpeg",
-    names: [
-      "princess lace crown", "royal crown", "lace crown",
-      "princess crown", "fancy lace", "lace border",
-      "crown pattern", "lace pattern", "open center crown",
-      "crown", "lace"
-    ]
-  },
-  {
-    image: "7-J.jpeg",
-    names: [
-      "happy little flower", "bouncy flower",
-      "overlapping petals", "loopy petals", "petal flower",
-      "rosette pattern", "loopy flower", "flower pattern",
-      "floral pattern", "flower", "rosette", "petals"
-    ]
-  },
-  {
-    image: "3-R.jpeg",
-    names: [
-      "spinning galaxy swirl", "dense whirlpool",
-      "dense donut", "dense spiral", "packed spiral",
-      "solid ring", "solid donut", "tightly packed lines",
-      "thick donut", "thick ring", "whirlpool pattern",
-      "donut pattern", "whirlpool", "galaxy swirl",
-      "donut", "vortex", "swirl"
-    ]
-  },
-  {
-    image: "10-A.jpeg",
-    names: [
-      "shining spiderweb", "spiderweb mandala",
-      "spiral web like structure", "spiral web like", "spiral web",
-      "web like structure", "web-like structure",
-      "radiating lines", "diamond gaps", "diamond shapes",
-      "starburst pattern", "mandala pattern",
-      "spoke pattern", "diamond web", "web pattern",
-      "spider web", "spiderweb", "web structure",
-      "starburst", "mandala"
-    ]
-  },
+  // ── RING / CHAIN PATTERNS ──────────────────────────────────────────────────
+  { image: "3-D.jpeg",  names: ["magic bubble chain","bubble ring chain","bubble chain","chain of linked loops","chain of rings","linked ring chain","loopy chain","bubble ring","ring chain"] },
+  { image: "1-E.jpeg",  names: ["soapy bubble garland","floating bubble ring","bubble garland","soapy ring","ring of circles","bubble circles","garland of bubbles"] },
+  { image: "2-F.jpeg",  names: ["soap bubble ring","bubble dream ring","faint bubble ring","tiny soap bubbles","gentle bubble ring","quiet bubble ring","dream bubble","soap bubbles floating"] },
+  { image: "9-O.jpeg",  names: ["bird nest ring","cozy bird nest","delicate circle ring","nest of circles","dancing circles ring","thin loop ring","bird nest"] },
+
+  // ── NET / GRID PATTERNS — listed before 10-A so "net","grid","mesh" match first ──
+  { image: "12-J.jpeg", names: ["magic garden fence","secret garden net","circular grid","circular net","circular mesh","woven circle","garden fence","garden net","fishing net","grid pattern","net pattern","mesh pattern","lattice pattern","woven fence","square grid","grid","net","lattice","mesh","woven"] },
+
+  // ── CROWN / LACE PATTERNS ──────────────────────────────────────────────────
+  { image: "6-N.jpeg",  names: ["royal crown lace","princess lace crown","lace crown","lace border","open center crown","fancy lace pattern","crown pattern","lace pattern","crown","lace"] },
+  { image: "4-N.jpeg",  names: ["fancy lace tablecloth","lace tablecloth","lace ring","wavy lace","tablecloth lace","lace weave","fancy lace ring","wavy loop ring","tablecloth"] },
+  { image: "6-Q.jpeg",  names: ["bunny ear ring","bunny ears circle","tall thin loops","upright loop ring","tall loop ring","bunny ears","tall loops circle","bunny ear"] },
+  { image: "4-H.jpeg",  names: ["lacy flower ring","lacy donut ring","lacy ring","lace flower ring","tiny loops ring","hundreds of loops","fancy donut ring","lacy circle","lace donut"] },
+
+  // ── FLOWER PATTERNS ────────────────────────────────────────────────────────
+  { image: "7-J.jpeg",  names: ["happy little flower","petal flower","bouncy flower","overlapping petals","loopy petals","rosette pattern","loopy flower","flower pattern","floral pattern","small flower","compact flower","flower","rosette","petals"] },
+  { image: "1-P.jpeg",  names: ["blooming rose","bold rose","large petal flower","big petal flower","rose pattern","overlapping rose petals","rose bloom","bold flower"] },
+  { image: "14-I.jpeg", names: ["blooming sunburst","garden sunburst","soft petal sunburst","symmetrical sunburst","blooming garden flower","spinning flower","sunburst flower","garden flower"] },
+  { image: "7-C.jpeg",  names: ["fairy stamp flower","eight petal flower","lucky flower","eight petals","eight round petals","stamp flower","clean flower stamp","simple eight petal"] },
+  { image: "2-C.jpeg",  names: ["crystal ball flower","secret crystal garden","magical crystal flower","crystal garden","flower inside crystal","tiny garden flower","crystal ball","hidden flower","secret garden inside"] },
+  { image: "3-L.jpeg",  names: ["birthday cake swirl","swirling petals","cake decoration swirl","swirling flower","curving petals","calm whirlpool petals","fancy petal swirl","swirl petals"] },
+  { image: "3-C.jpeg",  names: ["geometric puzzle bloom","puzzle flower","neat geometric flower","round puzzle loops","geometric bloom","puzzle loops flower","tidy bloom","puzzle pieces flower"] },
+  { image: "14-H.jpeg", names: ["dandelion dream","dandelion petals","skinny dandelion loops","long petal dandelion","dandelion flower","long skinny petals","morning sun petals","dandelion"] },
+  { image: "9-M.jpeg",  names: ["spinning hula hoop","vibrant hula hoop","hula hoop ring","energetic ring","bouncy vibrant ring","hula ring","vibrant ring","hula hoop"] },
+
+  // ── SPIDERWEB / MANDALA ─────────────────────────────────────────────────────
+  { image: "10-A.jpeg", names: ["shining spiderweb","spiderweb mandala","spiral web like structure","spiral web like","spiral web","web like structure","web-like structure","radiating lines","diamond gaps","diamond shapes","starburst pattern","mandala pattern","spoke pattern","diamond web","web pattern","spider web","spiderweb","web structure","starburst","mandala"] },
+  { image: "7-B.jpeg",  names: ["artist spider star","spiderweb star","large loop star","loops crossing middle","spiderweb loops","large crossing loops","artist spider","simple spiderweb star"] },
+  { image: "11-A.jpeg", names: ["royal thread crown","crown of light","thread crown","crossing lines circle","glowing ring crown","shiny thread ring","straight crossing circle","crown of threads"] },
+
+  // ── DENSE / SOLID RING ──────────────────────────────────────────────────────
+  { image: "3-R.jpeg",  names: ["spinning galaxy swirl","dense whirlpool","fuzzy donut","dense donut","packed spiral","solid ring","solid donut","tightly packed lines","thick donut","thick ring","whirlpool pattern","donut pattern","whirlpool","galaxy swirl","vortex","swirl"] },
+  { image: "11-L.jpeg", names: ["giant bold donut","giant donut","solid thick ring","bold donut ring","thick ring with hole","big donut","bold ring","strong donut","giant ring"] },
+  { image: "15-A.jpeg", names: ["spinning scribble wheel","fuzzy tire","scribble wheel","messy circle tire","tire scribbles","dense messy circle","fuzzy wheel","spinning wheel scribble"] },
+  { image: "G-6.jpeg",  names: ["glowing magic coin","spinning badge","magic coin","glowing badge","thread sun","squeezed center badge","glowing coin","tiny spinning sun","badge coin"] },
+  { image: "16-O.jpeg", names: ["deep sea shell","spiraling seashell","seashell tunnel","deep tunnel spiral","busy seashell","spiral seashell","tunnel seashell","deep spiral","seashell"] },
+  { image: "12-C.jpeg", names: ["happy glowing sun","glowing sun","solid sun center","rays all directions","packed sun","dense sun pattern","glowing rays","solid bright sun"] },
+
+  // ── STAR PATTERNS ──────────────────────────────────────────────────────────
+  { image: "8-A.jpeg",  names: ["magic thread snowflake","magic snowflake star","thin star snowflake","delicate snowflake star","snowflake star","magic thread star","thin star","magic snowflake"] },
+  { image: "10-R.jpeg", names: ["magic castle window","castle star window","star window castle","steady star castle","straight line star","strong star","castle window","balanced star"] },
+  // 10-Q has TWO different configurations — each has its own unique image
+  { image: "10-Q-1.jpeg", names: ["ancient mystery star","triangle star","overlapping triangles star","geometric triangle star","mystery star","triangle circle","triangles in circle"] },
+  { image: "10-Q-2.jpeg", names: ["night air sparkle","spinning sparkle","thin rotating points","thin sharp sparkle","fast spinning star","sparkle star","rotating sparkle"] },
+  { image: "6-L.jpeg",  names: ["beautiful tangle","tangle star","complex crossing star","neat tangle","detailed crossing star","crossing line star","complex star tangle","tangle pattern"] },
+  // 9-B has TWO different configurations — each has its own unique image
+  { image: "9-B-1.jpeg",  names: ["treasure map star","compass star","explorer star","long thin star points","skinny star","compass rose star","twinkling compass","star compass","skinny star points"] },
+  { image: "4-P.jpeg",  names: ["royal star crown","star crown","pointy star crown","star crown border","triangular crown","sharp triangle crown","king queen crown star","crown star"] },
+  { image: "2-J.jpeg",  names: ["star bicycle wheel","star wheel","bicycle wheel stars","thin crisp star ring","neat star ring","round star path","bicycle wheel","star ring"] },
+  { image: "15-Q.jpeg", names: ["dancing loop ring","criss cross loop ring","criss crossing loops","magical loop ring","hundreds of tiny loops","criss cross ring","loop dance ring","dancing loops circle"] },
+  { image: "9-B-2.jpeg",  names: ["explorer medal","double star knot","two stars tied","two stars knot","brave explorer medal","double star","medal star","explorer medal star"] },
+
+  // ── SPIRAL / SWIRL / CURVES ─────────────────────────────────────────────────
+  { image: "4-C.jpeg",  names: ["candy swirl","lollipop spiral","lollipop candy","sweet spiral","converging spiral","candy shop spiral","lollipop pattern","candy lollipop"] },
+  { image: "5-L.jpeg",  names: ["deep ocean swirl","ocean whirlpool","bold wave swirl","ocean wave circle","swooping wave circle","water whirlpool","ocean swirl","bold waves","wave circle"] },
+  { image: "16-L.jpeg", names: ["giant snowflake","magical snowflake","smooth snowflake","sweeping snowflake curves","flowy snowflake","giant flowy snowflake","large snowflake","smooth curves snowflake"] },
+  { image: "11-C.jpeg", names: ["spinning fan","fan blades","fan blade pattern","curved fan lines","breezy fan","fan rotation","sweeping fan blades","cool fan pattern"] },
+  { image: "2-M.jpeg",  names: ["giant clock gear","clock gear","gear teeth","clock gear teeth","sharp gear teeth","mechanical gear","ticking gear","clock mechanism"] },
+  { image: "2-P.jpeg",  names: ["butterfly catcher","butterfly net","wide crossing loops","airy loop net","open space loops","wide loop net","net for butterflies","bouncing ball loops"] },
+  { image: "15-F.jpeg", names: ["spinning sawblade","sawblade gear","futuristic gear","zigzag spinning","sawblade pattern","fast spinning blade","zigzag gear","rotating sawblade"] },
+  { image: "13-R.jpeg", names: ["happy dancing loops","dancer loops","loose playful loops","messy fun loops","dancer spinning","playful messy pattern","dancer stage loops","loose loops"] },
+  { image: "1-H.jpeg",  names: ["lucky pinecone","pinecone shield","pinecone scales","overlapping scales","spinning shield scales","pinecone pattern","scale pattern","pinecone"] },
+  { image: "1-I.jpeg",  names: ["tunnel of light","light tunnel","thread tunnel","woven light tunnel","woven thread circle","thread path circle","intricate thread ring","light path tunnel"] },
+  { image: "7-A.jpeg",  names: ["fluffy dandelion","dandelion fluff","fuzzy dandelion","soft fluffy pattern","lines reaching out fluffy","dandelion wind","soft fluffy star","fluffy reaching lines"] },
+  { image: "7-H.jpeg",  names: ["christmas wreath","cozy wreath","thick wreath","heavy round wreath","overlapping circles wreath","wreath pattern","front door wreath","overlapping circle ring","round wreath"] },
 ];
 
 function findImageByPatternName(queryText) {
@@ -277,8 +282,26 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
   try {
     const clean = raw.replace(/```json|```/g, "").trim();
     const parsed = JSON.parse(clean);
-    const known = ["12-J", "10-A", "7-J", "6-N", "3-R", "3-D"];
-    if (parsed?.boardPosition && known.includes(parsed.boardPosition)) return parsed;
+    const known = ["3-D","12-J","6-N","7-J","3-R","10-A","9-M","2-P","4-P","4-N","1-P","15-A","2-J","16-L","9-B","2-F","2-C","4-C","5-L","6-Q","11-C","16-O","7-B","14-H","15-F","1-H","11-A","9-O","11-J","14-I","7-C","8-A","12-C","7-H","3-L","2-M","1-E","13-R","3-C","1-I","7-A","11-L","10-R","10-Q","6-L","4-H","G-6","15-Q"];
+    if (!parsed?.boardPosition || !known.includes(parsed.boardPosition)) return null;
+
+    // Boards with MULTIPLE configurations — disambiguated with -1 / -2 suffix
+    // 10-Q sticks 1-1 → 10-Q-1.jpeg  |  10-Q sticks 1-2 → 10-Q-2.jpeg
+    // 9-B  sticks 4-2 → 9-B-1.jpeg   |  9-B  sticks 2-1 → 9-B-2.jpeg
+    const multiConfigMap = {
+      "10-Q": { "1-1": "10-Q-1.jpeg", "1-2": "10-Q-2.jpeg" },
+      "9-B":  { "4-2": "9-B-1.jpeg",  "2-1": "9-B-2.jpeg"  },
+    };
+
+    let patternImage;
+    const boardMap = multiConfigMap[parsed.boardPosition];
+    if (boardMap && parsed.stickPosition && boardMap[parsed.stickPosition]) {
+      patternImage = boardMap[parsed.stickPosition];
+    } else {
+      patternImage = `${parsed.boardPosition}.jpeg`;
+    }
+
+    return { boardPosition: parsed.boardPosition, stickPosition: parsed.stickPosition, patternImage };
   } catch (_) {}
   return null;
 }
@@ -470,18 +493,40 @@ module.exports = async function handler(req, res) {
 
         // Strategies 1-4: text-only path (no image, or classifier failed)
         if (!grayscaleImageUrl || patternImages.length === 0) {
-          const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-r])\b/i);
+          const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-z])\b/i)
+            || queryText.match(/\b(g-[0-9])\b/i);  // handle G-6 style boards
           const askedBoard = boardMatch?.[1]?.toUpperCase();
-          const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]-[0-9])/i)
-            || queryText.match(/\b([0-9]-[0-9])\b/);
+          const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
+            || queryText.match(/position[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
+            || queryText.match(/\b([0-9]+-[0-9]+)\b/);
           const askedStick = stickMatch?.[1];
 
           if (askedBoard || askedStick) {
-            const exactChunk = configChunks.find(c => {
-              const boardOk = askedBoard ? (c.boardPosition || "").toUpperCase() === askedBoard : false;
-              const stickOk = askedStick ? c.stickPosition === askedStick : false;
-              return boardOk || stickOk;
-            });
+            // Find which boards have multiple configs — these require BOTH board+stick to resolve
+            const boardCounts = {};
+            configChunks.forEach(c => { boardCounts[c.boardPosition] = (boardCounts[c.boardPosition] || 0) + 1; });
+
+            let exactChunk = null;
+            if (askedBoard && askedStick) {
+              // Best case: both provided — exact match
+              exactChunk = configChunks.find(c =>
+                (c.boardPosition || "").toUpperCase() === askedBoard &&
+                c.stickPosition === askedStick
+              );
+            }
+            if (!exactChunk && askedBoard) {
+              // Board only — only safe if that board has exactly ONE config
+              const boardUpper = askedBoard;
+              const boardMatches = configChunks.filter(c => (c.boardPosition || "").toUpperCase() === boardUpper);
+              if (boardMatches.length === 1) {
+                exactChunk = boardMatches[0];
+              }
+              // If multiple configs exist for same board, we can't resolve without stick — leave null
+            }
+            if (!exactChunk && askedStick && !askedBoard) {
+              // Stick only — match on stick position alone
+              exactChunk = configChunks.find(c => c.stickPosition === askedStick);
+            }
             patternImages = exactChunk?.patternImage ? [exactChunk.patternImage] : [];
           } else {
             const nameMatchedImage = findImageByPatternName(queryText);
@@ -615,13 +660,72 @@ When a user asks about a specific configuration or pattern name, ALWAYS answer w
   - Difficulty level
   - Tell them: "The pattern picture will appear below my response automatically! 🎨"
 
-PATTERN FUN NAMES (always use these when describing patterns to kids):
-  - Board 3-D,  Sticks 3-3 → "The Magic Bubble Chain 🫧"    (Bubble Ring Chain)
-  - Board 12-J, Sticks 5-5 → "The Magic Garden Fence 🌿"    (Garden Net)
-  - Board 6-N,  Sticks 5-6 → "The Royal Crown 👑"           (Lace Crown)
-  - Board 7-J,  Sticks 1-1 → "The Happy Little Flower 🌸"   (Petal Flower)
-  - Board 3-R,  Sticks 4-2 → "The Spinning Galaxy Swirl 🌀" (Dense Whirlpool)
-  - Board 10-A, Sticks 4-4 → "The Shining Spiderweb ✨"     (Spiderweb Mandala)
+ALL 50 PATTERN FUN NAMES (use these when describing patterns to kids):
+  Ring / Chain:
+  - Board 3-D,  Sticks 3-3 → "The Magic Bubble Chain 🫧"        (Bubble Ring Chain)
+  - Board 1-E,  Sticks 4-4 → "The Floating Bubble Ring 🫧"      (Soapy Bubble Garland)
+  - Board 2-F,  Sticks 3-3 → "The Bubble Dream Ring 🫧"         (Soap Bubble Ring)
+  - Board 9-O,  Sticks 5-5 → "The Cozy Bird Nest 🐦"            (Bird Nest Ring)
+
+  Net / Grid:
+  - Board 12-J, Sticks 5-5 → "The Magic Garden Fence 🌿"        (Garden Net)
+
+  Crown / Lace:
+  - Board 6-N,  Sticks 5-6 → "The Royal Crown 👑"               (Lace Crown)
+  - Board 4-N,  Sticks 5-5 → "The Fancy Lace Ring 🎀"           (Lace Tablecloth)
+  - Board 6-Q,  Sticks 5-4 → "The Bunny Ears Circle 🐰"         (Bunny Ear Ring)
+  - Board 4-H,  Sticks 3-6 → "The Lacy Donut Ring 🍩"           (Lacy Flower Ring)
+
+  Flower:
+  - Board 7-J,  Sticks 1-1 → "The Happy Little Flower 🌸"       (Petal Flower)
+  - Board 1-P,  Sticks 4-4 → "The Blooming Rose 🌹"             (Bold Rose)
+  - Board 14-I, Sticks 4-4 → "The Blooming Sunburst 🌻"         (Garden Sunburst)
+  - Board 7-C,  Sticks 2-2 → "The Fairy Stamp Flower 🧚"        (Eight Petal Flower)
+  - Board 2-C,  Sticks 2-2 → "The Secret Crystal Garden 🔮"     (Crystal Ball Flower)
+  - Board 3-L,  Sticks 1-5 → "The Birthday Cake Swirl 🎂"       (Swirling Petals)
+  - Board 3-C,  Sticks 3-3 → "The Geometric Puzzle Bloom 🧩"    (Puzzle Flower)
+  - Board 14-H, Sticks 4-3 → "The Dandelion Dream 🌼"           (Dandelion Petals)
+  - Board 9-M,  Sticks 2-7 → "The Spinning Hula Hoop 🌈"        (Vibrant Hula Hoop)
+
+  Spiderweb / Mandala:
+  - Board 10-A, Sticks 4-4 → "The Shining Spiderweb ✨"         (Spiderweb Mandala)
+  - Board 7-B,  Sticks 7-4 → "The Artist Spider Star 🕷️"        (Spiderweb Star)
+  - Board 11-A, Sticks 6-6 → "The Royal Thread Crown 👑"        (Crown of Light)
+
+  Dense / Solid Ring:
+  - Board 3-R,  Sticks 4-2 → "The Spinning Galaxy Swirl 🌀"     (Dense Whirlpool)
+  - Board 11-L, Sticks 1-1 → "The Giant Bold Donut 🍩"          (Giant Donut)
+  - Board 15-A, Sticks 4-6 → "The Spinning Scribble Wheel 🛞"   (Fuzzy Tire)
+  - Board G-6,  Sticks 1-2 → "The Glowing Magic Coin 🪙"        (Spinning Badge)
+  - Board 16-O, Sticks 6-3 → "The Deep Sea Shell 🐚"            (Spiraling Seashell)
+  - Board 12-C, Sticks 3-1 → "The Happy Glowing Sun ☀️"         (Glowing Sun)
+
+  Star:
+  - Board 8-A,  Sticks 3-2 → "The Magic Thread Snowflake ✨"    (Magic Snowflake Star)
+  - Board 10-R, Sticks 1-1 → "The Magic Castle Window 🏰"       (Castle Star Window)
+  - Board 10-Q, Sticks 1-1 → "The Ancient Mystery Star 🔯"      (Triangle Star)
+  - Board 10-Q, Sticks 1-2 → "The Night Air Sparkle ✨"         (Spinning Sparkle)
+  - Board 6-L,  Sticks 1-1 → "The Beautiful Tangle ⭐"          (Tangle Star)
+  - Board 9-B,  Sticks 4-2 → "The Treasure Map Star ⭐"         (Compass Star)
+  - Board 9-B,  Sticks 2-1 → "The Explorer's Medal 🎖️"          (Double Star Knot)
+  - Board 4-P,  Sticks 4-5 → "The Royal Star Crown 👸"          (Star Crown)
+  - Board 2-J,  Sticks 6-6 → "The Star Wheel 🚲"               (Star Bicycle Wheel)
+  - Board 15-Q, Sticks 2-1 → "The Dancing Loop Ring 💫"         (Criss-Cross Loop Ring)
+
+  Spiral / Swirl / Other:
+  - Board 4-C,  Sticks 2-2 → "The Candy Swirl 🍭"              (Lollipop Spiral)
+  - Board 5-L,  Sticks 6-5 → "The Deep Ocean Swirl 🌊"          (Ocean Whirlpool)
+  - Board 16-L, Sticks 4-6 → "The Giant Snowflake ❄️"           (Magical Snowflake)
+  - Board 11-C, Sticks 5-1 → "The Spinning Fan 🌀"              (Fan Blades)
+  - Board 2-M,  Sticks 1-5 → "The Giant Clock Gear ⏰"          (Clock Gear)
+  - Board 2-P,  Sticks 6-6 → "The Butterfly Catcher 🦋"         (Butterfly Net)
+  - Board 15-F, Sticks 5-3 → "The Spinning Sawblade ⚙️"         (Sawblade Gear)
+  - Board 13-R, Sticks 4-2 → "The Happy Dancing Loops 💃"       (Dancer's Loops)
+  - Board 1-H,  Sticks 3-5 → "The Lucky Pinecone 🌲"            (Pinecone Shield)
+  - Board 1-I,  Sticks 4-3 → "The Tunnel of Light 🌟"           (Light Tunnel)
+  - Board 7-A,  Sticks 1-2 → "The Fluffy Dandelion ☁️"          (Dandelion Fluff)
+  - Board 7-H,  Sticks 3-3 → "The Christmas Wreath 🎄"          (Cozy Wreath)
+  - Board 11-J, Sticks 4-4 → "The Fancy Woven Tire 🍩"          (Woven Donut)
 
 ================================================================================
 RULE ZERO — COLOR DOES NOT EXIST IN THIS IMAGE
@@ -635,16 +739,17 @@ VISUAL ANALYSIS CHECKLIST — when image is uploaded
 ================================================================================
 
 STEP 1 — CENTER HOLE (most reliable test):
-  Sharp pointed/star-shaped corners? → GARDEN NET  → Board 12-J, Sticks 5-5
-  Nearly solid ring, almost no hole? → WHIRLPOOL   → Board 3-R,  Sticks 4-2
-  Smooth perfectly round hole?       → Go to Step 2
+  Sharp pointed/star-shaped corners?    → GARDEN NET  → Board 12-J
+  Nearly solid — tiny or no hole?       → DENSE RING  → Board 3-R / 11-L / 15-A / G-6
+  Smooth perfectly round open hole?     → Go to Step 2
 
 STEP 2 — LINE STRUCTURE:
-  Grid/mesh of crossing lines, square gaps?         → GARDEN NET   → Board 12-J
-  Spokes radiating from center, diamond gaps?       → SPIDERWEB    → Board 10-A
-  Overlapping loopy petals meeting at center?       → FLOWER       → Board 7-J
-  Loops only on outer edge, huge empty center?      → CROWN        → Board 6-N
-  Linked bubble loops forming a chain circle?       → BUBBLE CHAIN → Board 3-D
+  Grid / mesh of crossing lines, square gaps?         → GARDEN NET      → Board 12-J
+  Spokes radiating from center, diamond gaps?         → SPIDERWEB       → Board 10-A
+  Overlapping loopy petals meeting at center?         → FLOWER          → Board 7-J / 1-P / 14-I / 7-C
+  Loops only on outer edge, large empty center?       → CROWN / LACE    → Board 6-N / 6-Q / 4-N
+  Linked bubble / O shapes in a chain circle?         → BUBBLE CHAIN    → Board 3-D / 1-E / 2-F
+  Sharp points radiating outward as a star?           → STAR PATTERN    → Board 10-R / 10-Q / 8-A / 9-B
 
 STEP 3 — GARDEN NET vs SPIDERWEB tiebreaker:
   Center has sharp pointed star corners? → GARDEN NET → Board 12-J
