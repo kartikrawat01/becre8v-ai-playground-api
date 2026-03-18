@@ -215,49 +215,178 @@ function findImageByPatternName(queryText) {
 // Receives a GRAYSCALE image — color already eliminated before this call.
 // temperature=0 + JSON-only output = deterministic, reliable classification.
 // =============================================================================
-const VISION_CLASSIFIER_PROMPT = `You are a Spin Genius pattern classifier. You will be shown a GRAYSCALE spirograph pattern image.
+// =============================================================================
+// EXACT PATTERN LOOKUP TABLE — hardcoded from spingenius.json
+// This is the single source of truth for board+stick → image mapping.
+// No Pinecone ranking involved — always exact, never "closest match".
+// When classifier identifies a board, this table gives the precise image.
+// =============================================================================
+const PATTERN_LOOKUP = {
+  "3-D|3-3":   { patternImage: "3-D.jpeg",    patternName: "Bubble Ring Chain",    funName: "The Magic Bubble Chain 🫧" },
+  "12-J|5-5":  { patternImage: "12-J.jpeg",   patternName: "Garden Net",           funName: "The Magic Garden Fence 🌿" },
+  "6-N|5-6":   { patternImage: "6-N.jpeg",    patternName: "Lace Crown",           funName: "The Royal Crown 👑" },
+  "7-J|1-1":   { patternImage: "7-J.jpeg",    patternName: "Petal Flower",         funName: "The Happy Little Flower 🌸" },
+  "3-R|4-2":   { patternImage: "3-R.jpeg",    patternName: "Dense Whirlpool",      funName: "The Spinning Galaxy Swirl 🌀" },
+  "10-A|4-4":  { patternImage: "10-A.jpeg",   patternName: "Spiderweb Mandala",    funName: "The Shining Spiderweb ✨" },
+  "9-M|2-7":   { patternImage: "9-M.jpeg",    patternName: "Vibrant Hula Hoop",    funName: "The Spinning Hula Hoop 🌈" },
+  "2-P|6-6":   { patternImage: "2-P.jpeg",    patternName: "Butterfly Net",        funName: "The Butterfly Catcher 🦋" },
+  "4-P|4-5":   { patternImage: "4-P.jpeg",    patternName: "Star Crown",           funName: "The Royal Star Crown 👸" },
+  "4-N|5-5":   { patternImage: "4-N.jpeg",    patternName: "Lace Tablecloth",      funName: "The Fancy Lace Ring 🎀" },
+  "1-P|4-4":   { patternImage: "1-P.jpeg",    patternName: "Bold Rose",            funName: "The Blooming Rose 🌹" },
+  "15-A|4-6":  { patternImage: "15-A.jpeg",   patternName: "Fuzzy Tire",           funName: "The Spinning Scribble Wheel 🛞" },
+  "2-J|6-6":   { patternImage: "2-J.jpeg",    patternName: "Star Bicycle Wheel",   funName: "The Star Wheel 🚲" },
+  "16-L|4-6":  { patternImage: "16-L.jpeg",   patternName: "Magical Snowflake",    funName: "The Giant Snowflake ❄️" },
+  "9-B|4-2":   { patternImage: "9-B-1.jpeg",  patternName: "Compass Star",         funName: "The Treasure Map Star ⭐" },
+  "2-F|3-3":   { patternImage: "2-F.jpeg",    patternName: "Soap Bubble Ring",     funName: "The Bubble Dream Ring 🫧" },
+  "2-C|2-2":   { patternImage: "2-C.jpeg",    patternName: "Crystal Ball Flower",  funName: "The Secret Crystal Garden 🔮" },
+  "4-C|2-2":   { patternImage: "4-C.jpeg",    patternName: "Lollipop Spiral",      funName: "The Candy Swirl 🍭" },
+  "5-L|6-5":   { patternImage: "5-L.jpeg",    patternName: "Ocean Whirlpool",      funName: "The Deep Ocean Swirl 🌊" },
+  "6-Q|5-4":   { patternImage: "6-Q.jpeg",    patternName: "Bunny Ear Ring",       funName: "The Bunny Ears Circle 🐰" },
+  "11-C|5-1":  { patternImage: "11-C.jpeg",   patternName: "Fan Blades",           funName: "The Spinning Fan 🌀" },
+  "16-O|6-3":  { patternImage: "16-O.jpeg",   patternName: "Spiraling Seashell",   funName: "The Deep Sea Shell 🐚" },
+  "7-B|7-4":   { patternImage: "7-B.jpeg",    patternName: "Spiderweb Star",       funName: "The Artist Spider Star 🕷️" },
+  "14-H|4-3":  { patternImage: "14-H.jpeg",   patternName: "Dandelion Petals",     funName: "The Dandelion Dream 🌼" },
+  "15-F|5-3":  { patternImage: "15-F.jpeg",   patternName: "Sawblade Gear",        funName: "The Spinning Sawblade ⚙️" },
+  "1-H|3-5":   { patternImage: "1-H.jpeg",    patternName: "Pinecone Shield",      funName: "The Lucky Pinecone 🌲" },
+  "11-A|6-6":  { patternImage: "11-A.jpeg",   patternName: "Crown of Light",       funName: "The Royal Thread Crown 👑" },
+  "9-O|5-5":   { patternImage: "9-O.jpeg",    patternName: "Bird Nest Ring",       funName: "The Cozy Bird Nest 🐦" },
+  "11-J|4-4":  { patternImage: "11-J.jpeg",   patternName: "Woven Donut",          funName: "The Fancy Woven Tire 🍩" },
+  "14-I|4-4":  { patternImage: "14-I.jpeg",   patternName: "Garden Sunburst",      funName: "The Blooming Sunburst 🌻" },
+  "7-C|2-2":   { patternImage: "7-C.jpeg",    patternName: "Eight Petal Flower",   funName: "The Fairy Stamp Flower 🧚" },
+  "8-A|3-2":   { patternImage: "8-A.jpeg",    patternName: "Magic Snowflake Star", funName: "The Magic Thread Snowflake ✨" },
+  "12-C|3-1":  { patternImage: "12-C.jpeg",   patternName: "Glowing Sun",          funName: "The Happy Glowing Sun ☀️" },
+  "7-H|3-3":   { patternImage: "7-H.jpeg",    patternName: "Cozy Wreath",          funName: "The Christmas Wreath 🎄" },
+  "3-L|1-5":   { patternImage: "3-L.jpeg",    patternName: "Swirling Petals",      funName: "The Birthday Cake Swirl 🎂" },
+  "2-M|1-5":   { patternImage: "2-M.jpeg",    patternName: "Clock Gear",           funName: "The Giant Clock Gear ⏰" },
+  "1-E|4-4":   { patternImage: "1-E.jpeg",    patternName: "Soapy Bubble Garland", funName: "The Floating Bubble Ring 🫧" },
+  "13-R|4-2":  { patternImage: "13-R.jpeg",   patternName: "Dancer's Loops",       funName: "The Happy Dancing Loops 💃" },
+  "3-C|3-3":   { patternImage: "3-C.jpeg",    patternName: "Puzzle Flower",        funName: "The Geometric Puzzle Bloom 🧩" },
+  "1-I|4-3":   { patternImage: "1-I.jpeg",    patternName: "Light Tunnel",         funName: "The Tunnel of Light 🌟" },
+  "7-A|1-2":   { patternImage: "7-A.jpeg",    patternName: "Dandelion Fluff",      funName: "The Fluffy Dandelion ☁️" },
+  "11-L|1-1":  { patternImage: "11-L.jpeg",   patternName: "Giant Donut",          funName: "The Giant Bold Donut 🍩" },
+  "10-R|1-1":  { patternImage: "10-R.jpeg",   patternName: "Castle Star Window",   funName: "The Magic Castle Window 🏰" },
+  "10-Q|1-1":  { patternImage: "10-Q-1.jpeg", patternName: "Triangle Star",        funName: "The Ancient Mystery Star 🔯" },
+  "6-L|1-1":   { patternImage: "6-L.jpeg",    patternName: "Tangle Star",          funName: "The Beautiful Tangle ⭐" },
+  "10-Q|1-2":  { patternImage: "10-Q-2.jpeg", patternName: "Spinning Sparkle",     funName: "The Night Air Sparkle ✨" },
+  "9-B|2-1":   { patternImage: "9-B-2.jpeg",  patternName: "Double Star Knot",     funName: "The Explorer's Medal 🎖️" },
+  "4-H|3-6":   { patternImage: "4-H.jpeg",    patternName: "Lacy Flower Ring",     funName: "The Lacy Donut Ring 🍩" },
+  "G-6|1-2":   { patternImage: "G-6.jpeg",    patternName: "Spinning Badge",       funName: "The Glowing Magic Coin 🪙" },
+  "15-Q|2-1":  { patternImage: "15-Q.jpeg",   patternName: "Criss-Cross Loop Ring",funName: "The Dancing Loop Ring 💫" },
+};
 
-Your ONLY job: identify which of the 6 known patterns is shown and return a JSON object.
-The image is grayscale on purpose — identify by GEOMETRY AND LINE STRUCTURE ONLY.
+// Lookup by board only (for cases where only board is known, no stick)
+// Returns the entry if that board has exactly ONE configuration, else null.
+function lookupByBoard(board) {
+  const upper = board.toUpperCase();
+  const matches = Object.entries(PATTERN_LOOKUP).filter(([k]) => k.startsWith(upper + "|"));
+  return matches.length === 1 ? matches[0][1] : null;
+}
 
-THE 6 KNOWN PATTERNS:
+// Lookup by board+stick — always exact, never approximate
+function lookupExact(board, stick) {
+  const key = `${board.toUpperCase()}|${stick}`;
+  return PATTERN_LOOKUP[key] || null;
+}
 
-PATTERN A — Board 12-J, Sticks 5-5, Image: 12-J.jpeg
-  Structure: Lines cross forming a repeating GRID or MESH all the way around a circle.
-  Gap shape: SQUARE or rectangular.
-  Center hole: STAR-SHAPED / POLYGON with sharp pointed corners pointing inward.
-  Think: graph paper bent into a ring. Star-shaped center = strongest identifier.
+// =============================================================================
+// Vision Pattern Classifier — category-based for all 50 patterns
+// Receives GRAYSCALE image. temperature=0, JSON-only output.
+// Returns boardPosition + stickPosition. Image filename resolved via PATTERN_LOOKUP.
+// =============================================================================
+const VISION_CLASSIFIER_PROMPT = `You are a Spin Genius pattern classifier. You will be shown a GRAYSCALE spirograph pattern drawn on paper.
+The image is grayscale — identify by GEOMETRY AND LINE STRUCTURE ONLY. Color does not exist.
 
-PATTERN B — Board 10-A, Sticks 4-4, Image: 10-A.jpeg
-  Structure: Thin lines RADIATE outward from center like wheel spokes.
-  Gap shape: DIAMOND or rhombus shaped.
-  Center hole: SMOOTH PERFECTLY ROUND — zero sharp corners, no star shape.
+YOUR JOB: Identify the board position and stick position from the list below.
 
-PATTERN C — Board 7-J, Sticks 1-1, Image: 7-J.jpeg
-  Structure: Several loopy PETAL shapes overlapping, all meeting at center.
-  Small compact rosette / doodle flower shape.
+══════════════════════════════════════════════════
+VISUAL CATEGORY GUIDE
+══════════════════════════════════════════════════
 
-PATTERN D — Board 6-N, Sticks 5-6, Image: 6-N.jpeg
-  Structure: Decorative loops ONLY on the outer edge.
-  The entire center is a vast open empty space. Like a crown or lacy border.
+CAT-1 NET/GRID — Lines cross forming a grid/mesh ring. Gaps are SQUARE. Center hole has SHARP STAR/POLYGON corners (pointed tips pointing inward like a star).
+  Board: 12-J  Sticks: 5-5
 
-PATTERN E — Board 3-R, Sticks 4-2, Image: 3-R.jpeg
-  Structure: Lines packed SO tightly the ring looks nearly SOLID.
-  Thick dense donut. Almost no empty space in the ring anywhere.
+CAT-2 SPIDERWEB/SPOKE — Straight lines radiate from center like wheel spokes. Gaps are DIAMOND shaped. Center is SMOOTH ROUND (no sharp corners).
+  Boards: 10-A(4-4)  7-B(7-4)  11-A(6-6)  8-A(3-2)  10-R(1-1)  10-Q(1-1 or 1-2)  6-L(1-1)  9-B(4-2 or 2-1)  4-P(4-5)  2-J(6-6)  15-Q(2-1)
 
-PATTERN F — Board 3-D, Sticks 3-3, Image: 3-D.jpeg
-  Structure: Round bubble loops LINKED together like a chain forming one large circle.
+CAT-3 FLOWER/PETAL — Curved petal shapes bow outward and meet at center. Center is open and round.
+  Boards: 7-J(1-1)  1-P(4-4)  14-I(4-4)  7-C(2-2)  2-C(2-2)  3-L(1-5)  3-C(3-3)  14-H(4-3)  9-M(2-7)  7-H(3-3)  11-J(4-4)
 
-DECISION STEPS — follow in order, stop at first match:
-1. Center hole has SHARP POINTED star/polygon corners?     → PATTERN A (12-J)
-2. Ring looks nearly solid, almost no gaps at all?         → PATTERN E (3-R)
-3. Lines radiate from center + diamond gaps + round hole?  → PATTERN B (10-A)
-4. Overlapping loopy petals meeting at center?             → PATTERN C (7-J)
-5. Loops only on outer edge, huge empty center?            → PATTERN D (6-N)
-6. Linked bubble/ring shapes in a chain circle?            → PATTERN F (3-D)
+CAT-4 CROWN/LACE — Decorative loops ONLY on the outer edge. Entire center is one large empty open space.
+  Boards: 6-N(5-6)  4-N(5-5)  6-Q(5-4)  4-H(3-6)  2-P(6-6)
 
-Respond ONLY with valid JSON — no other text whatsoever:
-{"boardPosition":"12-J","stickPosition":"5-5","patternImage":"12-J.jpeg"}`;
+CAT-5 DENSE SOLID RING — Ring band looks nearly SOLID. Lines packed so tightly almost no gaps are visible in the ring itself.
+  Boards: 3-R(4-2)  11-L(1-1)  15-A(4-6)  G-6(1-2)  16-O(6-3)  12-C(3-1)
+
+CAT-6 BUBBLE/CHAIN — Distinct round O-shaped or bubble loops linked together forming one large circle.
+  Boards: 3-D(3-3)  1-E(4-4)  2-F(3-3)  9-O(5-5)
+
+CAT-7 SPIRAL/SWIRL/CURVE — Sweeping curved lines that spiral or swirl. Not straight spokes, not petals.
+  Boards: 4-C(2-2)  5-L(6-5)  11-C(5-1)  2-M(1-5)  15-F(5-3)  13-R(4-2)  16-L(4-6)  3-L(1-5)
+
+CAT-8 FUZZY/DANDELION — Many tiny thin lines reaching outward loosely. Airy and fuzzy.
+  Boards: 7-A(1-2)  1-H(3-5)  1-I(4-3)
+
+══════════════════════════════════════════════════
+DECISION STEPS
+══════════════════════════════════════════════════
+
+STEP 1 — CENTER HOLE shape:
+  Sharp star/polygon corners pointing inward? → CAT-1 → 12-J sticks 5-5
+  Ring nearly solid, tiny or no hole?         → CAT-5 → pick densest match
+  Smooth perfectly round open hole?           → go to STEP 2
+
+STEP 2 — LINE TYPE:
+  Straight spokes radiating out, diamond gaps?  → CAT-2
+  Curved petals bowing out, meeting at center?  → CAT-3
+  Loops only on outer edge, empty center?       → CAT-4
+  Distinct round bubbles linked in a chain?     → CAT-6
+  Sweeping curves / spiraling lines?            → CAT-7
+  Tiny fuzzy lines radiating loosely outward?   → CAT-8
+
+STEP 3 — WITHIN CAT-2 (Spiderweb/Spoke), pick exact board:
+  Few long thin spokes, very sparse, large open center?           → 9-B sticks 4-2
+  Many crossing lines forming diamond web, medium open center?    → 10-A sticks 4-4
+  Overlapping large loops crossing in middle like star?           → 7-B sticks 7-4
+  Sharp triangular star points, overlapping triangles?            → 10-Q sticks 1-1
+  Thin rotating sharp points, very fine sparkle star?             → 10-Q sticks 1-2
+  Simple straight balanced star, few straight arms?               → 10-R sticks 1-1
+  Complex crossing lines, detailed tangle/knot star?              → 6-L sticks 1-1
+  Two star shapes tied like a knot?                               → 9-B sticks 2-1
+  Dense ring of straight crossing lines, no open center?          → 11-A sticks 6-6
+
+STEP 4 — WITHIN CAT-3 (Flower/Petal), pick exact board:
+  Small compact rosette, few petals, simple doodle flower?        → 7-J sticks 1-1
+  Eight equal round petals, clean and symmetrical?                → 7-C sticks 2-2
+  Large bold overlapping petals like a rose?                      → 1-P sticks 4-4
+  Sunburst with many soft petals spinning outward?                → 14-I sticks 4-4
+  Long skinny dandelion-like petals reaching out?                 → 14-H sticks 4-3
+  Small flower inside a circular frame, crystal-like?             → 2-C sticks 2-2
+  Curved petals swirling like a birthday cake decoration?         → 3-L sticks 1-5
+  Round puzzle-like loops fitting together in bloom?              → 3-C sticks 3-3
+  Thick energetic hula-hoop-like ring, bouncy loops?              → 9-M sticks 2-7
+  Heavy thick overlapping circles like a wreath?                  → 7-H sticks 3-3
+  Woven donut with perfectly overlapping lines?                   → 11-J sticks 4-4
+
+STEP 5 — WITHIN CAT-5 (Dense), pick exact board:
+  Very thick solid donut, ring completely filled?                 → 3-R sticks 4-2
+  Solid thick bold ring, very clean edges?                        → 11-L sticks 1-1
+  Messy fuzzy scribbled tire shape?                               → 15-A sticks 4-6
+  Dense spiraling seashell, deep tunnel effect?                   → 16-O sticks 6-3
+  Tiny dense badge/coin shape, small and centered?                → G-6 sticks 1-2
+  Dense center with rays spreading outward like a sun?            → 12-C sticks 3-1
+
+══════════════════════════════════════════════════
+CRITICAL RULES — never break these
+══════════════════════════════════════════════════
+- NEVER output 12-J unless center has SHARP STAR/POLYGON corners AND lines form a grid/mesh
+- NEVER output 3-R unless ring looks nearly completely solid with almost no gaps at all
+- Straight radiating lines + round center = CAT-2, NOT 12-J
+- Curved petals meeting at center = CAT-3, NOT 12-J and NOT 3-R
+- If unsure between two boards in same category, pick the one whose description fits better
+- ALWAYS output a valid board from the lists above — never invent a new one
+
+Respond ONLY with valid JSON, no other text:
+{"boardPosition":"10-A","stickPosition":"4-4","patternImage":"10-A.jpeg"}`;
 
 async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
   const r = await fetch(OPENAI_CHAT_URL, {
@@ -266,7 +395,7 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
     body: JSON.stringify({
       model: "gpt-4o-mini",
       temperature: 0,
-      max_tokens: 60,
+      max_tokens: 80,
       messages: [{
         role: "user",
         content: [
@@ -282,26 +411,24 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
   try {
     const clean = raw.replace(/```json|```/g, "").trim();
     const parsed = JSON.parse(clean);
-    const known = ["3-D","12-J","6-N","7-J","3-R","10-A","9-M","2-P","4-P","4-N","1-P","15-A","2-J","16-L","9-B","2-F","2-C","4-C","5-L","6-Q","11-C","16-O","7-B","14-H","15-F","1-H","11-A","9-O","11-J","14-I","7-C","8-A","12-C","7-H","3-L","2-M","1-E","13-R","3-C","1-I","7-A","11-L","10-R","10-Q","6-L","4-H","G-6","15-Q"];
-    if (!parsed?.boardPosition || !known.includes(parsed.boardPosition)) return null;
+    if (!parsed?.boardPosition) return null;
 
-    // Boards with MULTIPLE configurations — disambiguated with -1 / -2 suffix
-    // 10-Q sticks 1-1 → 10-Q-1.jpeg  |  10-Q sticks 1-2 → 10-Q-2.jpeg
-    // 9-B  sticks 4-2 → 9-B-1.jpeg   |  9-B  sticks 2-1 → 9-B-2.jpeg
-    const multiConfigMap = {
-      "10-Q": { "1-1": "10-Q-1.jpeg", "1-2": "10-Q-2.jpeg" },
-      "9-B":  { "4-2": "9-B-1.jpeg",  "2-1": "9-B-2.jpeg"  },
+    // Use PATTERN_LOOKUP as the single source of truth for image filename.
+    // Never trust the patternImage field the classifier returns — look it up exactly.
+    const stick = parsed.stickPosition || "";
+    let entry = lookupExact(parsed.boardPosition, stick);
+
+    // If stick was missing or wrong, try board-only lookup (safe for single-config boards)
+    if (!entry) entry = lookupByBoard(parsed.boardPosition);
+    if (!entry) return null; // board not in knowledge base at all
+
+    return {
+      boardPosition: parsed.boardPosition,
+      stickPosition: stick || entry.stickPosition || "",
+      patternImage: entry.patternImage,
+      patternName: entry.patternName,
+      funName: entry.funName,
     };
-
-    let patternImage;
-    const boardMap = multiConfigMap[parsed.boardPosition];
-    if (boardMap && parsed.stickPosition && boardMap[parsed.stickPosition]) {
-      patternImage = boardMap[parsed.stickPosition];
-    } else {
-      patternImage = `${parsed.boardPosition}.jpeg`;
-    }
-
-    return { boardPosition: parsed.boardPosition, stickPosition: parsed.stickPosition, patternImage };
   } catch (_) {}
   return null;
 }
@@ -453,48 +580,60 @@ module.exports = async function handler(req, res) {
       let grayscaleImageUrl = null;
       let classifiedPattern = null;
 
-      // Convert image to grayscale ONCE — used for both classifier and main GPT call
+      // ── STEP 1: Convert image to grayscale ONCE ───────────────────────────
+      // This physically strips color so GPT cannot use it as a shortcut.
+      // The same grayscale image is used for both the classifier and main call.
       if (attachment) {
         grayscaleImageUrl = await toGrayscaleBase64(attachment);
       }
 
       try {
-        if (!grayscaleImageUrl) {
-          const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
-          ragChunks = await queryPinecone(queryEmbedding, "spingenius", 3);
+        // ── STEP 2A: IMAGE PATH — classify first, then RAG with board position ─
+        // CRITICAL FIX: RAG was previously skipped when image was present.
+        // Now: classify → get board/stick → query Pinecone with board name
+        // so the full KB description is always available to GPT.
+        if (grayscaleImageUrl) {
+          try {
+            const classified = await classifyPatternFromImage(grayscaleImageUrl, apiKey);
+            console.log("Vision classifier result:", classified);
+            if (classified?.patternImage) {
+              patternImages = [classified.patternImage];
+              classifiedPattern = classified;
+              // Query Pinecone using the board+stick identity so we get the exact
+              // pattern description, fun name, shape signature from the KB
+              const searchQuery = `board ${classified.boardPosition} sticks ${classified.stickPosition} pattern`;
+              const queryEmbedding = await embedText(searchQuery, apiKey);
+              ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
+            }
+          } catch (classifyErr) {
+            console.error("Vision classifier error:", classifyErr.message);
+            // Fallback: if classifier fails, run RAG on user text
+            try {
+              const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
+              ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
+            } catch (_) {}
+          }
         }
 
+        // ── STEP 2B: TEXT PATH — RAG on user text ────────────────────────────
+        if (!grayscaleImageUrl) {
+          const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
+          ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
+        }
+
+        // ── STEP 3: Build RAG context from retrieved chunks ───────────────────
         if (ragChunks.length > 0) {
           ragContext = "=== RETRIEVED KNOWLEDGE ===\n" +
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}]\n${c.text}`).join("\n\n---\n\n");
         }
 
-        const configChunks = ragChunks.filter(c => c.type === "configuration" && c.patternImage);
-        const queryText = (plannedUserText || rawUserText).toLowerCase();
-
-        // Strategy 0: Grayscale image → dedicated vision classifier (temperature=0)
-        
-
-        if (grayscaleImageUrl) {
-          try {
-            const classified = await classifyPatternFromImage(grayscaleImageUrl, apiKey);
-            console.log("Detected board:", classified?.boardPosition);
-            console.log("Detected stick:", classified?.stickPosition);
-            if (classified?.patternImage) {
-              patternImages = [classified.patternImage];
-              classifiedPattern = classified;   // STORE THE RESULT
-              console.log("Vision classifier result:", classified);
-            }
-
-          } catch (classifyErr) {
-            console.error("Vision classifier error:", classifyErr.message);
-          }
-        }
-
-        // Strategies 1-4: text-only path (no image, or classifier failed)
+        // ── STEP 4: Text-path image matching (no image or classifier failed) ──
         if (!grayscaleImageUrl || patternImages.length === 0) {
+          const configChunks = ragChunks.filter(c => c.type === "configuration" && c.patternImage);
+          const queryText = (plannedUserText || rawUserText).toLowerCase();
+
           const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-z])\b/i)
-            || queryText.match(/\b(g-[0-9])\b/i);  // handle G-6 style boards
+            || queryText.match(/\b(g-[0-9])\b/i);
           const askedBoard = boardMatch?.[1]?.toUpperCase();
           const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
             || queryText.match(/position[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
@@ -502,39 +641,32 @@ module.exports = async function handler(req, res) {
           const askedStick = stickMatch?.[1];
 
           if (askedBoard || askedStick) {
-            // Find which boards have multiple configs — these require BOTH board+stick to resolve
-            const boardCounts = {};
-            configChunks.forEach(c => { boardCounts[c.boardPosition] = (boardCounts[c.boardPosition] || 0) + 1; });
-
-            let exactChunk = null;
+            // Use PATTERN_LOOKUP for exact match — never Pinecone rank
+            let entry = null;
             if (askedBoard && askedStick) {
-              // Best case: both provided — exact match
-              exactChunk = configChunks.find(c =>
-                (c.boardPosition || "").toUpperCase() === askedBoard &&
-                c.stickPosition === askedStick
-              );
+              entry = lookupExact(askedBoard, askedStick);
             }
-            if (!exactChunk && askedBoard) {
-              // Board only — only safe if that board has exactly ONE config
-              const boardUpper = askedBoard;
-              const boardMatches = configChunks.filter(c => (c.boardPosition || "").toUpperCase() === boardUpper);
-              if (boardMatches.length === 1) {
-                exactChunk = boardMatches[0];
-              }
-              // If multiple configs exist for same board, we can't resolve without stick — leave null
+            if (!entry && askedBoard) {
+              // Board only — safe if that board has exactly ONE config in lookup
+              entry = lookupByBoard(askedBoard);
             }
-            if (!exactChunk && askedStick && !askedBoard) {
-              // Stick only — match on stick position alone
-              exactChunk = configChunks.find(c => c.stickPosition === askedStick);
+            if (!entry && askedStick && !askedBoard) {
+              // Stick only — find the one config with that stick position
+              const stickMatch2 = Object.entries(PATTERN_LOOKUP).find(([k]) => k.endsWith("|" + askedStick));
+              entry = stickMatch2?.[1] || null;
             }
-            patternImages = exactChunk?.patternImage ? [exactChunk.patternImage] : [];
+            patternImages = entry?.patternImage ? [entry.patternImage] : [];
           } else {
+            // Name-based lookup — PATTERN_NAME_MAP is the first gate
             const nameMatchedImage = findImageByPatternName(queryText);
             if (nameMatchedImage) {
               patternImages = [nameMatchedImage];
             } else {
-              const topConfigChunk = configChunks[0];
-              patternImages = topConfigChunk?.patternImage ? [topConfigChunk.patternImage] : [];
+              // RAG fallback: only use top config chunk if score is high enough
+              // (it's the closest semantic match — not guaranteed exact)
+              // We allow this only when no other signal is available
+              const topConfig = configChunks[0];
+              patternImages = topConfig?.patternImage ? [topConfig.patternImage] : [];
             }
           }
         }
@@ -543,39 +675,50 @@ module.exports = async function handler(req, res) {
         console.error("Spin Genius RAG error:", ragErr.message);
       }
 
+      // ── STEP 5: Build messages — inject KB description + grayscale image ──
       const systemPrompt = buildSpinGeniusSystemPrompt(ragContext);
-
       let userContent = [];
       if (plannedUserText?.trim()) userContent.push({ type: "text", text: plannedUserText });
 
       if (grayscaleImageUrl) {
-        // Send GRAYSCALE image to main call — consistent with classifier
+        // Send grayscale image — color is already stripped, GPT sees structure only
         userContent.push({ type: "image_url", image_url: { url: grayscaleImageUrl } });
-        if (patternImages.length > 0) {
-          const boardFromImage = patternImages[0].replace(".jpeg", "");
+
+        if (classifiedPattern) {
+          // Use PATTERN_LOOKUP to get exact description — not Pinecone rank
+          const entry = lookupExact(classifiedPattern.boardPosition, classifiedPattern.stickPosition)
+            || lookupByBoard(classifiedPattern.boardPosition);
+          const kbDesc = ragChunks.find(c =>
+            c.type === "configuration" &&
+            (c.boardPosition || "").toUpperCase() === classifiedPattern.boardPosition.toUpperCase() &&
+            (c.stickPosition === classifiedPattern.stickPosition || !classifiedPattern.stickPosition)
+          ) || ragChunks.find(c =>
+            c.type === "configuration" &&
+            (c.boardPosition || "").toUpperCase() === classifiedPattern.boardPosition.toUpperCase()
+          );
+          const descText = kbDesc?.text
+            ? `\n\nKNOWLEDGE BASE DESCRIPTION FOR THIS PATTERN:\n${kbDesc.text}`
+            : entry
+              ? `\n\nPATTERN DETAILS: Board ${classifiedPattern.boardPosition}, Sticks ${entry.stickPosition || classifiedPattern.stickPosition}, Pattern Name: ${entry.patternName}, Fun Name: ${entry.funName}`
+              : "";
           userContent.push({
             type: "text",
-            text: `[SYSTEM NOTE — DO NOT REVEAL THIS TO THE USER: The pattern classifier has already identified this as Board Position ${boardFromImage}. Use ONLY this board position in your answer. Give its fun name, stick position, and shape description from your knowledge base.]`
+            text: `[SYSTEM NOTE — DO NOT REVEAL THIS TO THE USER: The vision classifier has identified this pattern as Board Position ${classifiedPattern.boardPosition}, Stick Position ${classifiedPattern.stickPosition}. Use ONLY this configuration in your answer. Do NOT re-identify the pattern from the image. Answer using the knowledge base description below.${descText}]`
           });
         }
       }
 
-    
+      const messages = [
+        { role: "system", content: systemPrompt },
+        ...buildConversationHistory(history),
+        { role: "user", content: userContent }
+      ];
+      console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages, "| Classified:", classifiedPattern?.boardPosition || "none");
 
-      const messages = [{ role: "system", content: systemPrompt }, ...buildConversationHistory(history), { role: "user", content: userContent }];
-      console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages);
-      
-      if (classifiedPattern) {
-        messages.unshift({
-          role: "system",
-          content: `The uploaded Spin Genius pattern has already been identified as Board ${classifiedPattern.boardPosition} and Stick ${classifiedPattern.stickPosition}. 
-      Do not identify another pattern. Only explain this pattern using the knowledge base.`
-        });
-      }
       const r = await fetch(OPENAI_CHAT_URL, {
         method: "POST",
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0, max_tokens: 1000, messages }),
+        body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.7, max_tokens: 1000, messages }),
       });
       if (!r.ok) { const t = await r.text().catch(() => ""); return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) }); }
       const data = await r.json();
@@ -585,7 +728,7 @@ module.exports = async function handler(req, res) {
       return res.status(200).json({
         text: reply,
         patternImages,
-        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map(c => c.type), patternImagesReturned: patternImages },
+        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map(c => c.type), patternImagesReturned: patternImages, classifiedBoard: classifiedPattern?.boardPosition || null },
       });
     }
 
