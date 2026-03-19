@@ -471,460 +471,384 @@ Respond ONLY with valid JSON, no other text:
 {"boardPosition":"1-E","stickPosition":"4-4","patternImage":"1-E.jpeg"}`;
 
 // =============================================================================
-// THREE-STEP CLASSIFIER — Built from direct observation of all 50 real patterns
+// THREE-STEP CLASSIFIER — Grounded in direct observation of all 50 real patterns
 //
-// STEP 1: Route to a tight visual group (10 groups)
-// STEP 2: Identify exact board within the group using real observed fingerprints
-// STEP 3: Verification pass for the most visually similar pairs
+// CONFIRMED FAILURES FIXED IN THIS VERSION:
+//   11-J → 11-A  (scalloped disc misrouted to grid group)
+//   13-R → 3-L   (floppy oval loops misrouted to flower group)
+//   5-L  → 6-N   (pen line width confused with interior hatching)
+//   16-L → 7-H   (large sweeping loops misrouted to flower/wreath group)
+//   6-Q  → 9-M   (teardrop-tip starburst misrouted to large ring group)
 //
-// Every description below is grounded in what the actual drawn pattern looks
-// like on paper — not theoretical geometry.
+// APPROACH:
+//   Step 1 — Sequential YES/NO questions route image to correct group (A-L)
+//   Step 2 — Within that group, identify the exact board
+//   Step 3 — Verification pass for the most visually similar pairs
 // =============================================================================
 
-// ─── STEP 1: Visual group routing ────────────────────────────────────────────
-// Answers a sequence of concrete visual questions to route to the right group.
-// Each question has a clear YES/NO answer from looking at the image.
+// ─── STEP 1 ──────────────────────────────────────────────────────────────────
 const STEP1_CATEGORY_PROMPT = `You are a Spin Genius spirograph pattern classifier.
-You will see a GRAYSCALE image of a spirograph drawn on a circular disc.
-IGNORE ALL COLOR. Identify only by SHAPE, STRUCTURE, SIZE, and LINE GEOMETRY.
+You will see a GRAYSCALE image of a spirograph drawn on a circular white disc.
+IGNORE ALL COLOR. Judge only by SHAPE, STRUCTURE, SIZE, and LINE GEOMETRY.
 
-Answer this sequence of YES/NO questions in order. Stop at the first YES.
+Go through these questions IN ORDER. Stop at the FIRST question that matches. Output ONLY the single letter.
 
-Q1 — TINY CENTERED: Is the ENTIRE drawn pattern SMALL/TINY and sitting only at the CENTER of the disc, with a large empty white area surrounding it on all sides? (Pattern takes up less than 1/4 of the disc)
-  YES → output the letter: G
+Q1 — TINY CENTERED PATTERN:
+Is the ENTIRE pattern SMALL and sitting only at the CENTER of the disc, with large empty white area all around it? (Pattern fills less than 1/4 of the disc)
+  YES → G
 
-Q2 — SEPARATE OVAL BUBBLES IN RING: Can you see clearly SEPARATE enclosed oval or loop shapes arranged in a ring, with open space between each shape, and the shapes do NOT meet at a central point?
-  YES → output the letter: F
+Q2 — TEARDROP/HEART LOOPS AT OUTER TIPS:
+Do you see many thin lines or spokes radiating outward, where EACH LINE ENDS IN A SMALL TEARDROP, HEART, or LOOP SHAPE at the outer tip? Loops are only at the outer edge. Large open center.
+  YES → J
 
-Q3 — LARGE FULL-DISC SCALLOP/PETAL GRID: Does the pattern cover MOST or ALL of the disc AND consist of overlapping arc shapes creating a repeating petal/scallop texture like fish scales tiling across the disc?
-  YES → output the letter: H
+Q3 — SEPARATE ENCLOSED BUBBLE/OVAL SHAPES IN A RING:
+Can you see clearly SEPARATE enclosed oval or loop shapes arranged in a ring, with open space between each shape? Each shape is its own distinct closed loop — they do NOT all meet at a central point.
+  YES → F
 
-Q4 — GRID WITH SPECIAL EDGE FEATURE: Is there a crosshatch/grid ring AND you can see either (a) sharp jagged/spiky teeth on the inner rim, OR (b) short spiky lines on the outer edge, OR (c) tiny squiggly curls on the outer edge, OR (d) large sweeping diagonal S-curves cutting through the grid?
-  YES → output the letter: A
+Q4 — LARGE SWEEPING PETAL LOOPS (few very large loops crossing each other):
+Does the pattern have a SMALL NUMBER (5-8) of VERY LARGE, WIDE, SWEEPING oval or petal loops that CROSS THROUGH EACH OTHER, forming a ring? The loops are big and bold — each one curves widely across the disc. Has a polygon-shaped open center hole. Fills most of disc.
+  YES → L
 
-Q5 — STRAIGHT RADIATING LINES: Do you see STRAIGHT or nearly-straight lines radiating outward from a center point, forming a star or asterisk shape? The arms are straight lines, not curved petals.
-  YES → output the letter: E
+Q5 — FULL DISC SCALLOP/PETAL GRID:
+Does the pattern cover MOST or ALL of the disc AND consist of overlapping arc shapes creating a repeating PETAL or SCALLOP texture like fish scales tiling across the surface?
+  YES → H
 
-Q6 — LARGE FAN/PINWHEEL BLADES: Do you see a LARGE RING of LONG CURVED BLADE or ARM shapes, all sweeping in the SAME rotational direction like a spinning fan or pinwheel? Each blade is an individual long curve. Fills most of the disc.
-  YES → output the letter: C
+Q6 — GRID WITH SPECIAL EDGE OR BODY FEATURE:
+Is there a crosshatch/grid ring AND you can see ANY of: (a) jagged/spiky teeth on inner rim, (b) short spiky lines on outer edge, (c) tiny squiggly curls on outer edge, (d) large sweeping diagonal S-curves through the grid body?
+  YES → A
 
-Q7 — LEAF/FEATHER/SCALE RING (plain closed shapes): Do you see a ring of LEAF-SHAPED, FEATHER-SHAPED, or FISH-SCALE shapes, each one a distinct CLOSED outline shape tilted in the same direction? The shapes look like individual closed leaves or scales, not open blades.
-  YES → output the letter: B
+Q7 — STRAIGHT RADIATING LINES (arms are straight, not curved petal loops):
+Do you see STRAIGHT or nearly-straight lines radiating from a center point, forming a star or asterisk? The arms are straight lines — not curved petals or wide oval loops.
+  YES → E
 
-Q8 — FLOWER/PETAL (shapes meet at center): Do PETAL or OVAL shapes MEET or OVERLAP at or near the CENTER of the pattern, forming a flower look where the petals all share a center point?
-  YES → output the letter: D
+Q8 — LARGE FAN/PINWHEEL (long narrow curved blades, same sweep direction):
+Do you see a large ring of LONG NARROW CURVED BLADE shapes, all sweeping in the SAME rotational direction like a spinning fan? Each blade is a long narrow individual curve.
+  YES → C
 
-Q9 — PLAIN CROSSING-LINE RING: Is there a clean ring made of thin lines that CROSS each other making a woven band? Both inner and outer edges are smooth curves. No extra features.
-  YES → output the letter: I
+Q9 — LEAF/FEATHER/SCALE RING (distinct closed leaf shapes in a ring):
+Do you see a ring of LEAF, FEATHER, or SCALE shapes — each one a distinct closed outline shape, all tilted the same direction?
+  YES → B
 
-Q10 — Default for anything else: output the letter: A
+Q10 — FLOWER/PETAL (shapes meet at or near center):
+Do petal or oval shapes MEET or OVERLAP at or near the CENTER of the pattern, forming a flower where petals share a center point?
+  YES → D
 
-Output ONLY the single letter. Nothing else. Example: B`;
+Q11 — PLAIN CROSSING-LINE RING (smooth woven band, no extra features):
+Is there a clean ring of thin lines crossing each other, with smooth inner and outer edges and no extra features?
+  YES → I
 
-// ─── STEP 2 PROMPTS: One per group, grounded in real observed images ─────────
+Default → A
+
+Output ONLY the single letter. Nothing else.`;
+
+// ─── STEP 2 PROMPTS ──────────────────────────────────────────────────────────
 const STEP2_PROMPTS = {
 
-  // ── GROUP A: GRID / CROSSING-LINE RINGS ──────────────────────────────────
-  A: `GRAYSCALE spirograph. You are identifying a GRID or CROSSING-LINE RING pattern.
-Answer each question in order. Stop at first YES and output that JSON.
+  // GROUP A: GRID / CROSSING-LINE RINGS
+  A: `GRAYSCALE spirograph. Identify the GRID or CROSSING-LINE RING.
+Answer each question in order. Stop at first YES.
 
-Q1: Does the CENTER HOLE have a JAGGED / SPIKY / ZIGZAG border — like sharp teeth pointing inward all around the hole rim? (This is the most dramatic inner edge of any pattern — very obvious spiky notches)
+Q1: Does the CENTER HOLE have a JAGGED/SPIKY/ZIGZAG border — sharp teeth pointing inward all around the hole rim?
   YES → {"boardPosition":"12-J","stickPosition":"5-5"}
 
-Q2: Look at the OUTER EDGE of the ring. Are there SHORT SPIKY or FEATHER-LIKE lines sticking outward beyond the ring edge, pointing away from center like pine needles or short spears?
+Q2: Are there SHORT SPIKY or FEATHER-LIKE lines sticking OUTWARD beyond the ring outer edge — pointing away from center like short spears?
   YES → {"boardPosition":"1-I","stickPosition":"4-3"}
 
-Q3: Look at the OUTER EDGE. Are there tiny SQUIGGLY CURLS or SCRIBBLY LOOP decorations all around the outer rim of the ring? (Like tiny cursive loops decorating the outer border)
+Q3: Are there tiny SQUIGGLY CURLS or SCRIBBLY LOOP decorations all around the OUTER RIM of the ring?
   YES → {"boardPosition":"2-J","stickPosition":"6-6"}
 
-Q4: Can you see 4-5 large bold SMOOTH DIAGONAL CURVES or S-SHAPES sweeping across the entire pattern? The grid body is there but these large sweeping curves dominate the look — they create a swirling wave effect through the grid. The pattern fills most of the disc.
+Q4: Can you see 4-5 large bold SMOOTH DIAGONAL CURVES or S-SHAPES sweeping across the ENTIRE pattern, filling most of the disc?
   YES → {"boardPosition":"2-P","stickPosition":"6-6"}
 
-Q5: Plain ring of crossing lines forming diamond gaps — both edges smooth, no extra features on any edge?
+Q5: Plain ring of crossing lines — smooth edges both sides, no extra features?
   YES → {"boardPosition":"11-A","stickPosition":"6-6"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP B: LEAF / FEATHER / SCALE RING (closed shapes) ─────────────────
-  B: `GRAYSCALE spirograph. You are identifying a LEAF, FEATHER, or SCALE RING pattern.
-Each shape in this ring is a distinct closed outline.
+  // GROUP B: LEAF / FEATHER / SCALE RING
+  B: `GRAYSCALE spirograph. Identify the LEAF, FEATHER, or SCALE RING.
 
-CRITICAL QUESTION — Look carefully INSIDE one of the leaf/feather shapes:
-Can you see MULTIPLE FINE LINES running across the INTERIOR of each shape — like veins drawn inside a leaf, or hatching lines filling the inside of each shape? These are additional lines INSIDE the body of each shape, not just the outline.
+CRITICAL — Look carefully INSIDE one leaf/feather shape:
+Can you see MULTIPLE FINE LINES running across the INTERIOR of each shape — like veins or hatching lines drawn INSIDE the body (not just the outline)?
 
-  YES, there are lines drawn INSIDE each shape (like feather barbs or leaf veins):
-    → Also: do the shapes CROSS OVER each other (overlap with crossing visible)?
-      YES → {"boardPosition":"6-N","stickPosition":"5-6"}
-      NO → {"boardPosition":"1-H","stickPosition":"3-5"}  (scale shapes overlap neighbors but lean over, no obvious crossing)
+  YES, fine interior lines inside each shape → {"boardPosition":"6-N","stickPosition":"5-6"}
 
-  NO, the shapes are plain closed outlines — hollow inside, no interior lines:
-    → The shapes are clean plain OVAL or LEAF outlines, all tilted same direction, hollow inside
-      → {"boardPosition":"5-L","stickPosition":"6-5"}
-
-KEY DISTINCTION 6-N vs 5-L: 6-N has many fine parallel lines drawn inside each feather shape. 5-L shapes are plain empty outlines with nothing inside.
-KEY DISTINCTION 1-H vs 5-L: 1-H shapes LEAN OVER their neighbor like pinecone scales, each one overlapping the next in one direction.
+  NO, shapes are plain hollow outlines — nothing drawn inside:
+    Shapes LEAN OVER their neighbor like pinecone or fish scales (each one overlaps the next in one direction)?
+      YES → {"boardPosition":"1-H","stickPosition":"3-5"}
+    Plain clean oval or leaf outlines, all tilted same direction, hollow inside?
+      YES → {"boardPosition":"5-L","stickPosition":"6-5"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP C: LARGE FAN / PINWHEEL BLADES ─────────────────────────────────
-  C: `GRAYSCALE spirograph. You are identifying a LARGE FAN or PINWHEEL BLADE pattern.
-Long curved blades all sweeping in the same direction, filling most of the disc.
+  // GROUP C: LARGE FAN / PINWHEEL BLADES
+  C: `GRAYSCALE spirograph. Identify the LARGE FAN or PINWHEEL BLADE pattern.
+Long narrow curved blades all sweeping in the same direction.
 
-FIRST — Look at the TIP of each blade. What do you see at the tip?
+Look at the TIP of each blade:
 
-  EACH BLADE TIP has a small ROUNDED LOOP or CURL at the end (like a tiny closed loop or teardrop at the tip of each blade):
+  Each tip ends in a tiny LOOP or CURL (a small closed loop at the tip):
     → {"boardPosition":"4-N","stickPosition":"5-5"}
 
-  EACH BLADE TIP ends in a small OVAL shape (the blade tapers into a tiny oval end — slightly rounded, not a plain point):
-    → Now compare SPACING: are blades WIDELY spaced with clear gaps between them?
-      YES wide spacing → {"boardPosition":"2-M","stickPosition":"1-5"}
-      NO blades are closer/denser → {"boardPosition":"11-C","stickPosition":"5-1"}
+  Each tip ends in a small OVAL, blades WIDELY SPACED with clear gaps between them:
+    → {"boardPosition":"2-M","stickPosition":"1-5"}
 
-  BLADES are VERY LARGE sweeping smooth curves — much bigger scale than normal fan blades, filling most of the disc with just a few grand curves:
-    → {"boardPosition":"16-L","stickPosition":"4-6"}
-
-KEY: 4-N has a visible loop/curl at each blade tip. 2-M has oval tips + wide spacing. 11-C has oval/plain tips + blades packed closer. 16-L has only ~5-6 giant curves.
+  Each tip ends in a small OVAL, blades CLOSER TOGETHER (denser, ~20-25 blades):
+    → {"boardPosition":"11-C","stickPosition":"5-1"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP D: FLOWER / PETAL (shapes meet at center) ──────────────────────
-  D: `GRAYSCALE spirograph. You are identifying a FLOWER or PETAL pattern.
-Petal or oval shapes that meet or overlap at or near the center.
+  // GROUP D: FLOWER / PETAL
+  D: `GRAYSCALE spirograph. Identify the FLOWER or PETAL pattern.
 
-SIZE CHECK FIRST:
+TINY/SMALL (less than 1/3 of disc):
+  Visible CIRCULAR OUTER BORDER surrounding the flower? → {"boardPosition":"2-C","stickPosition":"2-2"}
+  Exactly 8 neat equal petals, no outer frame? → {"boardPosition":"7-C","stickPosition":"2-2"}
+  7-8 round fatter overlapping petals, casual doodle flower? → {"boardPosition":"7-J","stickPosition":"1-1"}
 
-TINY/SMALL (pattern takes up less than 1/3 of disc, lots of white space around it):
-  Is there a clearly visible CIRCULAR OUTER BORDER/RING surrounding the entire flower pattern?
-    YES outer ring frame: → {"boardPosition":"2-C","stickPosition":"2-2"}  (4-petal flower enclosed inside a circle frame)
-  Is it 8 EQUAL neat clean oval petals arranged symmetrically, no outer frame?
-    YES 8 neat petals: → {"boardPosition":"7-C","stickPosition":"2-2"}
-  Is it 7-8 ROUND FATTER petals overlapping at center, more casual doodle-flower look?
-    YES casual flower: → {"boardPosition":"7-J","stickPosition":"1-1"}
+MEDIUM (1/3 to 2/3 of disc):
+  Dense WREATH/RING of many overlapping circular loops — looks like a donut with a center hole? → {"boardPosition":"7-H","stickPosition":"3-3"}
+  Separate full ROUND CIRCLES overlapping (like soap bubbles — no clear ring hole)? → {"boardPosition":"3-C","stickPosition":"3-3"}
+  ALL lines meet at ONE SOLID CENTER POINT — no hole at all (starburst/firework)? → {"boardPosition":"12-C","stickPosition":"3-1"}
 
-MEDIUM (pattern fills roughly 1/3 to 2/3 of disc):
-  Is it a RING/WREATH of many overlapping CIRCULAR LOOP shapes packed together forming a donut? (more wreath than flower)
-    YES wreath of loops: → {"boardPosition":"7-H","stickPosition":"3-3"}
-  Is it SEPARATE FULL ROUND CIRCLES overlapping each other? (not petals — full circles, like soap bubbles overlapping)
-    YES full circles: → {"boardPosition":"3-C","stickPosition":"3-3"}
-  Do ALL lines meet at a SINGLE SOLID CENTER POINT with absolutely no center hole? (starburst/sun shape)
-    YES solid center: → {"boardPosition":"12-C","stickPosition":"3-1"}
-
-LARGE (pattern fills most or all of disc):
-  Are there 6-7 VERY LARGE WIDE oval loops crossing each other, like giant rose petals, with a small star-shaped center hole?
-    YES giant petals: → {"boardPosition":"1-P","stickPosition":"4-4"}
-  Are there MANY large oval petals slightly rotating around a small polygon center hole, filling most of disc?
-    YES many rotating petals: → {"boardPosition":"14-I","stickPosition":"4-4"}
-  Are there ~20-25 WIDE BOLD oval petals ALL swirling strongly in ONE direction with a polygon center hole?
-    YES bold swirling: → {"boardPosition":"3-L","stickPosition":"1-5"}
+LARGE (fills most of disc):
+  ~20-25 WIDE BOLD oval petals ALL swirling strongly in ONE direction, polygon center hole? → {"boardPosition":"3-L","stickPosition":"1-5"}
+  MANY large oval petals rotating around a small polygon center hole, not strongly directional? → {"boardPosition":"14-I","stickPosition":"4-4"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP E: STAR / SPOKE / ASTERISK ─────────────────────────────────────
-  E: `GRAYSCALE spirograph. You are identifying a STAR, SPOKE, or ASTERISK pattern.
-Straight or near-straight lines radiating from a center.
+  // GROUP E: STAR / SPOKE / ASTERISK
+  E: `GRAYSCALE spirograph. Identify the STAR, SPOKE, or ASTERISK pattern.
 
-STEP 1 — Does the pattern have LOOP shapes at the ARM TIPS?
-
-NO LOOPS — arms are plain straight lines or end in sharp points:
-  Very small — just a few lines making a neat OCTAGON or simple POLYGON RING shape? → {"boardPosition":"10-R","stickPosition":"1-1"}
-  Small — neat overlapping TRIANGLES forming an organized geometric star with a clear polygon center hole? → {"boardPosition":"10-Q","stickPosition":"1-1"}
-  Small — MANY thin straight lines going in ALL DIRECTIONS, chaotic messy explosion, small hexagon hole? → {"boardPosition":"10-Q","stickPosition":"1-2"}
-  Small-medium — MANY straight lines crossing in a DENSE TANGLE, very busy and complex, small center barely visible? → {"boardPosition":"6-L","stickPosition":"1-1"}
-  Medium-large — SHARP TRIANGULAR POINTS (like shark fins or arrow tips) rotating around center, fills disc well? → {"boardPosition":"4-P","stickPosition":"4-5"}
+NO LOOPS — plain straight lines or sharp points at arm tips:
+  Very small — just a few lines making a neat OCTAGON or simple polygon ring? → {"boardPosition":"10-R","stickPosition":"1-1"}
+  Small neat overlapping TRIANGLES, organized geometric star, clear polygon center hole? → {"boardPosition":"10-Q","stickPosition":"1-1"}
+  Small CHAOTIC — many thin lines going all directions, messy explosion? → {"boardPosition":"10-Q","stickPosition":"1-2"}
+  Small-medium — many lines in a DENSE TANGLE, very complex and busy? → {"boardPosition":"6-L","stickPosition":"1-1"}
+  SHARP TRIANGULAR POINTS (shark fins) rotating around open center, fills disc well? → {"boardPosition":"4-P","stickPosition":"4-5"}
 
 YES LOOPS at arm tips:
-  5-6 VERY LARGE BOLD OVAL LOOPS crossing each other, each loop is BIG and wide, fills most of disc, large polygon center hole? → {"boardPosition":"7-B","stickPosition":"7-4"}
-  8 MEDIUM arms with PLUMP FAT oval loops at tips, pattern is compact and densely packed at center? → {"boardPosition":"9-B","stickPosition":"2-1"}
-  8 LONG THIN arms each ending in a SMALL rounded loop, pattern is open/sparse, medium-sized? → {"boardPosition":"9-B","stickPosition":"4-2"}
-  8 VERY LONG WISPY barely-visible arms ending in tiny loops, very sparse, huge white space? → {"boardPosition":"8-A","stickPosition":"3-2"}
-  Many thin arms each ending in a small TEARDROP or HEART LOOP at the outer tip (like dandelion seeds or tiny hearts around edge)? → {"boardPosition":"14-H","stickPosition":"4-3"}
+  5-6 VERY LARGE BOLD OVAL LOOPS crossing each other, fills most of disc, polygon center hole? → {"boardPosition":"7-B","stickPosition":"7-4"}
+  8 COMPACT FAT plump oval loops, short arms, dense star? → {"boardPosition":"9-B","stickPosition":"2-1"}
+  8 MEDIUM-LENGTH arms each ending in a small rounded loop, open/sparse? → {"boardPosition":"9-B","stickPosition":"4-2"}
+  8 VERY LONG WISPY barely-visible arms with tiny loops, huge white space? → {"boardPosition":"8-A","stickPosition":"3-2"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP F: SEPARATE OVAL/BUBBLE SHAPES IN A RING ───────────────────────
-  F: `GRAYSCALE spirograph. You are identifying a pattern with SEPARATE OVAL or BUBBLE shapes in a ring.
+  // GROUP F: SEPARATE OVAL/BUBBLE SHAPES IN A RING
+  F: `GRAYSCALE spirograph. Identify the SEPARATE BUBBLE/OVAL CHAIN pattern.
 
-Count the shapes and observe their character carefully:
+~7-8 LARGE FLOPPY ovals, each drawn with MULTIPLE OVERLAPPING LINES making them thick and messy. Big and casual-looking. Large open center.
+  → {"boardPosition":"13-R","stickPosition":"4-2"}
 
-13-R sticks 4-2:
-  About 7-8 LARGE FLOPPY OVAL shapes loosely placed in a ring.
-  Each oval is BIG and drawn with MULTIPLE OVERLAPPING LINES making each oval look thick/messy.
-  The ovals look casual and hand-drawn, not neat. Large open center.
-  KEY: big + messy/multi-stroked + ~7-8 ovals
+~12-14 CLEAN SINGLE-LINE neat oval shapes in a tidy ring. Each oval is a crisp single-stroke outline. Very large open center.
+  → {"boardPosition":"1-E","stickPosition":"4-4"}
 
-1-E sticks 4-4:
-  About 12-14 CLEAN SINGLE-LINE oval shapes arranged neatly in a ring.
-  Each oval is a crisp clean single-stroke outline. Ovals are SMALLER than 13-R.
-  Very neat and delicate looking. Very large open center.
-  KEY: clean single-line + ~12-14 ovals + neat ring
+~8-10 MEDIUM oval cluster shapes — small bundles of a few overlapping lines each. Not as large as 13-R, not as neat as 1-E.
+  → {"boardPosition":"2-F","stickPosition":"3-3"}
 
-2-F sticks 3-3:
-  About 8-10 oval loop shapes arranged in a ring.
-  Each shape is drawn with a FEW OVERLAPPING LINES making small bundles/clusters.
-  The loops are medium-sized, not as large as 13-R, not as neat as 1-E.
-  KEY: medium oval clusters + ~8-10 shapes
-
-9-O sticks 5-5:
-  MANY small oval loops that OVERLAP their neighbors continuously.
-  The ring looks nearly CONTINUOUS — loops blend into each other.
-  More like a textured ring than a chain of separate bubbles.
-  KEY: many small overlapping loops → continuous-looking ring
-
-Decision:
-  ~7-8 large floppy multi-stroked ovals → 13-R
-  ~12-14 small clean single-line ovals → 1-E
-  ~8-10 medium oval clusters → 2-F
-  Many small overlapping continuous loops → 9-O
+MANY small loops OVERLAPPING continuously — ring looks nearly continuous, loops blend into each other.
+  → {"boardPosition":"9-O","stickPosition":"5-5"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP G: TINY CENTERED PATTERN ───────────────────────────────────────
-  G: `GRAYSCALE spirograph. You are identifying a TINY CENTERED pattern.
-The entire pattern is small and sits at the center of the disc with huge white space around it.
+  // GROUP G: TINY CENTERED PATTERN
+  G: `GRAYSCALE spirograph. Identify the TINY CENTERED pattern.
+Entire pattern is small at the disc center with large white space around it.
 
-Compare these options carefully:
+OUTWARD SPIKES radiating in all directions from center — spiky ball or sea urchin look. Has a tiny center hole.
+  → {"boardPosition":"7-A","stickPosition":"1-2"}
 
-11-L sticks 1-1:
-  Just a SINGLE SIMPLE RING or CIRCLE — like one thick drawn ring, a simple donut band.
-  Very minimal. No complexity. Just a plain ring/circle shape. The simplest of the group.
+Just ONE plain simple RING or CIRCLE — like a single drawn ring band. Very minimal, no complexity at all.
+  → {"boardPosition":"11-L","stickPosition":"1-1"}
 
-4-C sticks 2-2:
-  A small MESSY SCRIBBLE DONUT — overlapping circular scribble lines making a small messy donut.
-  The lines look CHAOTIC and RANDOM, looping around each other. Has a visible center hole.
-  Like a tangled circular scribble with a hole in the middle.
+NEAT ORDERLY tightly-wound coil — concentric arcs wound around each other precisely. NOT messy. Small center hole. Looks like a neatly coiled spring from above.
+  → {"boardPosition":"G-6","stickPosition":"1-2"}
 
-G-6 sticks 1-2:
-  A small NEAT TIGHTLY-WOUND donut shape — concentric oval arcs wound around each other very neatly.
-  Lines are ORDERLY and follow each other in a precise pattern, NOT messy.
-  Has a small center hole. Looks like a neatly coiled rope or spring from above.
-
-7-A sticks 1-2:
-  A small SPIKY BALL — many very short lines pointing OUTWARD in all directions from the center.
-  Also has some inner circular structure visible beneath the spikes.
-  Looks like a spiky sea urchin or hedgehog ball. Has a tiny center hole.
-  The OUTWARD SPIKES all around are the most distinctive feature.
-
-KEY DIFFERENCES:
-  11-L = one plain simple ring (no complexity at all)
-  4-C = messy chaotic scribble donut (random overlapping loops)
-  G-6 = neat orderly tightly-wound coil donut (precise and mathematical)
-  7-A = spiky ball with outward-pointing spikes all around (like a sea urchin)
+MESSY CHAOTIC scribble donut — overlapping circular scribble lines forming a small messy donut. Lines are RANDOM. Has a center hole.
+  → {"boardPosition":"4-C","stickPosition":"2-2"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP H: LARGE FULL-DISC SCALLOP / PETAL GRID ────────────────────────
-  H: `GRAYSCALE spirograph. You are identifying a LARGE SCALLOPED or PETAL DISC pattern.
-The pattern covers most or all of the disc with repeating arc/petal shapes.
+  // GROUP H: FULL DISC SCALLOP / PETAL GRID
+  H: `GRAYSCALE spirograph. Identify the LARGE SCALLOPED or PETAL DISC pattern.
 
-Compare these three carefully:
+ENTIRE DISC filled from edge to edge — petal/scallop texture covers ALL space, no background gap outside. Clear ROUND center hole.
+  → {"boardPosition":"11-J","stickPosition":"4-4"}
 
-11-J sticks 4-4:
-  Covers the ENTIRE DISC from edge to edge — the scalloped petal texture fills ALL the space.
-  The repeating arc/petal shapes create a beautiful fish-scale or honeycomb-like grid.
-  Has a clear ROUND center hole. Pattern goes right up to the disc edge with no gap.
-  KEY: ENTIRE disc filled, round center hole, regular petal grid texture.
+VERY WIDE RING covering most of disc — VERY SMALL center hole. Thin gap of background at outer disc edge.
+  → {"boardPosition":"3-R","stickPosition":"4-2"}
 
-3-D sticks 3-3:
-  A MEDIUM-LARGE RING of many overlapping rounded loop/petal shapes.
-  Does NOT fill the full disc — there is visible white disc background beyond the ring edge.
-  Has a round center hole. The loops/petals are packed into a wide ring band.
-  KEY: ring shape (not full disc), clear gap outside ring, overlapping loops.
-
-3-R sticks 4-2:
-  Covers MOST of the disc — very large ring — but you can see a small gap at the disc edge.
-  Made of overlapping arcs forming a wide scalloped ring.
-  Has a VERY SMALL round center hole (much smaller than 3-D's center hole).
-  The ring is very wide and fills most of the disc except for a thin gap at the outer edge.
-  KEY: nearly fills disc, very small center hole, thin outer gap visible.
+MEDIUM-LARGE RING — visible white gap outside ring, MEDIUM-SIZED center hole. Overlapping loops/petals form the ring.
+  → {"boardPosition":"3-D","stickPosition":"3-3"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // ── GROUP I: PLAIN CROSSING-LINE RING ────────────────────────────────────
-  I: `GRAYSCALE spirograph. You are identifying a PLAIN CROSSING-LINE RING.
-A clean ring made of lines that cross each other. No extra decorations.
+  // GROUP I: PLAIN CROSSING-LINE RING
+  I: `GRAYSCALE spirograph. Identify the PLAIN CROSSING-LINE RING.
 
-10-A sticks 4-4:
-  A clean ring where lines sweep and cross making diamond-shaped gaps throughout the ring band.
-  BOTH inner and outer edges are perfectly smooth curves.
-  Large round open center. Elegant and clean.
+Crossing lines making diamond-shaped gaps — BOTH inner and outer edges are perfectly smooth curves. Elegant and clean. Large round open center.
+  → {"boardPosition":"10-A","stickPosition":"4-4"}
 
-9-M sticks 2-7:
-  A very thick wide ring made of what appear to be large blob-like or lens-shaped sections.
-  The sections are chunky and rounded — not individual thin crossing lines.
-  Very large open center. The thick chunky rounded segments are distinctive.
+Thick ring of large CHUNKY ROUNDED BLOB-LIKE sections — sections look thick and rounded/lens-shaped. Very large open center.
+  → {"boardPosition":"9-M","stickPosition":"2-7"}
 
-KEY: 10-A has thin crossing lines with diamond gaps + smooth edges.
-     9-M has thick chunky rounded blob-like sections forming the ring.
+Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
+
+  // GROUP J: TEARDROP/HEART LOOP TIPS AT OUTER EDGE
+  J: `GRAYSCALE spirograph. Identify the OUTER-LOOP TIP pattern.
+
+Many thin spokes where EACH TIP ends in a TEARDROP or HEART-SHAPED LOOP at the outer edge. Loops are clearly teardrop/heart shaped. Fills most of disc. Large open center.
+  → {"boardPosition":"6-Q","stickPosition":"5-4"}
+
+A ring of HUNDREDS of tiny small loops — very dense lacy ring. Loops are side by side without crossing. Large open center.
+  → {"boardPosition":"4-H","stickPosition":"3-6"}
+
+A ring of HUNDREDS of tiny loops that CRISS-CROSS and interweave with each other. Busier and more tangled than 4-H.
+  → {"boardPosition":"15-Q","stickPosition":"2-1"}
+
+Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
+
+  // GROUP L: LARGE SWEEPING PETAL LOOPS (16-L type)
+  L: `GRAYSCALE spirograph. Identify the LARGE SWEEPING LOOP pattern.
+
+5-6 VERY LARGE GRACEFUL SMOOTH CURVES sweeping across the disc. Very few curves, very open. Polygon-shaped center hole. Fills most of disc.
+  → {"boardPosition":"16-L","stickPosition":"4-6"}
+
+~20-25 wide bold oval petals ALL swirling strongly in ONE direction — polygon center hole, pinwheel-like rotation.
+  → {"boardPosition":"3-L","stickPosition":"1-5"}
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 };
 
 // ─── STEP 3: Verification prompts for the most visually similar pairs ─────────
-// Grounded in what I actually observed in the real images.
 const VERIFY_PROMPTS = {
 
-  // 11-J vs 3-D vs 3-R — all are overlapping-arc patterns
-  "11-J": `GRAYSCALE spirograph verification.
-The classifier said this is 11-J (petal/scallop grid covering ENTIRE disc).
-Look at the outer edge: does the petal/arc texture go ALL THE WAY to the disc rim with NO undrawn white background gap outside the pattern?
-  YES, fills entire disc to the edge → {"boardPosition":"11-J","stickPosition":"4-4"}
-  NO, there is a visible white gap/background between the pattern and the disc edge:
-    Is the center hole VERY SMALL (tiny hole) → {"boardPosition":"3-R","stickPosition":"4-2"}
-    Is the center hole MEDIUM-SIZED → {"boardPosition":"3-D","stickPosition":"3-3"}
+  "11-J": `GRAYSCALE spirograph verification. Classifier said 11-J (full disc scallop pattern).
+Does the petal/arc texture reach ALL THE WAY to the disc rim with NO white gap outside?
+  YES fills entire disc → {"boardPosition":"11-J","stickPosition":"4-4"}
+  NO gap outside, very small center hole → {"boardPosition":"3-R","stickPosition":"4-2"}
+  NO gap outside, medium center hole → {"boardPosition":"3-D","stickPosition":"3-3"}
 Respond ONLY with JSON.`,
 
-  "3-D": `GRAYSCALE spirograph verification.
-The classifier said this is 3-D (medium ring of overlapping loop/petals, does not fill full disc).
-Look at the outer edge: is there a visible gap of plain white background between the outer edge of the pattern and the disc rim?
-  YES clear gap outside the ring, and center hole is medium-sized → {"boardPosition":"3-D","stickPosition":"3-3"}
-  YES clear gap but the center hole is VERY SMALL → {"boardPosition":"3-R","stickPosition":"4-2"}
-  NO the pattern fills the entire disc to the edge → {"boardPosition":"11-J","stickPosition":"4-4"}
+  "3-D": `GRAYSCALE spirograph verification. Classifier said 3-D (medium ring, does not fill full disc).
+Is there a visible white background gap between the outer ring edge and disc rim?
+  YES clear gap, medium center hole → {"boardPosition":"3-D","stickPosition":"3-3"}
+  YES clear gap, very small center hole → {"boardPosition":"3-R","stickPosition":"4-2"}
+  NO fills entire disc edge to edge → {"boardPosition":"11-J","stickPosition":"4-4"}
 Respond ONLY with JSON.`,
 
-  "3-R": `GRAYSCALE spirograph verification.
-The classifier said this is 3-R (very wide ring filling most of disc, very small center hole).
-Is the center hole VERY SMALL (much smaller than most patterns), and is there a thin gap at the outer disc edge?
+  "3-R": `GRAYSCALE spirograph verification. Classifier said 3-R (nearly full disc, very small center hole).
+Is the center hole VERY SMALL, and is there a thin white gap at the outer disc edge?
   YES very small hole + thin outer gap → {"boardPosition":"3-R","stickPosition":"4-2"}
-  NO the center hole is medium-sized → {"boardPosition":"3-D","stickPosition":"3-3"}
-  NO the pattern fills the entire disc edge to edge → {"boardPosition":"11-J","stickPosition":"4-4"}
+  NO medium-sized hole → {"boardPosition":"3-D","stickPosition":"3-3"}
+  NO fills entire disc → {"boardPosition":"11-J","stickPosition":"4-4"}
 Respond ONLY with JSON.`,
 
-  // 5-L vs 6-N — the confirmed failure case — plain ovals vs feather with interior lines
-  "5-L": `GRAYSCALE spirograph verification.
-The classifier said this is 5-L (plain clean oval leaf shapes — hollow inside, no interior lines).
-Look very carefully INSIDE one of the leaf/oval shapes.
-Can you see FINE PARALLEL LINES drawn across the interior of the shape — like hatching lines or leaf veins running inside the shape's body (not just the outline)?
-  YES, there are fine lines drawn inside each shape → {"boardPosition":"6-N","stickPosition":"5-6"}
-  NO, the shapes are plain hollow outlines with nothing drawn inside → {"boardPosition":"5-L","stickPosition":"6-5"}
+  "5-L": `GRAYSCALE spirograph verification. Classifier said 5-L (plain hollow oval outlines, nothing inside).
+Look very carefully INSIDE one oval/leaf shape. Can you see FINE PARALLEL LINES drawn across the INTERIOR of the shape — actual additional lines inside the body (not just the outline)?
+  YES fine interior lines → {"boardPosition":"6-N","stickPosition":"5-6"}
+  NO plain hollow outlines → {"boardPosition":"5-L","stickPosition":"6-5"}
 Respond ONLY with JSON.`,
 
-  "6-N": `GRAYSCALE spirograph verification.
-The classifier said this is 6-N (feather ring with fine parallel lines drawn INSIDE each feather shape).
-Look inside one of the feather/leaf shapes — can you see fine hatching/vein lines inside the shape?
-  YES clear interior lines inside each shape → {"boardPosition":"6-N","stickPosition":"5-6"}
-  NO shapes are plain clean hollow outlines → {"boardPosition":"5-L","stickPosition":"6-5"}
+  "6-N": `GRAYSCALE spirograph verification. Classifier said 6-N (feather shapes with interior hatching lines).
+Can you clearly see fine hatching/vein lines drawn INSIDE the shape body?
+  YES interior lines clearly visible → {"boardPosition":"6-N","stickPosition":"5-6"}
+  NO plain hollow outlines → {"boardPosition":"5-L","stickPosition":"6-5"}
 Respond ONLY with JSON.`,
 
-  // 11-A vs 10-A — plain ring vs diamond-gap ring
-  "11-A": `GRAYSCALE spirograph verification.
-The classifier said this is 11-A (plain crossing-line ring, smooth edges, no extra features).
-Do the crossing lines create clear DIAMOND-SHAPED GAPS throughout the ring band, AND are both inner and outer edges perfectly smooth curves?
-  YES diamond gaps + smooth edges → {"boardPosition":"10-A","stickPosition":"4-4"}
-  Can you see tiny SQUIGGLY CURLS on the outer rim? → {"boardPosition":"2-J","stickPosition":"6-6"}
-  Plain ring, no distinctive gaps, no edge features → {"boardPosition":"11-A","stickPosition":"6-6"}
+  "11-A": `GRAYSCALE spirograph verification. Classifier said 11-A (plain crossing-line ring, no features).
+Do the crossing lines form clear DIAMOND-SHAPED GAPS and are both edges smooth curves?
+  YES diamond gaps, smooth edges → {"boardPosition":"10-A","stickPosition":"4-4"}
+  Tiny SQUIGGLY CURLS on outer rim? → {"boardPosition":"2-J","stickPosition":"6-6"}
+  Plain ring, no distinctive features → {"boardPosition":"11-A","stickPosition":"6-6"}
 Respond ONLY with JSON.`,
 
-  // 13-R vs 1-E vs 2-F — bubble chain disambiguation
-  "13-R": `GRAYSCALE spirograph verification.
-The classifier said this is 13-R (~7-8 large floppy multi-stroked oval shapes).
-Count the oval shapes. Are there significantly MORE than 8 ovals, and do they look like clean single-line outlines (not messy/multi-stroked)?
-  YES more than 8, clean single-line ovals → {"boardPosition":"1-E","stickPosition":"4-4"}
-  YES more than 8, oval clusters/bundles (not clean single lines) → {"boardPosition":"2-F","stickPosition":"3-3"}
+  "13-R": `GRAYSCALE spirograph verification. Classifier said 13-R (7-8 large floppy multi-stroked ovals).
+Are there MORE than 8 ovals with clean single-line outlines?
+  YES more than 8, clean single-line → {"boardPosition":"1-E","stickPosition":"4-4"}
+  YES more than 8, small oval clusters → {"boardPosition":"2-F","stickPosition":"3-3"}
   NO clearly 7-8 large floppy multi-stroked ovals → {"boardPosition":"13-R","stickPosition":"4-2"}
 Respond ONLY with JSON.`,
 
-  "1-E": `GRAYSCALE spirograph verification.
-The classifier said this is 1-E (~12-14 clean single-line oval shapes in a neat ring).
-Are there only 7-8 ovals, each drawn with multiple overlapping messy lines (thick/floppy)?
+  "1-E": `GRAYSCALE spirograph verification. Classifier said 1-E (~12-14 clean single-line ovals).
+Are there only 7-8 ovals, each with multiple messy overlapping lines (floppy, thick)?
   YES only 7-8 large messy multi-stroked ovals → {"boardPosition":"13-R","stickPosition":"4-2"}
-  NO there are about 12-14 clean neat single-line ovals → {"boardPosition":"1-E","stickPosition":"4-4"}
+  NO about 12-14 clean neat single-line ovals → {"boardPosition":"1-E","stickPosition":"4-4"}
 Respond ONLY with JSON.`,
 
-  // 9-B sticks 4-2 vs 8-A — long thin arms, similar look
-  "9-B_4-2": `GRAYSCALE spirograph verification.
-The classifier said this is 9-B sticks 4-2 (8 long thin arms with small loops at tips).
-Are the arms EXTREMELY long and wispy — reaching more than 2/3 of the way to the disc edge — with tiny barely-visible loops?
-  YES extremely long wispy arms, loops barely visible → {"boardPosition":"8-A","stickPosition":"3-2"}
-  NO arms are medium length, loops are small but clearly visible → {"boardPosition":"9-B","stickPosition":"4-2"}
+  "9-B_4-2": `GRAYSCALE spirograph verification. Classifier said 9-B sticks 4-2 (8 medium arms, small loops).
+Are the arms EXTREMELY long and wispy, reaching more than 2/3 to disc edge, with barely-visible loops?
+  YES extremely long wispy arms → {"boardPosition":"8-A","stickPosition":"3-2"}
+  NO medium-length arms, loops clearly visible → {"boardPosition":"9-B","stickPosition":"4-2"}
 Respond ONLY with JSON.`,
 
-  // 9-B sticks 2-1 vs 9-B sticks 4-2 — fat compact vs long thin
-  "9-B_2-1": `GRAYSCALE spirograph verification.
-The classifier said this is 9-B sticks 2-1 (8 short fat plump loops, compact pattern).
-Are the arms actually LONG and THIN with small loops at the tips (not short and fat)?
-  YES long thin arms with small loops → {"boardPosition":"9-B","stickPosition":"4-2"}
-  NO short fat plump oval loops, compact dense star → {"boardPosition":"9-B","stickPosition":"2-1"}
+  "10-Q_1-1": `GRAYSCALE spirograph verification. Classifier said 10-Q sticks 1-1 (neat overlapping triangles).
+Is the pattern actually CHAOTIC — many thin lines going in all directions, messy explosion?
+  YES chaotic lines everywhere → {"boardPosition":"10-Q","stickPosition":"1-2"}
+  NO neat organized triangles, polygon center hole → {"boardPosition":"10-Q","stickPosition":"1-1"}
 Respond ONLY with JSON.`,
 
-  // 10-Q-1 vs 10-Q-2 — triangles vs chaotic
-  "10-Q_1-1": `GRAYSCALE spirograph verification.
-The classifier said this is 10-Q sticks 1-1 (neat overlapping triangles, organized geometric star).
-Is the pattern actually CHAOTIC — many thin lines going in all different directions, messy explosion look?
-  YES chaotic lines going everywhere, messy → {"boardPosition":"10-Q","stickPosition":"1-2"}
-  NO clearly neat triangles, organized, polygon center hole visible → {"boardPosition":"10-Q","stickPosition":"1-1"}
+  "G-6": `GRAYSCALE spirograph verification. Classifier said G-6 (neat tightly-wound coil donut).
+  OUTWARD SPIKES radiating in all directions (sea urchin)? → {"boardPosition":"7-A","stickPosition":"1-2"}
+  Lines are MESSY and CHAOTIC? → {"boardPosition":"4-C","stickPosition":"2-2"}
+  Just a plain single ring/circle? → {"boardPosition":"11-L","stickPosition":"1-1"}
+  Neat orderly coiled arcs → {"boardPosition":"G-6","stickPosition":"1-2"}
 Respond ONLY with JSON.`,
 
-  // G-6 vs 4-C vs 7-A — tiny centered patterns
-  "G-6": `GRAYSCALE spirograph verification.
-The classifier said this is G-6 (neat tightly-wound coil donut at center).
-Check carefully:
-  Do you see short lines or spikes pointing OUTWARD in all directions (like a tiny hedgehog)? → {"boardPosition":"7-A","stickPosition":"1-2"}
-  Are the lines MESSY and CHAOTIC (not neat and orderly)? → {"boardPosition":"4-C","stickPosition":"2-2"}
-  Is it a plain simple single ring/circle with no complexity? → {"boardPosition":"11-L","stickPosition":"1-1"}
-  Neat orderly coiled concentric arcs, precise → {"boardPosition":"G-6","stickPosition":"1-2"}
+  "4-C": `GRAYSCALE spirograph verification. Classifier said 4-C (messy chaotic scribble donut).
+  OUTWARD SPIKES radiating in all directions? → {"boardPosition":"7-A","stickPosition":"1-2"}
+  Lines are NEAT and ORDERLY? → {"boardPosition":"G-6","stickPosition":"1-2"}
+  Just a plain single ring/circle? → {"boardPosition":"11-L","stickPosition":"1-1"}
+  Messy chaotic scribble with center hole → {"boardPosition":"4-C","stickPosition":"2-2"}
 Respond ONLY with JSON.`,
 
-  "4-C": `GRAYSCALE spirograph verification.
-The classifier said this is 4-C (messy chaotic scribble donut).
-Check carefully:
-  Do you see short spikes pointing OUTWARD all around (sea urchin look)? → {"boardPosition":"7-A","stickPosition":"1-2"}
-  Are the lines NEAT and ORDERLY (not messy)? → {"boardPosition":"G-6","stickPosition":"1-2"}
-  Is it just a plain single ring/circle? → {"boardPosition":"11-L","stickPosition":"1-1"}
-  Messy chaotic overlapping circular scribbles with a center hole → {"boardPosition":"4-C","stickPosition":"2-2"}
-Respond ONLY with JSON.`,
-
-  // 4-H vs 15-Q — lacy ring vs criss-cross ring
-  "4-H": `GRAYSCALE spirograph verification.
-The classifier said this is 4-H (ring of many small rounded loops).
-Do the loops visibly CROSS OVER and INTERWEAVE with each other, making the ring look busier and more tangled?
+  "4-H": `GRAYSCALE spirograph verification. Classifier said 4-H (dense lacy ring of small loops).
+Do the loops visibly CRISS-CROSS and interweave with each other, making it look busier and more tangled?
   YES loops criss-cross and interweave → {"boardPosition":"15-Q","stickPosition":"2-1"}
-  NO loops are side by side, dense but not crossing → {"boardPosition":"4-H","stickPosition":"3-6"}
+  NO loops are side by side, not crossing → {"boardPosition":"4-H","stickPosition":"3-6"}
 Respond ONLY with JSON.`,
 
-  // 2-M vs 11-C — both large fan blades
-  "11-C": `GRAYSCALE spirograph verification.
-The classifier said this is 11-C (~20-25 curved fan blades with oval/plain tips, blades packed closer).
-Are the blades WIDELY SPACED with clear open gaps between each blade (fewer blades, more open)?
-  YES wide spacing between blades, fewer blades → {"boardPosition":"2-M","stickPosition":"1-5"}
-  NO blades are closer together, denser packing → {"boardPosition":"11-C","stickPosition":"5-1"}
+  "6-Q": `GRAYSCALE spirograph verification. Classifier said 6-Q (spokes with teardrop/heart loops at outer tips).
+Are the tip-loops clearly TEARDROP or HEART SHAPED — distinct shaped loops at end of each spoke (not tiny lacy loops)?
+  YES distinct teardrop/heart loops at spoke tips → {"boardPosition":"6-Q","stickPosition":"5-4"}
+  NO looks like hundreds of tiny lacy loops forming a dense ring → {"boardPosition":"4-H","stickPosition":"3-6"}
 Respond ONLY with JSON.`,
 
-  // 1-P vs 14-I vs 3-L — large flower/petal patterns
-  "1-P": `GRAYSCALE spirograph verification.
-The classifier said this is 1-P (6-7 very large wide bold oval loops like giant rose petals).
-Are there actually MANY MORE petals (20+) all swirling in the same direction with a polygon center hole?
-  YES many petals all swirling same direction, polygon center → {"boardPosition":"3-L","stickPosition":"1-5"}
-Are the petals numerous and rotating around a small polygon hole but not strongly directional?
-  YES many rotating petals, small polygon hole → {"boardPosition":"14-I","stickPosition":"4-4"}
+  "16-L": `GRAYSCALE spirograph verification. Classifier said 16-L (5-6 very large graceful sweeping curves).
+Are there only 5-6 very large smooth curves (very few, very grand scale)?
+  YES just 5-6 giant graceful curves, very open → {"boardPosition":"16-L","stickPosition":"4-6"}
+  NO many more petals (~20+) swirling strongly in one direction → {"boardPosition":"3-L","stickPosition":"1-5"}
+Respond ONLY with JSON.`,
+
+  "11-C": `GRAYSCALE spirograph verification. Classifier said 11-C (~20-25 fan blades, closer together).
+Are the blades WIDELY SPACED with clear open gaps between each blade?
+  YES wide spacing → {"boardPosition":"2-M","stickPosition":"1-5"}
+  NO blades are closer/denser → {"boardPosition":"11-C","stickPosition":"5-1"}
+Respond ONLY with JSON.`,
+
+  "7-H": `GRAYSCALE spirograph verification. Classifier said 7-H (wreath/donut ring of overlapping loops, has center hole).
+Are the shapes actually FULL SEPARATE CIRCLES overlapping (like soap bubble rings), with no clear donut hole?
+  YES full overlapping circles, no donut hole → {"boardPosition":"3-C","stickPosition":"3-3"}
+  NO clearly a wreath/donut ring with a visible center hole → {"boardPosition":"7-H","stickPosition":"3-3"}
+Respond ONLY with JSON.`,
+
+  "1-P": `GRAYSCALE spirograph verification. Classifier said 1-P (6-7 giant wide bold oval loops like huge rose petals).
+Are there actually MANY MORE petals (20+) swirling strongly in one direction?
+  YES many petals swirling same direction, polygon center → {"boardPosition":"3-L","stickPosition":"1-5"}
+  YES many rotating petals, small polygon hole, not strongly directional → {"boardPosition":"14-I","stickPosition":"4-4"}
   NO just 6-7 giant wide bold oval loops crossing → {"boardPosition":"1-P","stickPosition":"4-4"}
-Respond ONLY with JSON.`,
-
-  // 7-H vs 3-C — wreath of loops vs overlapping full circles
-  "7-H": `GRAYSCALE spirograph verification.
-The classifier said this is 7-H (dense ring/wreath of overlapping circular loops, donut shape with center hole).
-Are the shapes actually FULL SEPARATE CIRCLES that overlap each other (like soap bubble rings), with NO clear ring/donut structure?
-  YES full overlapping circles, no clear ring hole → {"boardPosition":"3-C","stickPosition":"3-3"}
-  NO clearly a ring/wreath shape with a center hole, made of overlapping loops → {"boardPosition":"7-H","stickPosition":"3-3"}
-Respond ONLY with JSON.`,
-
-  // 6-L vs 10-Q-2 — dense tangle vs chaotic star
-  "6-L": `GRAYSCALE spirograph verification.
-The classifier said this is 6-L (many straight lines in a dense messy tangle, very complex and busy).
-Is the pattern actually more like a STAR SHAPE with lines going in all directions from a center but with a clear center hole?
-  YES star-like with visible center hole, lines radiate → {"boardPosition":"10-Q","stickPosition":"1-2"}
-  NO very dense complex tangle, lines everywhere, barely any center visible → {"boardPosition":"6-L","stickPosition":"1-1"}
 Respond ONLY with JSON.`,
 };
 
 // Boards that get a verification pass
 const VERIFY_BOARDS = new Set([
   "11-J","3-D","3-R","5-L","6-N","11-A","13-R","1-E",
-  "4-H","11-C","1-P","7-H","6-L","G-6","4-C"
+  "4-H","11-C","1-P","7-H","G-6","4-C","6-Q","16-L"
 ]);
 
 function getVerifyKey(board, stick) {
   if (board === "9-B" && stick === "4-2") return "9-B_4-2";
-  if (board === "9-B" && stick === "2-1") return "9-B_2-1";
   if (board === "10-Q" && stick === "1-1") return "10-Q_1-1";
   return board;
 }
@@ -958,7 +882,7 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
 
     const step2Prompt = STEP2_PROMPTS[category];
     if (!step2Prompt) {
-      console.warn("Unknown category:", category);
+      console.warn("Unknown Step 1 category:", category);
       return null;
     }
 
@@ -983,7 +907,7 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
           const cleanV = rawV.replace(/```json|```/g, "").trim();
           const parsedV = JSON.parse(cleanV);
           if (parsedV?.boardPosition) {
-            console.log(`Step 3 verify: ${board}→${parsedV.boardPosition} stick:${parsedV.stickPosition}`);
+            console.log(`Step 3 verify: ${board} → ${parsedV.boardPosition} (stick: ${parsedV.stickPosition})`);
             board = parsedV.boardPosition;
             stick = parsedV.stickPosition || stick;
           }
