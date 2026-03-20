@@ -583,18 +583,27 @@ Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
   // GROUP C: LARGE FAN / PINWHEEL BLADES
   C: `GRAYSCALE spirograph. Identify the LARGE FAN or PINWHEEL BLADE pattern.
-Long narrow curved blades all sweeping in the same direction.
+Long curved blades all sweeping in the same direction like a spinning fan.
 
-Look at the TIP of each blade:
+STEP 1 — Look at the TIP of each blade. Do the tips end in a tiny LOOP or CURL (a small closed loop at the end)?
+  YES, each tip has a small loop/curl → {"boardPosition":"4-N","stickPosition":"5-5"}
+  NO, tips are plain (pointed or slightly oval) → continue to STEP 2
 
-  Each tip ends in a tiny LOOP or CURL (a small closed loop at the tip):
-    → {"boardPosition":"4-N","stickPosition":"5-5"}
+STEP 2 — Look closely at each individual blade. Is each blade made of a SINGLE THIN LINE, or are the blades made of MULTIPLE PARALLEL LINES bundled together making each blade look THICK and BOLD?
 
-  Each tip ends in a small OVAL, blades WIDELY SPACED with clear gaps between them:
+  SINGLE THIN LINES — each blade is just one thin line:
+    The blades are very thin, widely spaced, lots of white space clearly visible between each blade.
+    The centre hole is LARGE. Blades reach from near-centre out to near the disc edge.
     → {"boardPosition":"2-M","stickPosition":"1-5"}
 
-  Each tip ends in a small OVAL, blades CLOSER TOGETHER (denser, ~20-25 blades):
+  MULTIPLE BUNDLED LINES — each blade is made of several lines travelling together:
+    The blades look THICKER and BOLDER because multiple lines make up each blade.
+    Blades are more densely packed, less white space between them.
+    The centre hole is MEDIUM-SMALL. The overall pattern looks heavier/bolder.
     → {"boardPosition":"11-C","stickPosition":"5-1"}
+
+KEY: 2-M = single thin lines, widely spaced, large open center.
+     11-C = bundled thick bold blades, more packed, smaller center.
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
@@ -821,10 +830,11 @@ Are there only 5-6 very large smooth curves (very few, very grand scale)?
   NO many more petals (~20+) swirling strongly in one direction → {"boardPosition":"3-L","stickPosition":"1-5"}
 Respond ONLY with JSON.`,
 
-  "11-C": `GRAYSCALE spirograph verification. Classifier said 11-C (~20-25 fan blades, closer together).
-Are the blades WIDELY SPACED with clear open gaps between each blade?
-  YES wide spacing → {"boardPosition":"2-M","stickPosition":"1-5"}
-  NO blades are closer/denser → {"boardPosition":"11-C","stickPosition":"5-1"}
+  "11-C": `GRAYSCALE spirograph verification. Classifier said 11-C (thick bold fan blades, multiple lines per blade).
+CRITICAL CHECK — Look at ONE individual blade closely:
+Is each blade made of a SINGLE THIN LINE (one thin stroke per blade, widely spaced, lots of white between blades)?
+  YES single thin lines, widely spaced, large open center → {"boardPosition":"2-M","stickPosition":"1-5"}
+  NO each blade is made of MULTIPLE LINES bundled together (blades look thick/bold, more packed) → {"boardPosition":"11-C","stickPosition":"5-1"}
 Respond ONLY with JSON.`,
 
   "7-H": `GRAYSCALE spirograph verification. Classifier said 7-H (wreath/donut ring of overlapping loops, has center hole).
@@ -1174,37 +1184,47 @@ module.exports = async function handler(req, res) {
         console.error("Spin Genius RAG error:", ragErr.message);
       }
 
-      // ── STEP 5: Build messages — inject KB description + grayscale image ──
+      // ── STEP 5: Build messages — inject classifier result as text (NO image re-sent) ──
+      //
+      // CRITICAL BUG FIX:
+      // Previously the grayscale image was sent to the final LLM call. GPT would see the
+      // image, re-identify the pattern itself, and override the classifier's correct answer.
+      // This caused the text reply (e.g. '11-C') to contradict patternImages (e.g. '7-A.jpeg').
+      // THE FIX: Do NOT send the image to the final LLM call.
+      // The classifier already ran 3 dedicated GPT-4o calls to identify the pattern.
+      // The final LLM only needs the text description — it must trust the classifier result.
+      //
       const systemPrompt = buildSpinGeniusSystemPrompt(ragContext);
       let userContent = [];
       if (plannedUserText?.trim()) userContent.push({ type: "text", text: plannedUserText });
 
-      if (grayscaleImageUrl) {
-        // Send grayscale image — color is already stripped, GPT sees structure only
-        userContent.push({ type: "image_url", image_url: { url: grayscaleImageUrl } });
-
-        if (classifiedPattern) {
-          // Use PATTERN_LOOKUP to get exact description — not Pinecone rank
-          const entry = lookupExact(classifiedPattern.boardPosition, classifiedPattern.stickPosition)
-            || lookupByBoard(classifiedPattern.boardPosition);
-          const kbDesc = ragChunks.find(c =>
-            c.type === "configuration" &&
-            (c.boardPosition || "").toUpperCase() === classifiedPattern.boardPosition.toUpperCase() &&
-            (c.stickPosition === classifiedPattern.stickPosition || !classifiedPattern.stickPosition)
-          ) || ragChunks.find(c =>
-            c.type === "configuration" &&
-            (c.boardPosition || "").toUpperCase() === classifiedPattern.boardPosition.toUpperCase()
-          );
-          const descText = kbDesc?.text
-            ? `\n\nKNOWLEDGE BASE DESCRIPTION FOR THIS PATTERN:\n${kbDesc.text}`
-            : entry
-              ? `\n\nPATTERN DETAILS: Board ${classifiedPattern.boardPosition}, Sticks ${entry.stickPosition || classifiedPattern.stickPosition}, Pattern Name: ${entry.patternName}, Fun Name: ${entry.funName}`
-              : "";
-          userContent.push({
-            type: "text",
-            text: `[SYSTEM NOTE — DO NOT REVEAL THIS TO THE USER: The vision classifier has identified this pattern as Board Position ${classifiedPattern.boardPosition}, Stick Position ${classifiedPattern.stickPosition}. Use ONLY this configuration in your answer. Do NOT re-identify the pattern from the image. Answer using the knowledge base description below.${descText}]`
-          });
-        }
+      if (grayscaleImageUrl && classifiedPattern) {
+        // Classifier succeeded — inject result as text only, never re-send the image
+        const entry = lookupExact(classifiedPattern.boardPosition, classifiedPattern.stickPosition)
+          || lookupByBoard(classifiedPattern.boardPosition);
+        const kbDesc = ragChunks.find(c =>
+          c.type === "configuration" &&
+          (c.boardPosition || "").toUpperCase() === classifiedPattern.boardPosition.toUpperCase() &&
+          (c.stickPosition === classifiedPattern.stickPosition || !classifiedPattern.stickPosition)
+        ) || ragChunks.find(c =>
+          c.type === "configuration" &&
+          (c.boardPosition || "").toUpperCase() === classifiedPattern.boardPosition.toUpperCase()
+        );
+        const descText = kbDesc?.text
+          ? `\n\nKNOWLEDGE BASE DESCRIPTION:\n${kbDesc.text}`
+          : entry
+            ? `\n\nPattern Name: ${entry.patternName}\nFun Name: ${entry.funName}\nBoard Position: ${classifiedPattern.boardPosition}\nStick Position: ${entry.stickPosition || classifiedPattern.stickPosition}`
+            : "";
+        userContent.push({
+          type: "text",
+          text: `[CLASSIFIER RESULT — DEFINITIVE IDENTIFICATION. DO NOT CHANGE OR QUESTION THIS.\nBoard Position: ${classifiedPattern.boardPosition}\nStick Position: ${classifiedPattern.stickPosition}\nPattern Name: ${classifiedPattern.patternName}\nFun Name: ${classifiedPattern.funName}\nAnswer the user in a fun kid-friendly way about EXACTLY this pattern. Do not suggest alternatives.${descText}]`
+        });
+      } else if (grayscaleImageUrl && !classifiedPattern) {
+        // Image uploaded but classifier failed — ask user for more info
+        userContent.push({
+          type: "text",
+          text: "[NOTE: An image was uploaded but the pattern classifier could not identify it confidently. Tell the user in a friendly way that you could not clearly identify this pattern, and ask them to try a clearer photo or share the board and stick positions directly.]"
+        });
       }
 
       const messages = [
