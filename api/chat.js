@@ -493,8 +493,9 @@ IGNORE ALL COLOR. Judge only by SHAPE, STRUCTURE, SIZE, and LINE GEOMETRY.
 
 Go through these questions IN ORDER. Stop at the FIRST question that matches. Output ONLY the single letter.
 
-Q1 — TINY CENTERED PATTERN:
-Is the ENTIRE pattern SMALL and sitting only at the CENTER of the disc, with large empty white area all around it? (Pattern fills less than 1/4 of the disc)
+Q1 — TRULY TINY CENTERED PATTERN:
+Is the ENTIRE pattern VERY SMALL — like a small coin or badge — sitting only at the very CENTER of the disc, with a MASSIVE empty white area all around it taking up at least 3/4 of the disc? The pattern must be clearly coin-sized or smaller relative to the disc.
+IMPORTANT: Star shapes, triangle stars, geometric stars, asterisks — even small ones — do NOT go here. Only true tiny donut/scribble/spiky-ball patterns go here.
   YES → G
 
 Q2 — TEARDROP/HEART LOOPS AT OUTER TIPS:
@@ -1217,7 +1218,27 @@ module.exports = async function handler(req, res) {
             : "";
         userContent.push({
           type: "text",
-          text: `[CLASSIFIER RESULT — DEFINITIVE IDENTIFICATION. DO NOT CHANGE OR QUESTION THIS.\nBoard Position: ${classifiedPattern.boardPosition}\nStick Position: ${classifiedPattern.stickPosition}\nPattern Name: ${classifiedPattern.patternName}\nFun Name: ${classifiedPattern.funName}\nAnswer the user in a fun kid-friendly way about EXACTLY this pattern. Do not suggest alternatives.${descText}]`
+          text: `[CLASSIFIER RESULT — DEFINITIVE IDENTIFICATION. DO NOT CHANGE OR QUESTION THIS.
+
+Board Position: ${classifiedPattern.boardPosition}
+Stick Position: ${classifiedPattern.stickPosition}
+Pattern Name: ${classifiedPattern.patternName}
+Fun Name: ${classifiedPattern.funName}
+
+You MUST respond in this EXACT format — no paragraphs, use this structure:
+
+Sure! ☀️ Here is the pattern you are looking at:
+
+- Fun Name: [fun name with emoji]
+- Pattern Name: [pattern name]
+- Board Position: [board]
+- Stick Position: [stick]
+- Shape Description: [1-2 fun kid-friendly sentences describing what it looks like]
+- Difficulty: [beginner / intermediate / advanced]
+
+The pattern picture will appear below my response automatically! 🎨
+
+Do not write paragraphs. Do not suggest alternatives. Use EXACTLY the board and stick position above.${descText}]`
         });
       } else if (grayscaleImageUrl && !classifiedPattern) {
         // Image uploaded but classifier failed — ask user for more info
@@ -1314,14 +1335,20 @@ PATTERN KNOWLEDGE BASE (retrieved from vector search):
 ${groundedContext || "No specific patterns retrieved. Use your general Spin Genius knowledge."}
 
 PATTERN LOOKUP RULES — VERY IMPORTANT:
-When a user asks about a specific configuration or pattern name, ALWAYS answer with ALL of these:
-  - Fun Name (e.g. "The Happy Little Flower 🌸")
-  - Pattern Name
-  - Board Position
-  - Stick Position
-  - Shape description
-  - Difficulty level
-  - Tell them: "The pattern picture will appear below my response automatically! 🎨"
+Whenever identifying or describing a pattern (whether from an image upload or a text question), ALWAYS respond in this EXACT format:
+
+Sure! ☀️ Here is the pattern:
+
+- Fun Name: [fun name with emoji]
+- Pattern Name: [pattern name]
+- Board Position: [board]
+- Stick Position: [stick]
+- Shape Description: [1-2 fun kid-friendly sentences describing what it looks like]
+- Difficulty: [beginner / intermediate / advanced]
+
+The pattern picture will appear below my response automatically! 🎨
+
+NEVER write a long paragraph. ALWAYS use this bullet point format.
 
 ALL 50 PATTERN FUN NAMES (use these when describing patterns to kids):
   - Board 3-D    Sticks 3-3 → "The Petal Loop Donut 🍩" (Petal Loop Donut)
