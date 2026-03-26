@@ -8,22 +8,12 @@
 // gemini-2.0-flash       → Vision classifier + final answers
 // text-embedding-004     → Embeddings for Pinecone RAG (768 dims)
 // -----------------------------------------------------------------------------
-const GEMINI_BASE       = "https://generativelanguage.googleapis.com/v1beta/models";
-
-// ── Chat models ──────────────────────────────────────────────────────────────
-const MODEL_LITE        = "gemini-3-flash-preview";       // Gemini 3 Flash — planner + robocoders
-const MODEL_FLASH       = "gemini-3-flash-preview";       // Gemini 3 Flash — vision + spingenius
-
-// ── Image generation (Nano Banana 2) ─────────────────────────────────────────
-const MODEL_IMAGE       = "gemini-3.1-flash-image-preview"; // Nano Banana 2 — generate pattern images
-
-// ── Video generation (Veo 3.1) ───────────────────────────────────────────────
-const MODEL_VIDEO       = "veo-3.1-generate-preview";       // Veo 3.1 — generate tutorial videos
-const VEO_BASE          = "https://generativelanguage.googleapis.com/v1beta";
-
-// ── Embeddings (OpenAI — Gemini embedding not available in India) ─────────────
-const OPENAI_EMBED_URL  = "https://api.openai.com/v1/embeddings";
-const EMBED_MODEL       = "text-embedding-3-small";
+const GEMINI_BASE      = "https://generativelanguage.googleapis.com/v1beta/models";
+const MODEL_LITE       = "gemini-2.0-flash-lite";
+const MODEL_FLASH      = "gemini-2.0-flash";
+const MODEL_IMAGE      = "gemini-2.0-flash-exp-image-generation"; // Nano Banana image gen
+const OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings";
+const EMBED_MODEL      = "text-embedding-3-small"; // 1536 dims — existing Pinecone index
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -49,21 +39,43 @@ async function geminiChat({ model, systemPrompt, messages, temperature = 0.7, ma
   // Convert OpenAI-style message array to Gemini contents format.
   // Gemini uses "model" where OpenAI uses "assistant".
   // System prompt is passed separately via system_instruction.
-  const contents = messages
+  const rawContents = messages
     .filter(m => m.role !== "system")
     .map(m => {
-      const role = m.role === "assistant" ? "model" : "user";
+      if (Array.isArray(m.parts)) return { role: m.role, parts: m.parts };
+      const role = (m.role === "assistant") ? "model" : "user";
       let parts;
       if (typeof m.content === "string") {
         parts = [{ text: m.content }];
       } else if (Array.isArray(m.content)) {
-        // Handle content arrays (text + inline_data parts already formatted)
-        parts = m.content;
+        parts = m.content.map(p => {
+          if (p.type === "text") return { text: p.text };
+          if (p.type === "image_url") {
+            const url = p.image_url?.url || "";
+            const base64 = url.startsWith("data:") ? url.split(",")[1] : url;
+            return { inline_data: { mime_type: "image/jpeg", data: base64 } };
+          }
+          return { text: String(p.text || p || "") };
+        }).filter(Boolean);
       } else {
         parts = [{ text: String(m.content || "") }];
       }
       return { role, parts };
-    });
+    })
+    .filter(m => m.parts && m.parts.length > 0);
+
+  // Enforce alternating user/model turns — Gemini rejects consecutive same roles
+  const contents = [];
+  for (const msg of rawContents) {
+    if (contents.length > 0 && contents[contents.length - 1].role === msg.role) {
+      contents[contents.length - 1].parts.push(...msg.parts);
+    } else {
+      contents.push({ role: msg.role, parts: [...msg.parts] });
+    }
+  }
+  if (contents.length > 0 && contents[0].role !== "user") {
+    contents.unshift({ role: "user", parts: [{ text: "Hello" }] });
+  }
 
   const body = {
     contents,
@@ -121,15 +133,15 @@ async function planChatPrompt(userText, geminiKey) {
 
 // =============================================================================
 // Embeddings — OpenAI text-embedding-3-small (1536 dims)
-// Gemini embeddings not available in India — using OpenAI for Pinecone queries.
+// Gemini embeddings not available in India. Using OpenAI for Pinecone queries.
 // =============================================================================
 async function embedText(text, geminiKey) {
   const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) throw new Error("OPENAI_API_KEY not set in env.");
+  if (!openaiKey) throw new Error("OPENAI_API_KEY not set — needed for embeddings.");
   const r = await fetch(OPENAI_EMBED_URL, {
     method: "POST",
     headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: EMBED_MODEL, input: String(text || "").trim() }),
+    body: JSON.stringify({ model: EMBED_MODEL, input: String(text || "").trim().slice(0, 8000) }),
   });
   if (!r.ok) {
     const t = await r.text().catch(() => "");
@@ -140,83 +152,31 @@ async function embedText(text, geminiKey) {
 }
 
 // =============================================================================
-// Nano Banana 2 — Image Generation (gemini-3.1-flash-image-preview)
-// Generates pattern images or diagrams from text descriptions.
-// Returns base64 image data.
+// Nano Banana — Image Generation
+// Works for both robocoders and spingenius product contexts.
 // =============================================================================
-async function generateImage(prompt, geminiKey) {
-  const r = await fetch(
-    `${GEMINI_BASE}/${MODEL_IMAGE}:generateContent?key=${geminiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
-      }),
-    }
-  );
+async function generateImageWithNanoBanana(prompt, geminiKey) {
+  const r = await fetch(`${GEMINI_BASE}/${MODEL_IMAGE}:generateContent?key=${geminiKey}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      contents: [{ role: "user", parts: [{ text: prompt }] }],
+      generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
+    }),
+  });
   if (!r.ok) {
     const t = await r.text().catch(() => "");
-    console.error("Nano Banana image gen error:", t.slice(0, 400));
+    console.error("Nano Banana error:", t.slice(0, 300));
     return null;
   }
   const data = await r.json();
-  // Extract base64 image from response
   const parts = data?.candidates?.[0]?.content?.parts || [];
   for (const part of parts) {
     if (part.inlineData?.mimeType?.startsWith("image/")) {
-      return {
-        mimeType: part.inlineData.mimeType,
-        base64: part.inlineData.data,
-        dataUrl: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
-      };
+      return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
     }
   }
   return null;
-}
-
-// =============================================================================
-// Veo 3.1 — Video Generation (veo-3.1-generate-preview)
-// Generates short tutorial or demo videos from text descriptions.
-// Returns operation name for polling (video generation is async).
-// =============================================================================
-async function generateVideo(prompt, geminiKey) {
-  // Step 1: Start the generation job
-  const r = await fetch(
-    `${VEO_BASE}/models/${MODEL_VIDEO}:predictLongRunning`,
-    {
-      method: "POST",
-      headers: { "x-goog-api-key": geminiKey, "Content-Type": "application/json" },
-      body: JSON.stringify({
-        instances: [{ prompt }],
-        parameters: { aspectRatio: "16:9", durationSeconds: 6 },
-      }),
-    }
-  );
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    console.error("Veo video gen error:", t.slice(0, 400));
-    return null;
-  }
-  const data = await r.json();
-  // Returns operation name — client must poll for result
-  return { operationName: data.name, status: "processing" };
-}
-
-// Poll Veo operation for result
-async function pollVideoOperation(operationName, geminiKey) {
-  const r = await fetch(
-    `${VEO_BASE}/${operationName}`,
-    { headers: { "x-goog-api-key": geminiKey } }
-  );
-  if (!r.ok) return null;
-  const data = await r.json();
-  if (!data.done) return { status: "processing" };
-  const videoUri = data.response?.predictions?.[0]?.bytesBase64Encoded
-    ? `data:video/mp4;base64,${data.response.predictions[0].bytesBase64Encoded}`
-    : data.response?.predictions?.[0]?.videoUri || null;
-  return { status: "done", videoUrl: videoUri };
 }
 
 // =============================================================================
@@ -871,40 +831,76 @@ module.exports = async function handler(req, res) {
 
     const geminiKey = process.env.GEMINI_API_KEY;
     if (!geminiKey) return res.status(500).json({ error: "GEMINI_API_KEY is not set in env." });
-    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY is not set — needed for embeddings." });
 
-    // ── Nano Banana 2: Image generation route ────────────────────────────────
-    // POST with { action: "generate_image", prompt: "..." }
+    // ========================================================================
+    // NANO BANANA — Image generation (works for ALL products)
+    // Frontend: POST { action: "generate_image", prompt: "...", product: "..." }
+    // ========================================================================
     if (body.action === "generate_image") {
       const imgPrompt = String(body.prompt || "").trim();
-      if (!imgPrompt) return res.status(400).json({ error: "prompt required for image generation." });
-      const imgResult = await generateImage(imgPrompt, geminiKey);
-      if (!imgResult) return res.status(500).json({ error: "Image generation failed. Try again." });
-      return res.status(200).json({
-        type: "generated_image",
-        image: imgResult.dataUrl,
-        mimeType: imgResult.mimeType,
-      });
+      const imgProduct = String(body.product || "robocoders").toLowerCase();
+      if (!imgPrompt) return res.status(400).json({ error: "prompt required." });
+
+      // SpinGenius: only generate patterns/spirograph images
+      // Robocoders: generate project diagrams, component illustrations
+      // Both: generate whatever user asks — no restriction on image content
+      try {
+        const imageUrl = await generateImageWithNanoBanana(imgPrompt, geminiKey);
+        if (imageUrl) {
+          return res.status(200).json({ type: "generated_image", image: imageUrl });
+        }
+        return res.status(200).json({
+          type: "generated_image",
+          text: "Image generation is not available right now. Try describing what you want and I'll help with text! 🎨",
+        });
+      } catch (err) {
+        return res.status(500).json({ error: "Image generation failed: " + String(err.message).slice(0, 200) });
+      }
     }
 
-    // ── Veo 3.1: Video generation route ─────────────────────────────────────
-    // POST with { action: "generate_video", prompt: "..." }
+    // ========================================================================
+    // VEO — Video generation
+    // Frontend: POST { action: "generate_video", prompt: "..." }
+    // ========================================================================
     if (body.action === "generate_video") {
       const vidPrompt = String(body.prompt || "").trim();
-      if (!vidPrompt) return res.status(400).json({ error: "prompt required for video generation." });
-      const vidResult = await generateVideo(vidPrompt, geminiKey);
-      if (!vidResult) return res.status(500).json({ error: "Video generation failed. Try again." });
-      return res.status(200).json({ type: "video_job", ...vidResult });
+      if (!vidPrompt) return res.status(400).json({ error: "prompt required." });
+      try {
+        const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predictLongRunning", {
+          method: "POST",
+          headers: { "x-goog-api-key": geminiKey, "Content-Type": "application/json" },
+          body: JSON.stringify({
+            instances: [{ prompt: vidPrompt }],
+            parameters: { aspectRatio: "16:9", durationSeconds: 6 },
+          }),
+        });
+        if (!r.ok) {
+          const t = await r.text().catch(() => "");
+          return res.status(500).json({ error: "Video generation failed: " + t.slice(0, 200) });
+        }
+        const data = await r.json();
+        return res.status(200).json({ type: "video_job", operationName: data.name, status: "processing" });
+      } catch (err) {
+        return res.status(500).json({ error: "Video generation error: " + String(err.message).slice(0, 200) });
+      }
     }
 
-    // ── Veo 3.1: Poll video job route ────────────────────────────────────────
-    // POST with { action: "poll_video", operationName: "..." }
     if (body.action === "poll_video") {
       const opName = String(body.operationName || "").trim();
       if (!opName) return res.status(400).json({ error: "operationName required." });
-      const pollResult = await pollVideoOperation(opName, geminiKey);
-      if (!pollResult) return res.status(500).json({ error: "Poll failed." });
-      return res.status(200).json({ type: "video_poll", ...pollResult });
+      try {
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/${opName}`, {
+          headers: { "x-goog-api-key": geminiKey },
+        });
+        if (!r.ok) return res.status(500).json({ error: "Poll failed." });
+        const data = await r.json();
+        if (!data.done) return res.status(200).json({ type: "video_poll", status: "processing" });
+        const videoUri = data.response?.predictions?.[0]?.videoUri || null;
+        return res.status(200).json({ type: "video_poll", status: "done", videoUrl: videoUri });
+      } catch (err) {
+        return res.status(500).json({ error: "Poll error: " + String(err.message).slice(0, 200) });
+      }
     }
 
     // ========================================================================
@@ -939,14 +935,16 @@ module.exports = async function handler(req, res) {
         });
       }
       if (rawIntent.type === "PROJECT_VIDEOS") {
-        if (!rawDetectedProject) {
+        const { lastProject: historyProject } = resolveContextFromHistory(history, projectNames, componentsMap);
+        const videoProject = rawDetectedProject || historyProject;
+        if (!videoProject) {
           return res.status(200).json({ text: "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I'll share all the relevant lesson videos for that project.", debug: { intent: rawIntent, product } });
         }
-        const videos = lessonsByProject[rawDetectedProject] || [];
+        const videos = lessonsByProject[videoProject] || [];
         if (!videos.length) {
-          return res.status(200).json({ text: `I found the project "${rawDetectedProject}", but no lesson videos are mapped for it yet.`, debug: { intent: rawIntent, product } });
+          return res.status(200).json({ text: `I found the project "${videoProject}", but no lesson videos are mapped for it yet.`, debug: { intent: rawIntent, product } });
         }
-        const out = `Lesson videos for ${rawDetectedProject}:\n\n` + videos.map((v, idx) => {
+        const out = `Lesson videos for ${videoProject}:\n\n` + videos.map((v, idx) => {
           const linksText = (v.videoLinks || []).map((u) => `- ${u}`).join("\n");
           return `${idx + 1}. ${v.lessonName}\n${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}Links:\n${linksText}`;
         }).join("\n\n");
@@ -978,11 +976,17 @@ module.exports = async function handler(req, res) {
         const queryEmbedding = await embedText(plannedUserText || rawUserText, geminiKey);
         ragChunks = await queryPinecone(queryEmbedding, "robocoders", 6);
         if (ragChunks.length > 0) {
-          ragContext = "=== RETRIEVED KNOWLEDGE (from vector search) ===\n" +
-            ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]\n${c.text}`).join("\n\n---\n\n");
+          ragContext = "=== RETRIEVED KNOWLEDGE (from vector search) ===
+" +
+            ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]
+${c.text}`).join("
+
+---
+
+");
         }
       } catch (ragErr) {
-        console.error("RAG error:", ragErr.message);
+        console.warn("RAG error (non-fatal):", ragErr.message);
       }
 
       const projectContext = detectedProject ? projectsByName[detectedProject] || null : null;
@@ -1008,7 +1012,7 @@ module.exports = async function handler(req, res) {
         systemPrompt,
         messages: geminiHistory,
         temperature: 0.7,
-        maxTokens: 1000,
+        maxTokens: 2500,
         geminiKey,
       });
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
@@ -1058,8 +1062,12 @@ module.exports = async function handler(req, res) {
         }
 
         if (!grayscaleImageUrl) {
-          const queryEmbedding = await embedText(plannedUserText || rawUserText, geminiKey);
-          ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
+          try {
+            const queryEmbedding = await embedText(plannedUserText || rawUserText, geminiKey);
+            ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
+          } catch (ragErr) {
+            console.warn("SpinGenius RAG error (non-fatal):", ragErr.message);
+          }
         }
 
         if (ragChunks.length > 0) {
@@ -1165,7 +1173,7 @@ Do not write paragraphs. Do not suggest alternatives. Use EXACTLY the board and 
         systemPrompt,
         messages: geminiHistory,
         temperature: 0.7,
-        maxTokens: 1000,
+        maxTokens: 2500,
         geminiKey,
       });
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
@@ -1205,6 +1213,7 @@ Important guidelines:
 - When asked about SAFETY: It is SAFE to plug/unplug sensors while the Robocoders Brain is on (low voltage 5V USB)
 - When asked about PROJECT COUNT: Always say "There are 50 projects, out of which 21 are live. One project per week shall be launched."
 - STRICT SCOPE: If user asks about Spin Genius, spirograph, or drawing machines, say: "I'm the Robocoders assistant! For Spin Genius questions, switch the product from the dropdown above 🤖"
+- IMAGE REQUESTS: If the user asks to "generate an image", "draw something", "show a picture" etc. of anything NOT related to Robocoders projects — say: "I can help with Robocoders project images! Use the Image button in the chat to generate images 🎨"
 
 KNOWLEDGE BASE:
 ${groundedContext}
@@ -1413,8 +1422,16 @@ function resolveContextFromHistory(history, projectNames, componentsMap) {
   let lastProject = null, lastComponent = null;
   for (let i = history.length - 1; i >= 0; i--) {
     const msg = history[i];
-    if (!msg?.content) continue;
-    const text = String(msg.content);
+    // Support OpenAI format (content string) and Gemini format (parts array)
+    let text = "";
+    if (msg?.content && typeof msg.content === "string") {
+      text = msg.content;
+    } else if (Array.isArray(msg?.parts)) {
+      text = msg.parts.map(p => p?.text || "").join(" ");
+    } else if (Array.isArray(msg?.content)) {
+      text = msg.content.map(p => (typeof p === "string" ? p : p?.text || "")).join(" ");
+    }
+    if (!text.trim()) continue;
     if (!lastProject) { const p = detectProject(text, projectNames); if (p) lastProject = p; }
     if (!lastComponent) { const c = detectComponent(text, componentsMap); if (c) lastComponent = c; }
     if (lastProject && lastComponent) break;
