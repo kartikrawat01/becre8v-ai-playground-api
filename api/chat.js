@@ -8,10 +8,22 @@
 // gemini-2.0-flash       → Vision classifier + final answers
 // text-embedding-004     → Embeddings for Pinecone RAG (768 dims)
 // -----------------------------------------------------------------------------
-const GEMINI_BASE    = "https://generativelanguage.googleapis.com/v1beta/models";
-const MODEL_LITE     = "gemini-2.0-flash-lite";   // planner + robocoders answers
-const MODEL_FLASH    = "gemini-2.0-flash";         // vision + spingenius answers
-const EMBED_MODEL    = "text-embedding-004";
+const GEMINI_BASE       = "https://generativelanguage.googleapis.com/v1beta/models";
+
+// ── Chat models ──────────────────────────────────────────────────────────────
+const MODEL_LITE        = "gemini-3-flash-preview";       // Gemini 3 Flash — planner + robocoders
+const MODEL_FLASH       = "gemini-3-flash-preview";       // Gemini 3 Flash — vision + spingenius
+
+// ── Image generation (Nano Banana 2) ─────────────────────────────────────────
+const MODEL_IMAGE       = "gemini-3.1-flash-image-preview"; // Nano Banana 2 — generate pattern images
+
+// ── Video generation (Veo 3.1) ───────────────────────────────────────────────
+const MODEL_VIDEO       = "veo-3.1-generate-preview";       // Veo 3.1 — generate tutorial videos
+const VEO_BASE          = "https://generativelanguage.googleapis.com/v1beta";
+
+// ── Embeddings (OpenAI — Gemini embedding not available in India) ─────────────
+const OPENAI_EMBED_URL  = "https://api.openai.com/v1/embeddings";
+const EMBED_MODEL       = "text-embedding-3-small";
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -108,28 +120,103 @@ async function planChatPrompt(userText, geminiKey) {
 }
 
 // =============================================================================
-// Embeddings — Google text-embedding-004 (768 dims)
-// Uses RETRIEVAL_QUERY task type for runtime queries.
+// Embeddings — OpenAI text-embedding-3-small (1536 dims)
+// Gemini embeddings not available in India — using OpenAI for Pinecone queries.
 // =============================================================================
 async function embedText(text, geminiKey) {
-  const r = await fetch(
-    `${GEMINI_BASE}/${EMBED_MODEL}:embedContent?key=${geminiKey}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: `models/${EMBED_MODEL}`,
-        content: { parts: [{ text: String(text || "").trim().slice(0, 8000) }] },
-        taskType: "RETRIEVAL_QUERY",
-      }),
-    }
-  );
+  const openaiKey = process.env.OPENAI_API_KEY;
+  if (!openaiKey) throw new Error("OPENAI_API_KEY not set in env.");
+  const r = await fetch(OPENAI_EMBED_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: EMBED_MODEL, input: String(text || "").trim() }),
+  });
   if (!r.ok) {
     const t = await r.text().catch(() => "");
     throw new Error("Embedding error: " + t.slice(0, 800));
   }
   const data = await r.json();
-  return data?.embedding?.values;
+  return data.data[0].embedding;
+}
+
+// =============================================================================
+// Nano Banana 2 — Image Generation (gemini-3.1-flash-image-preview)
+// Generates pattern images or diagrams from text descriptions.
+// Returns base64 image data.
+// =============================================================================
+async function generateImage(prompt, geminiKey) {
+  const r = await fetch(
+    `${GEMINI_BASE}/${MODEL_IMAGE}:generateContent?key=${geminiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
+      }),
+    }
+  );
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.error("Nano Banana image gen error:", t.slice(0, 400));
+    return null;
+  }
+  const data = await r.json();
+  // Extract base64 image from response
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  for (const part of parts) {
+    if (part.inlineData?.mimeType?.startsWith("image/")) {
+      return {
+        mimeType: part.inlineData.mimeType,
+        base64: part.inlineData.data,
+        dataUrl: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
+      };
+    }
+  }
+  return null;
+}
+
+// =============================================================================
+// Veo 3.1 — Video Generation (veo-3.1-generate-preview)
+// Generates short tutorial or demo videos from text descriptions.
+// Returns operation name for polling (video generation is async).
+// =============================================================================
+async function generateVideo(prompt, geminiKey) {
+  // Step 1: Start the generation job
+  const r = await fetch(
+    `${VEO_BASE}/models/${MODEL_VIDEO}:predictLongRunning`,
+    {
+      method: "POST",
+      headers: { "x-goog-api-key": geminiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instances: [{ prompt }],
+        parameters: { aspectRatio: "16:9", durationSeconds: 6 },
+      }),
+    }
+  );
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    console.error("Veo video gen error:", t.slice(0, 400));
+    return null;
+  }
+  const data = await r.json();
+  // Returns operation name — client must poll for result
+  return { operationName: data.name, status: "processing" };
+}
+
+// Poll Veo operation for result
+async function pollVideoOperation(operationName, geminiKey) {
+  const r = await fetch(
+    `${VEO_BASE}/${operationName}`,
+    { headers: { "x-goog-api-key": geminiKey } }
+  );
+  if (!r.ok) return null;
+  const data = await r.json();
+  if (!data.done) return { status: "processing" };
+  const videoUri = data.response?.predictions?.[0]?.bytesBase64Encoded
+    ? `data:video/mp4;base64,${data.response.predictions[0].bytesBase64Encoded}`
+    : data.response?.predictions?.[0]?.videoUri || null;
+  return { status: "done", videoUrl: videoUri };
 }
 
 // =============================================================================
@@ -784,6 +871,41 @@ module.exports = async function handler(req, res) {
 
     const geminiKey = process.env.GEMINI_API_KEY;
     if (!geminiKey) return res.status(500).json({ error: "GEMINI_API_KEY is not set in env." });
+    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
+
+    // ── Nano Banana 2: Image generation route ────────────────────────────────
+    // POST with { action: "generate_image", prompt: "..." }
+    if (body.action === "generate_image") {
+      const imgPrompt = String(body.prompt || "").trim();
+      if (!imgPrompt) return res.status(400).json({ error: "prompt required for image generation." });
+      const imgResult = await generateImage(imgPrompt, geminiKey);
+      if (!imgResult) return res.status(500).json({ error: "Image generation failed. Try again." });
+      return res.status(200).json({
+        type: "generated_image",
+        image: imgResult.dataUrl,
+        mimeType: imgResult.mimeType,
+      });
+    }
+
+    // ── Veo 3.1: Video generation route ─────────────────────────────────────
+    // POST with { action: "generate_video", prompt: "..." }
+    if (body.action === "generate_video") {
+      const vidPrompt = String(body.prompt || "").trim();
+      if (!vidPrompt) return res.status(400).json({ error: "prompt required for video generation." });
+      const vidResult = await generateVideo(vidPrompt, geminiKey);
+      if (!vidResult) return res.status(500).json({ error: "Video generation failed. Try again." });
+      return res.status(200).json({ type: "video_job", ...vidResult });
+    }
+
+    // ── Veo 3.1: Poll video job route ────────────────────────────────────────
+    // POST with { action: "poll_video", operationName: "..." }
+    if (body.action === "poll_video") {
+      const opName = String(body.operationName || "").trim();
+      if (!opName) return res.status(400).json({ error: "operationName required." });
+      const pollResult = await pollVideoOperation(opName, geminiKey);
+      if (!pollResult) return res.status(500).json({ error: "Poll failed." });
+      return res.status(200).json({ type: "video_poll", ...pollResult });
+    }
 
     // ========================================================================
     // ROBOCODERS PATH
