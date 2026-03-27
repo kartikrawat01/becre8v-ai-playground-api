@@ -1,19 +1,15 @@
 // =============================================================================
 // Be Cre8v AI Backend — Multi-Product RAG (Robocoders + Spin Genius)
-// Powered by Google Gemini 2.0 Flash family
 // =============================================================================
-
-// ── Gemini model assignments ─────────────────────────────────────────────────
-// gemini-2.0-flash-lite  → Planner (cheapest, fast, text-only)
-// gemini-2.0-flash       → Vision classifier + final answers
-// text-embedding-004     → Embeddings for Pinecone RAG (768 dims)
-// -----------------------------------------------------------------------------
-const GEMINI_BASE      = "https://generativelanguage.googleapis.com/v1beta/models";
-const MODEL_LITE       = "gemini-2.0-flash-lite";
-const MODEL_FLASH      = "gemini-2.0-flash";
-const MODEL_IMAGE      = "gemini-2.0-flash-exp-image-generation"; // Nano Banana image gen
+// ── OpenAI (embeddings only — Pinecone uses 1536-dim vectors) ────────────────
 const OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings";
-const EMBED_MODEL      = "text-embedding-3-small"; // 1536 dims — existing Pinecone index
+const EMBED_MODEL      = "text-embedding-3-small";
+
+// ── Gemini (chat, vision, image generation) ───────────────────────────────────
+const GEMINI_BASE  = "https://generativelanguage.googleapis.com/v1beta/models";
+const MODEL_CHAT   = "gemini-2.0-flash";       // main chat + vision classifier
+const MODEL_LITE   = "gemini-2.0-flash-lite";  // planner (lightweight)
+const MODEL_IMAGE  = "gemini-2.0-flash-exp-image-generation"; // Nano Banana image gen
 
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
@@ -32,58 +28,127 @@ function allow(res, origin) {
   return false;
 }
 
-// =============================================================================
-// Gemini Chat helper — text only (flash-lite for planner, flash for answers)
-// =============================================================================
-async function geminiChat({ model, systemPrompt, messages, temperature = 0.7, maxTokens = 1000, geminiKey }) {
-  // Convert OpenAI-style message array to Gemini contents format.
-  // Gemini uses "model" where OpenAI uses "assistant".
-  // System prompt is passed separately via system_instruction.
-  const rawContents = messages
-    .filter(m => m.role !== "system")
-    .map(m => {
-      if (Array.isArray(m.parts)) return { role: m.role, parts: m.parts };
-      const role = (m.role === "assistant") ? "model" : "user";
-      let parts;
-      if (typeof m.content === "string") {
-        parts = [{ text: m.content }];
-      } else if (Array.isArray(m.content)) {
-        parts = m.content.map(p => {
-          if (p.type === "text") return { text: p.text };
-          if (p.type === "image_url") {
-            const url = p.image_url?.url || "";
-            const base64 = url.startsWith("data:") ? url.split(",")[1] : url;
-            return { inline_data: { mime_type: "image/jpeg", data: base64 } };
-          }
-          return { text: String(p.text || p || "") };
-        }).filter(Boolean);
-      } else {
-        parts = [{ text: String(m.content || "") }];
-      }
-      return { role, parts };
-    })
-    .filter(m => m.parts && m.parts.length > 0);
+const CHAT_PLANNER_PROMPT = `
+You are Be Cre8v AI Conversation Planner.
+Rewrite the user's message into a clearer, more intelligent version BEFORE it is answered.
+Rules:
+- Do NOT answer the user.
+- Output ONLY the rewritten prompt text.
+- Preserve intent and key details.
+- Make it easier to answer with steps, structure, and the right questions.
+- Keep child-friendly, encouraging tone.
+- If the user asks something product-specific but doesn't specify the project/module name, include a short clarification question in the rewritten prompt.
+- Do not add adult/unsafe content.
+`.trim();
 
-  // Enforce alternating user/model turns — Gemini rejects consecutive same roles
+async function planChatPrompt(userText, apiKey) {
+  // apiKey param kept for signature compatibility but Gemini key comes from env
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) return String(userText || "").trim();
+  try {
+    const r = await fetch(`${GEMINI_BASE}/${MODEL_LITE}:generateContent?key=${geminiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        system_instruction: { parts: [{ text: CHAT_PLANNER_PROMPT }] },
+        contents: [{ role: "user", parts: [{ text: String(userText || "").trim() }] }],
+        generationConfig: { temperature: 0.4, maxOutputTokens: 500 },
+      }),
+    });
+    if (!r.ok) return String(userText || "").trim();
+    const data = await r.json();
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || String(userText || "").trim();
+  } catch (_) {
+    return String(userText || "").trim();
+  }
+}
+
+async function embedText(text, apiKey) {
+  // OpenAI embeddings kept — Gemini text-embedding-004 not available in India
+  // Existing Pinecone index uses 1536-dim (text-embedding-3-small) — no change needed
+  const r = await fetch(OPENAI_EMBED_URL, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ model: EMBED_MODEL, input: String(text || "").trim() }),
+  });
+  if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Embedding error: " + t.slice(0, 800)); }
+  const data = await r.json();
+  return data.data[0].embedding;
+}
+
+// =============================================================================
+// Nano Banana 2 — Image Generation (gemini-2.0-flash-exp-image-generation)
+// Returns base64 data URL or null if not available.
+// =============================================================================
+async function generateImageWithNanoBanana(prompt, geminiKey) {
+  try {
+    const r = await fetch(`${GEMINI_BASE}/${MODEL_IMAGE}:generateContent?key=${geminiKey}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
+      }),
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      console.warn("Nano Banana unavailable:", t.slice(0, 200));
+      return null;
+    }
+    const data = await r.json();
+    const parts = data?.candidates?.[0]?.content?.parts || [];
+    for (const part of parts) {
+      if (part.inlineData?.mimeType?.startsWith("image/")) {
+        return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
+      }
+    }
+    return null;
+  } catch (err) {
+    console.warn("Nano Banana error:", err.message);
+    return null;
+  }
+}
+
+// =============================================================================
+// Gemini Chat — replaces OpenAI chat completions
+// Handles conversation history in Gemini alternating-turns format.
+// =============================================================================
+async function geminiChatCall({ systemPrompt, history, userParts, model, temperature = 0.7, maxTokens = 2000, geminiKey }) {
+  // Build Gemini-format history from OpenAI-format history
   const contents = [];
-  for (const msg of rawContents) {
-    if (contents.length > 0 && contents[contents.length - 1].role === msg.role) {
-      contents[contents.length - 1].parts.push(...msg.parts);
-    } else {
-      contents.push({ role: msg.role, parts: [...msg.parts] });
+  for (const h of history || []) {
+    if (h?.role === "user" && h?.content) {
+      const text = typeof h.content === "string" ? h.content : (Array.isArray(h.content) ? h.content.map(p => p?.text || "").join(" ") : "");
+      if (text.trim()) contents.push({ role: "user", parts: [{ text }] });
+    } else if (h?.role === "assistant" && h?.content) {
+      const text = String(h.content || "");
+      if (text.trim()) contents.push({ role: "model", parts: [{ text }] });
     }
   }
-  if (contents.length > 0 && contents[0].role !== "user") {
-    contents.unshift({ role: "user", parts: [{ text: "Hello" }] });
+
+  // Enforce alternating turns (Gemini requirement)
+  const alternating = [];
+  for (const msg of contents) {
+    if (alternating.length > 0 && alternating[alternating.length - 1].role === msg.role) {
+      alternating[alternating.length - 1].parts.push(...msg.parts);
+    } else {
+      alternating.push({ role: msg.role, parts: [...msg.parts] });
+    }
+  }
+
+  // Add current user message
+  alternating.push({ role: "user", parts: userParts });
+
+  // First turn must be user
+  if (alternating.length > 0 && alternating[0].role !== "user") {
+    alternating.unshift({ role: "user", parts: [{ text: "Hello" }] });
   }
 
   const body = {
-    contents,
+    system_instruction: systemPrompt ? { parts: [{ text: systemPrompt }] } : undefined,
+    contents: alternating,
     generationConfig: { temperature, maxOutputTokens: maxTokens },
   };
-  if (systemPrompt) {
-    body.system_instruction = { parts: [{ text: systemPrompt }] };
-  }
 
   const r = await fetch(`${GEMINI_BASE}/${model}:generateContent?key=${geminiKey}`, {
     method: "POST",
@@ -99,89 +164,6 @@ async function geminiChat({ model, systemPrompt, messages, temperature = 0.7, ma
   return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
 }
 
-// =============================================================================
-// Planner — uses flash-lite (cheapest, no vision needed)
-// =============================================================================
-const CHAT_PLANNER_PROMPT = `
-You are Be Cre8v AI Conversation Planner.
-Rewrite the user's message into a clearer, more intelligent version BEFORE it is answered.
-Rules:
-- Do NOT answer the user.
-- Output ONLY the rewritten prompt text.
-- Preserve intent and key details.
-- Make it easier to answer with steps, structure, and the right questions.
-- Keep child-friendly, encouraging tone.
-- If the user asks something product-specific but doesn't specify the project/module name, include a short clarification question in the rewritten prompt.
-- Do not add adult/unsafe content.
-`.trim();
-
-async function planChatPrompt(userText, geminiKey) {
-  try {
-    return await geminiChat({
-      model: MODEL_LITE,
-      systemPrompt: CHAT_PLANNER_PROMPT,
-      messages: [{ role: "user", content: String(userText || "").trim() }],
-      temperature: 0.4,
-      maxTokens: 500,
-      geminiKey,
-    });
-  } catch (err) {
-    console.warn("Planner error:", err.message);
-    return String(userText || "").trim();
-  }
-}
-
-// =============================================================================
-// Embeddings — OpenAI text-embedding-3-small (1536 dims)
-// Gemini embeddings not available in India. Using OpenAI for Pinecone queries.
-// =============================================================================
-async function embedText(text, geminiKey) {
-  const openaiKey = process.env.OPENAI_API_KEY;
-  if (!openaiKey) throw new Error("OPENAI_API_KEY not set — needed for embeddings.");
-  const r = await fetch(OPENAI_EMBED_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${openaiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({ model: EMBED_MODEL, input: String(text || "").trim().slice(0, 8000) }),
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error("Embedding error: " + t.slice(0, 800));
-  }
-  const data = await r.json();
-  return data.data[0].embedding;
-}
-
-// =============================================================================
-// Nano Banana — Image Generation
-// Works for both robocoders and spingenius product contexts.
-// =============================================================================
-async function generateImageWithNanoBanana(prompt, geminiKey) {
-  const r = await fetch(`${GEMINI_BASE}/${MODEL_IMAGE}:generateContent?key=${geminiKey}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents: [{ role: "user", parts: [{ text: prompt }] }],
-      generationConfig: { responseModalities: ["IMAGE", "TEXT"] },
-    }),
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    console.error("Nano Banana error:", t.slice(0, 300));
-    return null;
-  }
-  const data = await r.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  for (const part of parts) {
-    if (part.inlineData?.mimeType?.startsWith("image/")) {
-      return `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`;
-    }
-  }
-  return null;
-}
-
-// =============================================================================
-// Pinecone query — unchanged, only receives vector values
-// =============================================================================
 async function queryPinecone(queryEmbedding, namespace, topK = 6) {
   const host = process.env.PINECONE_INDEX_HOST;
   const apiKey = process.env.PINECONE_API_KEY;
@@ -206,8 +188,22 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
 }
 
 // =============================================================================
-// IMAGE PREPROCESSING — Convert to grayscale before sending to Gemini
-// Same fix as before: strip color so the model analyses shape only.
+// IMAGE PREPROCESSING — Convert to grayscale before sending to GPT
+//
+// ROOT CAUSE OF COLOR MISIDENTIFICATION:
+// GPT-4o-mini uses color as a visual shortcut even when told not to in the prompt.
+// Prompt instructions alone cannot fully override the model's internal vision
+// processing which detects color automatically.
+//
+// THE FIX — Strip color BEFORE the API call:
+// By converting the image to grayscale using sharp, we physically eliminate all
+// color data. The model literally cannot see color because it does not exist in
+// the image. This permanently solves:
+//   Problem 1: Same pattern, different pen color → now correctly identified
+//   Problem 2: Two different patterns in same color → now distinguished by shape
+//
+// .normalise() boosts contrast so line structure is sharper and easier to analyse.
+// Falls back to original image if sharp fails — handler never crashes.
 // =============================================================================
 async function toGrayscaleBase64(imageData) {
   try {
@@ -227,18 +223,32 @@ async function toGrayscaleBase64(imageData) {
 }
 
 // =============================================================================
-// Pattern name lookup table — unchanged
+// Pattern name lookup table — ALL 50 patterns, shape-based names ONLY
+// Rules:
+//   1. NO color words (no golden, pink, green, dark, black etc.)
+//   2. Specific multi-word phrases listed before short single words
+//   3. 12-J listed BEFORE 10-A so "net","grid","mesh" match garden net first
+//   4. findImageByPatternName sorts names by length desc so longer phrases win
+//   5. For duplicate board positions (e.g. 10-Q, 9-B), both stickPositions map
+//      to the same image filename — image naming is handled by the knowledge base
 // =============================================================================
 const PATTERN_NAME_MAP = [
+  // ── RING / CHAIN PATTERNS ──────────────────────────────────────────────────
   { image: "3-D.jpeg",  names: ["magic bubble chain","bubble ring chain","bubble chain","chain of linked loops","chain of rings","linked ring chain","loopy chain","bubble ring","ring chain"] },
   { image: "1-E.jpeg",  names: ["soapy bubble garland","floating bubble ring","bubble garland","soapy ring","ring of circles","bubble circles","garland of bubbles"] },
   { image: "2-F.jpeg",  names: ["soap bubble ring","bubble dream ring","faint bubble ring","tiny soap bubbles","gentle bubble ring","quiet bubble ring","dream bubble","soap bubbles floating"] },
   { image: "9-O.jpeg",  names: ["bird nest ring","cozy bird nest","delicate circle ring","nest of circles","dancing circles ring","thin loop ring","bird nest"] },
+
+  // ── NET / GRID PATTERNS — listed before 10-A so "net","grid","mesh" match first ──
   { image: "12-J.jpeg", names: ["magic garden fence","secret garden net","circular grid","circular net","circular mesh","woven circle","garden fence","garden net","fishing net","grid pattern","net pattern","mesh pattern","lattice pattern","woven fence","square grid","grid","net","lattice","mesh","woven"] },
+
+  // ── CROWN / LACE PATTERNS ──────────────────────────────────────────────────
   { image: "6-N.jpeg",  names: ["royal crown lace","princess lace crown","lace crown","lace border","open center crown","fancy lace pattern","crown pattern","lace pattern","crown","lace"] },
   { image: "4-N.jpeg",  names: ["fancy lace tablecloth","lace tablecloth","lace ring","wavy lace","tablecloth lace","lace weave","fancy lace ring","wavy loop ring","tablecloth"] },
   { image: "6-Q.jpeg",  names: ["bunny ear ring","bunny ears circle","tall thin loops","upright loop ring","tall loop ring","bunny ears","tall loops circle","bunny ear"] },
   { image: "4-H.jpeg",  names: ["lacy flower ring","lacy donut ring","lacy ring","lace flower ring","tiny loops ring","hundreds of loops","fancy donut ring","lacy circle","lace donut"] },
+
+  // ── FLOWER PATTERNS ────────────────────────────────────────────────────────
   { image: "7-J.jpeg",  names: ["happy little flower","petal flower","bouncy flower","overlapping petals","loopy petals","rosette pattern","loopy flower","flower pattern","floral pattern","small flower","compact flower","flower","rosette","petals"] },
   { image: "1-P.jpeg",  names: ["blooming rose","bold rose","large petal flower","big petal flower","rose pattern","overlapping rose petals","rose bloom","bold flower"] },
   { image: "14-I.jpeg", names: ["blooming sunburst","garden sunburst","soft petal sunburst","symmetrical sunburst","blooming garden flower","spinning flower","sunburst flower","garden flower"] },
@@ -248,25 +258,35 @@ const PATTERN_NAME_MAP = [
   { image: "3-C.jpeg",  names: ["geometric puzzle bloom","puzzle flower","neat geometric flower","round puzzle loops","geometric bloom","puzzle loops flower","tidy bloom","puzzle pieces flower"] },
   { image: "14-H.jpeg", names: ["dandelion dream","dandelion petals","skinny dandelion loops","long petal dandelion","dandelion flower","long skinny petals","morning sun petals","dandelion"] },
   { image: "9-M.jpeg",  names: ["spinning hula hoop","vibrant hula hoop","hula hoop ring","energetic ring","bouncy vibrant ring","hula ring","vibrant ring","hula hoop"] },
+
+  // ── SPIDERWEB / MANDALA ─────────────────────────────────────────────────────
   { image: "10-A.jpeg", names: ["shining spiderweb","spiderweb mandala","spiral web like structure","spiral web like","spiral web","web like structure","web-like structure","radiating lines","diamond gaps","diamond shapes","starburst pattern","mandala pattern","spoke pattern","diamond web","web pattern","spider web","spiderweb","web structure","starburst","mandala"] },
   { image: "7-B.jpeg",  names: ["artist spider star","spiderweb star","large loop star","loops crossing middle","spiderweb loops","large crossing loops","artist spider","simple spiderweb star"] },
   { image: "11-A.jpeg", names: ["royal thread crown","crown of light","thread crown","crossing lines circle","glowing ring crown","shiny thread ring","straight crossing circle","crown of threads"] },
+
+  // ── DENSE / SOLID RING ──────────────────────────────────────────────────────
   { image: "3-R.jpeg",  names: ["spinning galaxy swirl","dense whirlpool","fuzzy donut","dense donut","packed spiral","solid ring","solid donut","tightly packed lines","thick donut","thick ring","whirlpool pattern","donut pattern","whirlpool","galaxy swirl","vortex","swirl"] },
   { image: "11-L.jpeg", names: ["giant bold donut","giant donut","solid thick ring","bold donut ring","thick ring with hole","big donut","bold ring","strong donut","giant ring"] },
   { image: "15-A.jpeg", names: ["spinning scribble wheel","fuzzy tire","scribble wheel","messy circle tire","tire scribbles","dense messy circle","fuzzy wheel","spinning wheel scribble"] },
   { image: "G-6.jpeg",  names: ["glowing magic coin","spinning badge","magic coin","glowing badge","thread sun","squeezed center badge","glowing coin","tiny spinning sun","badge coin"] },
   { image: "16-O.jpeg", names: ["deep sea shell","spiraling seashell","seashell tunnel","deep tunnel spiral","busy seashell","spiral seashell","tunnel seashell","deep spiral","seashell"] },
   { image: "12-C.jpeg", names: ["happy glowing sun","glowing sun","solid sun center","rays all directions","packed sun","dense sun pattern","glowing rays","solid bright sun"] },
+
+  // ── STAR PATTERNS ──────────────────────────────────────────────────────────
   { image: "8-A.jpeg",  names: ["magic thread snowflake","magic snowflake star","thin star snowflake","delicate snowflake star","snowflake star","magic thread star","thin star","magic snowflake"] },
   { image: "10-R.jpeg", names: ["magic castle window","castle star window","star window castle","steady star castle","straight line star","strong star","castle window","balanced star"] },
+  // 10-Q has TWO different configurations — each has its own unique image
   { image: "10-Q-1.jpeg", names: ["ancient mystery star","triangle star","overlapping triangles star","geometric triangle star","mystery star","triangle circle","triangles in circle"] },
   { image: "10-Q-2.jpeg", names: ["night air sparkle","spinning sparkle","thin rotating points","thin sharp sparkle","fast spinning star","sparkle star","rotating sparkle"] },
   { image: "6-L.jpeg",  names: ["beautiful tangle","tangle star","complex crossing star","neat tangle","detailed crossing star","crossing line star","complex star tangle","tangle pattern"] },
+  // 9-B has TWO different configurations — each has its own unique image
   { image: "9-B-1.jpeg",  names: ["treasure map star","compass star","explorer star","long thin star points","skinny star","compass rose star","twinkling compass","star compass","skinny star points"] },
   { image: "4-P.jpeg",  names: ["royal star crown","star crown","pointy star crown","star crown border","triangular crown","sharp triangle crown","king queen crown star","crown star"] },
   { image: "2-J.jpeg",  names: ["star bicycle wheel","star wheel","bicycle wheel stars","thin crisp star ring","neat star ring","round star path","bicycle wheel","star ring"] },
   { image: "15-Q.jpeg", names: ["dancing loop ring","criss cross loop ring","criss crossing loops","magical loop ring","hundreds of tiny loops","criss cross ring","loop dance ring","dancing loops circle"] },
   { image: "9-B-2.jpeg",  names: ["explorer medal","double star knot","two stars tied","two stars knot","brave explorer medal","double star","medal star","explorer medal star"] },
+
+  // ── SPIRAL / SWIRL / CURVES ─────────────────────────────────────────────────
   { image: "4-C.jpeg",  names: ["candy swirl","lollipop spiral","lollipop candy","sweet spiral","converging spiral","candy shop spiral","lollipop pattern","candy lollipop"] },
   { image: "5-L.jpeg",  names: ["deep ocean swirl","ocean whirlpool","bold wave swirl","ocean wave circle","swooping wave circle","water whirlpool","ocean swirl","bold waves","wave circle"] },
   { image: "16-L.jpeg", names: ["giant snowflake","magical snowflake","smooth snowflake","sweeping snowflake curves","flowy snowflake","giant flowy snowflake","large snowflake","smooth curves snowflake"] },
@@ -291,100 +311,307 @@ function findImageByPatternName(queryText) {
 }
 
 // =============================================================================
-// EXACT PATTERN LOOKUP TABLE — unchanged
+// Vision Pattern Classifier
+// Receives a GRAYSCALE image — color already eliminated before this call.
+// temperature=0 + JSON-only output = deterministic, reliable classification.
+// =============================================================================
+// =============================================================================
+// EXACT PATTERN LOOKUP TABLE — hardcoded from spingenius.json
+// This is the single source of truth for board+stick → image mapping.
+// No Pinecone ranking involved — always exact, never "closest match".
+// When classifier identifies a board, this table gives the precise image.
 // =============================================================================
 const PATTERN_LOOKUP = {
   "3-D|3-3":   { patternImage: "3-D.jpeg", patternName: "Petal Loop Donut", funName: "The Petal Loop Donut 🍩" },
-  "12-J|5-5":  { patternImage: "12-J.jpeg", patternName: "Jagged Grid Ring", funName: "The Jagged Grid Ring 🌿" },
+  "12-J|5-5":   { patternImage: "12-J.jpeg", patternName: "Jagged Grid Ring", funName: "The Jagged Grid Ring 🌿" },
   "6-N|5-6":   { patternImage: "6-N.jpeg", patternName: "Swirling Feather Ring", funName: "The Swirling Feather Ring 🪶" },
   "7-J|1-1":   { patternImage: "7-J.jpeg", patternName: "Round Petal Flower", funName: "The Round Petal Flower 🌸" },
   "3-R|4-2":   { patternImage: "3-R.jpeg", patternName: "Woven Scallop Ring", funName: "The Woven Scallop Ring 🍩" },
-  "10-A|4-4":  { patternImage: "10-A.jpeg", patternName: "Crossing Arc Ring", funName: "The Crossing Arc Ring 🌟" },
+  "10-A|4-4":   { patternImage: "10-A.jpeg", patternName: "Crossing Arc Ring", funName: "The Crossing Arc Ring 🌟" },
   "9-M|2-7":   { patternImage: "9-M.jpeg", patternName: "Arc Donut", funName: "The Thick Arc Donut 🍩" },
   "2-P|6-6":   { patternImage: "2-P.jpeg", patternName: "Magic Grid Globe", funName: "The Magic Grid Globe 🌐" },
   "4-P|4-5":   { patternImage: "4-P.jpeg", patternName: "Shark Fin Star", funName: "The Spinning Shark Fin Star 🦈" },
   "4-N|5-5":   { patternImage: "4-N.jpeg", patternName: "Spinning Fan Crown", funName: "The Spinning Fan Crown 🌀" },
   "1-P|4-4":   { patternImage: "1-P.jpeg", patternName: "Bold Rose Flower", funName: "The Big Bold Rose 🌹" },
-  "15-A|4-6":  { patternImage: "15-A.jpeg", patternName: "Scribble Tire", funName: "The Scribble Tire 🛞" },
+  "15-A|4-6":   { patternImage: "15-A.jpeg", patternName: "Scribble Tire", funName: "The Scribble Tire 🛞" },
   "2-J|6-6":   { patternImage: "2-J.jpeg", patternName: "Diamond Lace Ring", funName: "The Diamond Lace Ring 💎" },
-  "16-L|4-6":  { patternImage: "16-L.jpeg", patternName: "Swooping Snowflake", funName: "The Swooping Snowflake ❄️" },
+  "16-L|4-6":   { patternImage: "16-L.jpeg", patternName: "Swooping Snowflake", funName: "The Swooping Snowflake ❄️" },
   "9-B|4-2":   { patternImage: "9-B-1.jpeg", patternName: "Loopy Asterisk Star", funName: "The Loopy Asterisk Star ⭐" },
   "2-F|3-3":   { patternImage: "2-F.jpeg", patternName: "Soap Bubble Garland", funName: "The Soap Bubble Garland 🫧" },
   "2-C|2-2":   { patternImage: "2-C.jpeg", patternName: "Flower in a Globe", funName: "The Secret Flower Globe 🔮" },
   "4-C|2-2":   { patternImage: "4-C.jpeg", patternName: "Scribble Donut", funName: "The Little Scribble Donut 🍩" },
   "5-L|6-5":   { patternImage: "5-L.jpeg", patternName: "Feather Wreath", funName: "The Blue Feather Wreath 🪶" },
   "6-Q|5-4":   { patternImage: "6-Q.jpeg", patternName: "Heart Tip Starburst", funName: "The Heart Tip Star 💝" },
-  "11-C|5-1":  { patternImage: "11-C.jpeg", patternName: "Spinning Fan Blades", funName: "The Spinning Fan 🌀" },
-  "16-O|6-3":  { patternImage: "16-O.jpeg", patternName: "Grid with Curly Edge", funName: "The Curly Grid Ring 🌊" },
+  "11-C|5-1":   { patternImage: "11-C.jpeg", patternName: "Spinning Fan Blades", funName: "The Spinning Fan 🌀" },
+  "16-O|6-3":   { patternImage: "16-O.jpeg", patternName: "Grid with Curly Edge", funName: "The Curly Grid Ring 🌊" },
   "7-B|7-4":   { patternImage: "7-B.jpeg", patternName: "Petal Star", funName: "The Bold Petal Star 🌟" },
-  "14-H|4-3":  { patternImage: "14-H.jpeg", patternName: "Dandelion Petal Ring", funName: "The Dandelion Wish Ring 🌼" },
-  "15-F|5-3":  { patternImage: "15-F.jpeg", patternName: "Zigzag Gear", funName: "The Zigzag Gear ⚙️" },
+  "14-H|4-3":   { patternImage: "14-H.jpeg", patternName: "Dandelion Petal Ring", funName: "The Dandelion Wish Ring 🌼" },
+  "15-F|5-3":   { patternImage: "15-F.jpeg", patternName: "Zigzag Gear", funName: "The Zigzag Gear ⚙️" },
   "1-H|3-5":   { patternImage: "1-H.jpeg", patternName: "Pinecone Scale Ring", funName: "The Lucky Pinecone Ring 🌲" },
-  "11-A|6-6":  { patternImage: "11-A.jpeg", patternName: "Thread Ring", funName: "The Golden Thread Ring ✨" },
+  "11-A|6-6":   { patternImage: "11-A.jpeg", patternName: "Thread Ring", funName: "The Golden Thread Ring ✨" },
   "9-O|5-5":   { patternImage: "9-O.jpeg", patternName: "Delicate Loop Ring", funName: "The Delicate Loop Ring 🐦" },
-  "11-J|4-4":  { patternImage: "11-J.jpeg", patternName: "Scalloped Woven Disc", funName: "The Scalloped Wonder Disc 🌀" },
-  "14-I|4-4":  { patternImage: "14-I.jpeg", patternName: "Grand Rose", funName: "The Grand Rose 🌹" },
+  "11-J|4-4":   { patternImage: "11-J.jpeg", patternName: "Scalloped Woven Disc", funName: "The Scalloped Wonder Disc 🌀" },
+  "14-I|4-4":   { patternImage: "14-I.jpeg", patternName: "Grand Rose", funName: "The Grand Rose 🌹" },
   "7-C|2-2":   { patternImage: "7-C.jpeg", patternName: "Eight Round Petals", funName: "The Eight Petal Stamp 🌼" },
   "8-A|3-2":   { patternImage: "8-A.jpeg", patternName: "Wispy Asterisk", funName: "The Wispy Magic Star ✨" },
-  "12-C|3-1":  { patternImage: "12-C.jpeg", patternName: "Exploding Sun", funName: "The Exploding Sun ☀️" },
+  "12-C|3-1":   { patternImage: "12-C.jpeg", patternName: "Exploding Sun", funName: "The Exploding Sun ☀️" },
   "7-H|3-3":   { patternImage: "7-H.jpeg", patternName: "Circle Wreath", funName: "The Cozy Circle Wreath 🎄" },
   "3-L|1-5":   { patternImage: "3-L.jpeg", patternName: "Bold Swirling Petals", funName: "The Bold Swirling Petals 🌸" },
   "2-M|1-5":   { patternImage: "2-M.jpeg", patternName: "Spinning Pinwheel", funName: "The Spinning Pinwheel 🌸" },
   "1-E|4-4":   { patternImage: "1-E.jpeg", patternName: "Oval Bubble Ring", funName: "The Oval Bubble Ring 🫧" },
-  "13-R|4-2":  { patternImage: "13-R.jpeg", patternName: "Floppy Oval Ring", funName: "The Floppy Oval Ring 🫧" },
+  "13-R|4-2":   { patternImage: "13-R.jpeg", patternName: "Floppy Oval Ring", funName: "The Floppy Oval Ring 🫧" },
   "3-C|3-3":   { patternImage: "3-C.jpeg", patternName: "Overlapping Circles Flower", funName: "The Circle Puzzle Flower 🌸" },
   "1-I|4-3":   { patternImage: "1-I.jpeg", patternName: "Feather Grid Ring", funName: "The Feather Grid Ring 🌿" },
   "7-A|1-2":   { patternImage: "7-A.jpeg", patternName: "Spiky Sea Urchin", funName: "The Spiky Sea Urchin 🦔" },
-  "11-L|1-1":  { patternImage: "11-L.jpeg", patternName: "Thin Circle Ring", funName: "The Thin Magic Ring 💍" },
-  "10-R|1-1":  { patternImage: "10-R.jpeg", patternName: "Simple Polygon Star", funName: "The Simple Magic Window ⭐" },
-  "10-Q|1-1":  { patternImage: "10-Q-1.jpeg", patternName: "Triangle Star", funName: "The Triangle Magic Star 🔯" },
+  "11-L|1-1":   { patternImage: "11-L.jpeg", patternName: "Thin Circle Ring", funName: "The Thin Magic Ring 💍" },
+  "10-R|1-1":   { patternImage: "10-R.jpeg", patternName: "Simple Polygon Star", funName: "The Simple Magic Window ⭐" },
+  "10-Q|1-1":   { patternImage: "10-Q-1.jpeg", patternName: "Triangle Star", funName: "The Triangle Magic Star 🔯" },
   "6-L|1-1":   { patternImage: "6-L.jpeg", patternName: "Dense Tangle Star", funName: "The Dense Tangle Star ⭐" },
-  "10-Q|1-2":  { patternImage: "10-Q-2.jpeg", patternName: "Spiky Chaos Star", funName: "The Spiky Chaos Star 💥" },
+  "10-Q|1-2":   { patternImage: "10-Q-2.jpeg", patternName: "Spiky Chaos Star", funName: "The Spiky Chaos Star 💥" },
   "9-B|2-1":   { patternImage: "9-B-2.jpeg", patternName: "Compact Loopy Star", funName: "The Compact Loopy Star 🌟" },
   "4-H|3-6":   { patternImage: "4-H.jpeg", patternName: "Tiny Loop Lace Ring", funName: "The Lacy Loop Ring 🍩" },
   "G-6|1-2":   { patternImage: "G-6.jpeg", patternName: "Tiny Sun Badge", funName: "The Tiny Sun Badge 🪙" },
-  "15-Q|2-1":  { patternImage: "15-Q.jpeg", patternName: "Criss-Cross Loop Ring", funName: "The Criss-Cross Magic Ring 💫" },
+  "15-Q|2-1":   { patternImage: "15-Q.jpeg", patternName: "Criss-Cross Loop Ring", funName: "The Criss-Cross Magic Ring 💫" },
 };
 
-function lookupExact(board, stick) {
-  return PATTERN_LOOKUP[`${board}|${stick}`] || null;
-}
+// Lookup by board only (for cases where only board is known, no stick)
+// Returns the entry if that board has exactly ONE configuration, else null.
 function lookupByBoard(board) {
-  const key = Object.keys(PATTERN_LOOKUP).find(k => k.startsWith(board + "|"));
-  return key ? PATTERN_LOOKUP[key] : null;
+  const upper = board.toUpperCase();
+  const matches = Object.entries(PATTERN_LOOKUP).filter(([k]) => k.startsWith(upper + "|"));
+  return matches.length === 1 ? matches[0][1] : null;
+}
+
+// Lookup by board+stick — always exact, never approximate
+function lookupExact(board, stick) {
+  const key = `${board.toUpperCase()}|${stick}`;
+  return PATTERN_LOOKUP[key] || null;
 }
 
 // =============================================================================
-// Vision Pattern Classifier — now uses Gemini 2.0 Flash for image analysis
-// Receives a GRAYSCALE image. All prompts are unchanged.
+// Vision Pattern Classifier — GPT-4o + precise fingerprints for all 50 patterns
+// Upgraded from gpt-4o-mini to gpt-4o for superior fine geometric detail vision.
+// Precise distinguishing fingerprints added for every visually similar pair.
+// Returns boardPosition + stickPosition. Image filename resolved via PATTERN_LOOKUP.
+// =============================================================================
+const VISION_CLASSIFIER_PROMPT = `You are an expert Spin Genius pattern classifier. You will be shown a GRAYSCALE spirograph pattern drawn on paper.
+The image is grayscale — identify by GEOMETRY AND STRUCTURAL DETAILS ONLY. Color does not exist.
+
+YOUR JOB: Identify the exact board position and stick position from the descriptions below.
+Study carefully before deciding. Use the distinguishing fingerprints.
+
+════════════════════════════════════════════════════════
+STEP 1 — SIZE AND POSITION OF THE PATTERN ON THE DISC
+════════════════════════════════════════════════════════
+
+TINY / SMALL pattern concentrated near center of disc (lots of empty white space around it):
+  → Could be: 10-R, 11-L, 9-B(2-1), 10-Q(1-1), 10-Q(1-2), 6-L, 8-A, 9-B(4-2), 7-J, 4-C, G-6, 7-A, 2-C
+
+MEDIUM pattern filling roughly half the disc:
+  → Could be: 7-B, 7-H, 7-C, 3-C, 1-I, 13-R, 1-E, 2-F, 3-D
+
+LARGE pattern filling most or all of the disc:
+  → Could be: 11-J, 14-I, 2-P, 12-J, 3-R, 6-N, 11-A, 9-M, 10-A, 3-L, all ring patterns
+
+════════════════════════════════════════════════════════
+STEP 2 — OVERALL STRUCTURE TYPE
+════════════════════════════════════════════════════════
+
+A) GRID/NET — Lines cross making square/rectangular gaps in a ring. Look for distinctive inner border.
+B) CROSSING-ARC RING — Lines sweep and cross in a ring making diamond gaps. Smooth edges.
+C) SCALLOPED/WOVEN DISC — Large disc-filling overlapping arcs making petal/scallop shapes.
+D) PARALLEL-ARC RING — Lines are PARALLEL (NOT crossing) curved arcs stacked in a ring.
+E) FEATHER/SCALE RING — Feather, leaf, or scale shapes all tilted in same swirling direction.
+F) FLOWER/PETAL — Curved petal or oval shapes meeting or overlapping at/near center.
+G) OVERLAPPING CIRCLES — Full round circles overlapping each other (not petals — full circles).
+H) STAR/SPOKE — Straight lines radiating outward forming a star or spoke pattern.
+I) FAN/PINWHEEL — Curved arms all sweeping in ONE direction like a fan or pinwheel.
+J) OUTER-LOOP RING — Shapes only on outer edge, large empty center.
+K) BUBBLE/OVAL CHAIN — Separate oval or bubble shapes linked in a ring.
+L) DENSE/SOLID RING — Ring looks very thick and dense, arcs nearly filling the ring.
+M) TINY DENSE CENTER — Very small dense pattern concentrated at center of disc.
+
+════════════════════════════════════════════════════════
+STEP 3 — EXACT BOARD FROM OBSERVED FINGERPRINTS
+════════════════════════════════════════════════════════
+
+── TYPE A: GRID/NET — CRITICAL DISAMBIGUATION ─────────────
+  These 5 patterns all have crossing lines. Use this STRICT DECISION TREE:
+
+  QUESTION 1: Does the center hole have JAGGED/SPIKY/ZIGZAG points?
+    YES → 12-J sticks 5-5
+      (Large grid ring. Inner border has sharp notched teeth pointing inward all around the hole.)
+    NO → continue to Q2
+
+  QUESTION 2: Are there short spiky or feather shapes pointing OUTWARD on the outer edge?
+    YES → 1-I sticks 4-3
+      (Medium ring. Grid inside + distinctive spikes/feathers on outer edge. Two features combined.)
+    NO → continue to Q3
+
+  QUESTION 3: Are there tiny loop or knot shapes on the outer edge?
+    YES → 2-J sticks 6-6
+      (Ring with diamond grid inside. Outer edge has tiny curl/knot decorations. Ring is moderately sized, large open center.)
+    NO → continue to Q4
+
+  QUESTION 4: Can you see 3 or 4 large sweeping S-CURVE or diagonal wave lines cutting through the grid?
+    YES → 2-P sticks 6-6
+      (Large ring/disc. The most distinctive feature: 3-4 bold curved lines sweep diagonally across the whole pattern making an S or wave shape through the grid. Fills large area.)
+    NO → 11-A sticks 6-6
+      (Clean thin ring of crossing lines only. No spikes, no knots, no S-curves, no jagged border. Just a plain neat woven thread ring. Large open center. This is the simplest of the group.)
+
+── TYPE B: CROSSING-ARC RING ─────────────────────────────
+  10-A sticks 4-4  — Ring where lines sweep and cross making a woven band with diamond/square gaps. Both inner and outer edges are smooth curves. Large round open center.
+  2-J  sticks 6-6  — Similar ring but with tiny loop or knot shapes decorating the outer edge. Inner crossing lines make diamond gaps. Distinctive outer knot decoration.
+
+── TYPE C: SCALLOPED/WOVEN DISC ──────────────────────────
+  KEY QUESTION: How much of the disc is filled, and what is the gap/center size?
+
+  11-J sticks 4-4  — ENTIRE DISC filled. Overlapping curved arcs make a beautiful scalloped petal grid covering the WHOLE disc from edge to edge. The arcs create a regular repeating petal pattern like fish scales. Center hole is ROUND and clearly defined.
+  3-R  sticks 4-2  — LARGE RING but NOT filling full disc — wide thick ring with medium center hole. The overlapping scalloped arcs form a wide band. You can clearly see individual arc shapes. The ring band is VERY WIDE and thick, almost but not quite filling the disc.
+  3-D  sticks 3-3  — MEDIUM RING, smaller than 3-R, more concentrated. The overlapping loops/arcs are packed into a ring that does NOT fill the full disc. Has a clear medium center hole. Less grand than 3-R. More like a thick donut ring than a full disc pattern.
+
+── TYPE D: PARALLEL-ARC RING ─────────────────────────────
+  9-M  sticks 2-7  — Thick ring of PARALLEL (non-crossing) curved arcs all stacked together. Very clean and regular. Lines do NOT cross each other — they are parallel. Large open center.
+
+── TYPE E: FEATHER/SCALE RING ────────────────────────────
+  KEY QUESTION: Do the individual shapes have visible lines INSIDE them (internal texture)?
+
+  6-N  sticks 5-6  — YES internal texture. Each feather/leaf shape has many tiny lines INSIDE it making it look like a real feather with detail. The feathers also CROSS each other with crossing lines visible between them. Large open center. Ring fills large area of disc.
+  5-L  sticks 6-5  — NO internal texture. Each shape is a plain clean oval or leaf with NO lines inside. Just simple clean oval outlines all tilted the same direction. Large open center. Simpler, cleaner look than 6-N.
+  1-H  sticks 3-5  — Scale shapes like pinecone or fish scales. Each scale leans over neighbor in ONE consistent direction. Scales are more rounded/compact than 5-L's ovals. Open center.
+
+── TYPE F: FLOWER/PETAL ──────────────────────────────────
+  Size and petal shape are key. Compare carefully:
+
+  7-J  sticks 1-1  — SMALL compact. 7-8 round fat oval petals overlapping at center. Centered on disc with lots of white space around. Looks like a cheerful doodle flower.
+  7-C  sticks 2-2  — SMALL. Exactly 8 equal round petals perfectly symmetrical, like a stamp. Clean and neat. Small.
+  7-H  sticks 3-3  — MEDIUM-SMALL. Dense circle wreath — many overlapping circular loops packed into a thick ring. More like a wreath than a flower. Small center hole.
+  3-C  sticks 3-3  — MEDIUM. 8-10 large full CIRCLES (not petals) overlapping each other filling an area. Like overlapping rings. NO clear center hole.
+  2-C  sticks 2-2  — TINY. A very small 4-petal flower ENCLOSED INSIDE a circular outer border. Has a visible circle outline surrounding it. Very small, centered.
+  1-P  sticks 4-4  — LARGE. Big bold wide petals like a rose. Bigger and bolder than 7-J. Fills more of disc.
+  14-I sticks 4-4  — LARGE. Grand rose — many large oval petals slightly rotated, spreading across most of disc. Elegant, open. Small center.
+  3-L  sticks 1-5  — LARGE. 20-25 big bold oval petals all swirling in ONE direction. Strong rotation sense. Polygon-shaped center hole.
+  12-C sticks 3-1  — MEDIUM-SMALL. ALL lines meet at ONE SOLID CENTER POINT. No hole at all. Like an exploding sun or firework from center. Starburst with solid center.
+
+── TYPE G: OVERLAPPING CIRCLES ───────────────────────────
+  3-C  sticks 3-3  — 8-10 large full circles overlapping. (Also listed in Type F above)
+
+── TYPE H: STAR/SPOKE ────────────────────────────────────
+  Compare by size, number of arms, and arm style:
+
+  10-R sticks 1-1  — VERY SMALL. Just a few straight lines making a clean simple polygon star or octagon. Minimal lines. Very tiny on disc.
+  8-A  sticks 3-2  — SMALL-MEDIUM. 8 very long thin wispy arms, each ending in tiny loop. Very sparse — lots of empty space between arms. Larger than 9-B(4-2). Like a wispy asterisk.
+  9-B  sticks 4-2  — SMALL-MEDIUM. 8 long thin arms each ending in small rounded loop. More defined than 8-A but similar. Like a loopy asterisk star. Slightly smaller than 8-A.
+  9-B  sticks 2-1  — SMALL. 8 shorter FATTER arms with BIGGER oval loops. More compact and concentrated. Looks like a compact badge star.
+  7-B  sticks 7-4  — MEDIUM-LARGE. 5-6 LARGE bold oval loop petals all crossing each other at center. Very open and airy. Each loop is big. Open star shape.
+  6-L  sticks 1-1  — SMALL-MEDIUM. Many straight lines crossing in a DENSE TANGLE. Busier and more complex than other stars. Small open center barely visible.
+  10-Q sticks 1-1  — SMALL. Clean geometric star of neat overlapping TRIANGLES. Polygon center hole clearly visible. Organized and mathematical-looking.
+  10-Q sticks 1-2  — SMALL. Many thin straight lines shooting in all DIRECTIONS making a chaotic spiky explosion. Messy and energetic. Small center.
+  4-P  sticks 4-5  — MEDIUM-LARGE. Sharp SHARK FIN star points (triangular, straight one side / diagonal other). Points rotate around open center. Fills disc well.
+
+── TYPE I: FAN/PINWHEEL ──────────────────────────────────
+  11-C sticks 5-1  — 20-25 curved blades sweeping in ONE direction. Open round center. Medium disc coverage. Classic fan blade look.
+  2-M  sticks 1-5  — ~25 long smooth curved arms sweeping in one direction with pointed tips. More open spacing between arms than 11-C. Round open center.
+  3-L  sticks 1-5  — 20-25 large bold oval petals swirling one direction. (Also listed in Type F)
+  4-N  sticks 5-5  — Fan-shaped triangular blades with tiny loop tip on each one. Distinctive loop at tip of every blade. Rotation direction visible.
+  16-L sticks 4-6  — Large smooth sweeping snowflake/pinwheel curves. Very large, open, graceful. Much bigger than 11-C.
+
+── TYPE J: OUTER-LOOP RING ───────────────────────────────
+  6-Q  sticks 5-4  — Many thin radiating lines ALL ending in tiny TEARDROP/HEART loops at outer tips. Like a starburst where every tip has a tiny heart. Open center.
+  4-H  sticks 3-6  — Ring of HUNDREDS of tiny loops. Very dense lacy ring. Large open center. Looks like detailed lacework.
+  15-Q sticks 2-1  — Ring of HUNDREDS of tiny CRISS-CROSSING loops. Busier and more tangled than 4-H. Loops cross each other.
+
+── TYPE K: BUBBLE/OVAL CHAIN ─────────────────────────────
+  CRITICAL GROUP — compare carefully by oval COUNT and SIZE:
+
+  13-R sticks 4-2  — 6-8 LARGE FLOPPY ovals loosely arranged in a ring. Each oval is big and casual. Very open. Large open center. Ovals are the biggest of the group.
+  1-E  sticks 4-4  — ~12 THIN SMALLER ovals linked side by side in a chain ring. More numerous and thinner than 13-R. Light and delicate. Large open center.
+  2-F  sticks 3-3  — ~10 VERY THIN DELICATE ovals. Even lighter/fainter/smaller than 1-E. Very airy and ghostly. Large open center.
+  9-O  sticks 5-5  — Many thin loops slightly overlapping and dancing. More numerous than others. Loops touch and overlap neighbors. Ring looks more continuous than a chain.
+
+  DISAMBIGUATION: Count ovals and check thickness.
+  6-8 large floppy → 13-R
+  ~12 thin medium  → 1-E
+  ~10 very faint   → 2-F
+  many overlapping → 9-O
+
+── TYPE L: DENSE/SOLID RING ──────────────────────────────
+  11-L sticks 1-1  — TINY NARROW RING. Looks like a thin simple circle/wedding ring. Very small, minimal lines, very thin band. Sits in center of disc. The simplest ring.
+  15-A sticks 4-6  — Thick messy SCRIBBLY ring. Lines look rough, tangled, and random. Like a tire drawn by scribbling. Small center hole.
+  16-O sticks 6-3  — Large grid filling most of disc. Distinctive SMALL CURL/LOOP shapes on the INNER EDGE pointing inward. Main body is a crossing-line grid.
+  G-6  sticks 1-2  — TINY SMALL dense circular scribble concentrated at center of disc. Very small. Like a tiny badge or coin. Lots of empty disc space around it.
+  7-A  sticks 1-2  — TINY SMALL dense SPIKY pattern at center. Many very short spiky lines shooting outward. Like a tiny sea urchin or spiky ball. Very small.
+  4-C  sticks 2-2  — SMALL messy scribble donut. Small overlapping circular scribbles making a tiny donut shape. Small center hole.
+
+── TYPE M: FUZZY/THREAD TUNNEL ───────────────────────────
+  1-I  sticks 4-3  — Ring with GRID inside + SHORT SPIKES/FEATHERS on outer edge. Two combined features. (Also in Type A above)
+
+════════════════════════════════════════════════════════
+CRITICAL CONFUSION RULES
+════════════════════════════════════════════════════════
+
+12-J vs 2-P: 12-J has JAGGED inner border. 2-P has smooth inner border and fills full disc.
+3-R vs 11-J vs 3-D: 11-J fills ENTIRE disc with scalloped grid. 3-R is a thick wide ring with visible arcs. 3-D is smaller/more concentrated.
+1-E vs 13-R vs 2-F: Count ovals. 6-8 big floppy=13-R. ~12 thin=1-E. ~10 very faint=2-F.
+9-B(4-2) vs 8-A: Both 8 arms with loops. 8-A arms are LONGER and THINNER. 9-B(4-2) slightly more defined/compact.
+9-B(2-1) vs 9-B(4-2): 9-B(2-1) has SHORTER FATTER arms with BIGGER loops, more compact overall.
+10-Q(1-1) vs 10-Q(1-2): 10-Q(1-1) has neat overlapping TRIANGLES and is organized. 10-Q(1-2) has chaotic spiky lines going everywhere.
+11-L vs G-6 vs 7-A vs 4-C: 11-L=thin ring. G-6=tiny dense scribble badge. 7-A=tiny spiky sea urchin. 4-C=tiny scribble donut with hole.
+11-C vs 2-M vs 4-N: 11-C=clean curved blades. 2-M=longer arms pointed tips. 4-N=blades with tiny loop at each tip (distinctive loop tip).
+NEVER output 12-J unless inner border is clearly JAGGED/ZIGZAG/SPIKY.
+11-A vs 2-P vs 1-I vs 2-J vs 12-J: Use the STRICT DECISION TREE in Type A above. Ask each question in order.
+  11-A = plain woven ring, no extra features. 2-P = S-curves through grid. 2-J = outer knots. 1-I = outer spikes. 12-J = jagged inner border.
+5-L vs 6-N: 6-N has lines INSIDE each feather (internal texture + crossing between feathers). 5-L shapes are PLAIN clean ovals with nothing inside.
+11-C vs 2-M vs 4-N: 4-N has LOOPS at blade tips. 11-C has bare pointed tips, ~20-25 blades. 2-M has bare pointed tips, longer arms, more open spacing.
+11-J vs 3-R vs 3-D: 11-J fills ENTIRE disc. 3-R is a very wide thick ring, NOT full disc. 3-D is a smaller medium ring.
+NEVER output 3-R unless arcs are clearly visible in a scalloped wide ring.
+ALWAYS output a board from the lists above.
+
+Respond ONLY with valid JSON, no other text:
+{"boardPosition":"1-E","stickPosition":"4-4","patternImage":"1-E.jpeg"}`;
+
+// =============================================================================
+// THREE-STEP CLASSIFIER — Grounded in direct observation of all 50 real patterns
+//
+// CONFIRMED FAILURES FIXED IN THIS VERSION:
+//   11-J → 11-A  (scalloped disc misrouted to grid group)
+//   13-R → 3-L   (floppy oval loops misrouted to flower group)
+//   5-L  → 6-N   (pen line width confused with interior hatching)
+//   16-L → 7-H   (large sweeping loops misrouted to flower/wreath group)
+//   6-Q  → 9-M   (teardrop-tip starburst misrouted to large ring group)
+//
+// APPROACH:
+//   Step 1 — Sequential YES/NO questions route image to correct group (A-L)
+//   Step 2 — Within that group, identify the exact board
+//   Step 3 — Verification pass for the most visually similar pairs
 // =============================================================================
 
-// ─── STEP 1 CATEGORY PROMPT ──────────────────────────────────────────────────
-const STEP1_CATEGORY_PROMPT = `You are analysing a GRAYSCALE spirograph pattern image.
-Answer the questions below in strict order. Stop at the FIRST YES.
+// ─── STEP 1 ──────────────────────────────────────────────────────────────────
+const STEP1_CATEGORY_PROMPT = `You are a Spin Genius spirograph pattern classifier.
+You will see a GRAYSCALE image of a spirograph drawn on a circular white disc.
+IGNORE ALL COLOR. Judge only by SHAPE, STRUCTURE, SIZE, and LINE GEOMETRY.
 
-Q1 — TEARDROP/HEART LOOPS AT OUTER EDGE:
-Do you see spokes where EACH OUTER TIP ends in a DISTINCT TEARDROP or HEART-SHAPED LOOP — or a DENSE RING of hundreds of tiny lacy side-by-side loops?
-  YES → J
+Go through these questions IN ORDER. Stop at the FIRST question that matches. Output ONLY the single letter.
 
-Q2 — TINY CENTERED PATTERN (fills less than 1/4 of disc):
-Is the ENTIRE PATTERN a small feature at the disc center with large empty space all around?
+Q1 — TRULY TINY CENTERED PATTERN:
+Is the ENTIRE pattern VERY SMALL — like a small coin or badge — sitting only at the very CENTER of the disc, with a MASSIVE empty white area all around it taking up at least 3/4 of the disc? The pattern must be clearly coin-sized or smaller relative to the disc.
+IMPORTANT: Star shapes, triangle stars, geometric stars, asterisks — even small ones — do NOT go here. Only true tiny donut/scribble/spiky-ball patterns go here.
   YES → G
 
-Q3 — LARGE SWEEPING LOOP (5-6 very large smooth curves, or ~20-25 bold swirling petals):
-Do you see either (a) only 5-6 very LARGE GRACEFUL SMOOTH CURVES sweeping grandly across the disc, OR (b) about 20-25 BOLD WIDE OVAL PETALS all strongly swirling in ONE direction (individually countable, like a bold pinwheel)?
-  YES → L
+Q2 — TEARDROP/HEART LOOPS AT OUTER TIPS:
+Do you see many thin lines or spokes radiating outward, where EACH LINE ENDS IN A SMALL TEARDROP, HEART, or LOOP SHAPE at the outer tip? Loops are only at the outer edge. Large open center.
+  YES → J
 
-Q4 — SEPARATE BUBBLE/OVAL SHAPES IN A RING:
-Are the shapes SEPARATE, individual closed oval or bubble shapes arranged in a ring — each one a distinct standalone outline shape with clear space (or few overlaps) between them?
-This includes: clean single-stroke ovals, floppy multi-stroke ovals, or small oval clusters.
-NOTE: If shapes are clearly TILTED or LEANING consistently in one direction (wreath-lean), still answer YES — they are still separate closed shapes.
-NOTE: Do NOT answer YES if shapes are hundreds of tiny lacy loops merged into a dense ring.
+Q3 — SEPARATE ENCLOSED BUBBLE/OVAL SHAPES IN A RING:
+Can you see clearly SEPARATE enclosed oval or loop shapes arranged in a ring, with open space between each shape? Each shape is its own distinct closed loop — they do NOT all meet at a central point.
   YES → F
+
+Q4 — LARGE SWEEPING PETAL LOOPS (few very large loops crossing each other):
+Does the pattern have a SMALL NUMBER (5-8) of VERY LARGE, WIDE, SWEEPING oval or petal loops that CROSS THROUGH EACH OTHER, forming a ring? The loops are big and bold — each one curves widely across the disc. Has a polygon-shaped open center hole. Fills most of disc.
+  YES → L
 
 Q5 — FULL DISC SCALLOP/PETAL GRID:
 Does the pattern cover MOST or ALL of the disc AND consist of overlapping arc shapes creating a repeating PETAL or SCALLOP texture like fish scales tiling across the surface?
-NOTE: Answer YES only if the scallop/petal texture is the MAIN feature. If shapes are clearly feathers/leaves tilted one direction use Q9. If shapes are swirling petals all in one direction use Q10.
   YES → H
 
 Q6 — GRID WITH SPECIAL EDGE OR BODY FEATURE:
@@ -399,14 +626,12 @@ Q8 — LARGE FAN/PINWHEEL (long narrow curved blades, same sweep direction):
 Do you see a large ring of LONG NARROW CURVED BLADE shapes, all sweeping in the SAME rotational direction like a spinning fan? Each blade is a long narrow individual curve.
   YES → C
 
-Q9 — LEAF/FEATHER/SCALE RING (distinct closed leaf or oval shapes all tilted same direction):
-Do you see a ring of LEAF, FEATHER, SCALE, or OVAL shapes — each one a distinct closed outline shape, all TILTED or LEANING in the same rotational direction?
-This includes patterns where oval shapes form a wreath/ring with a consistent lean — even if they vaguely resemble bubbles, if they tilt in one direction they belong here.
+Q9 — LEAF/FEATHER/SCALE RING (distinct closed leaf shapes in a ring):
+Do you see a ring of LEAF, FEATHER, or SCALE shapes — each one a distinct closed outline shape, all tilted the same direction?
   YES → B
 
 Q10 — FLOWER/PETAL (shapes meet at or near center):
 Do petal or oval shapes MEET or OVERLAP at or near the CENTER of the pattern, forming a flower where petals share a center point?
-NOTE: If the pattern is a RING (hollow center clearly visible, no petals reaching center) — answer NO even if it has petal-like shapes. Ring patterns go to H, B, or I.
   YES → D
 
 Q11 — PLAIN CROSSING-LINE RING (smooth woven band, no extra features):
@@ -419,280 +644,307 @@ Output ONLY the single letter. Nothing else.`;
 
 // ─── STEP 2 PROMPTS ──────────────────────────────────────────────────────────
 const STEP2_PROMPTS = {
+
+  // GROUP A: GRID / CROSSING-LINE RINGS
   A: `GRAYSCALE spirograph. Identify the GRID or CROSSING-LINE RING.
 Answer each question in order. Stop at first YES.
+
 Q1: Does the CENTER HOLE have a JAGGED/SPIKY/ZIGZAG border — sharp teeth pointing inward all around the hole rim?
   YES → {"boardPosition":"12-J","stickPosition":"5-5"}
+
 Q2: Are there SHORT SPIKY or FEATHER-LIKE lines sticking OUTWARD beyond the ring outer edge — pointing away from center like short spears?
   YES → {"boardPosition":"1-I","stickPosition":"4-3"}
+
 Q3: Are there tiny SQUIGGLY CURLS or SCRIBBLY LOOP decorations all around the OUTER RIM of the ring?
   YES → {"boardPosition":"2-J","stickPosition":"6-6"}
+
 Q4: Can you see 4-5 large bold SMOOTH DIAGONAL CURVES or S-SHAPES sweeping across the ENTIRE pattern, filling most of the disc?
   YES → {"boardPosition":"2-P","stickPosition":"6-6"}
+
 Q5: Plain ring of crossing lines — smooth edges both sides, no extra features?
   YES → {"boardPosition":"11-A","stickPosition":"6-6"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP B: LEAF / FEATHER / SCALE RING
   B: `GRAYSCALE spirograph. Identify the LEAF, FEATHER, or SCALE RING.
-FIRST — If shapes look like simple upright BUBBLES (NOT tilted, round, thin outlines), count them:
-  ~12-14 clean neat bubble ovals, not tilted → {"boardPosition":"1-E","stickPosition":"4-4"}
-  ~10 very faint/light bubble ovals, not tilted → {"boardPosition":"2-F","stickPosition":"3-3"}
+
 CRITICAL — Look carefully INSIDE one leaf/feather shape:
 Can you see MULTIPLE FINE LINES running across the INTERIOR of each shape — like veins or hatching lines drawn INSIDE the body (not just the outline)?
+
   YES, fine interior lines inside each shape → {"boardPosition":"6-N","stickPosition":"5-6"}
+
   NO, shapes are plain hollow outlines — nothing drawn inside:
-    Shapes LEAN OVER their neighbor like pinecone or fish scales (each one overlaps the next in one direction, compact and rounded)?
+    Shapes LEAN OVER their neighbor like pinecone or fish scales (each one overlaps the next in one direction)?
       YES → {"boardPosition":"1-H","stickPosition":"3-5"}
-    Plain clean oval or leaf outlines, all TILTED same direction, hollow inside, wreath-like ring?
+    Plain clean oval or leaf outlines, all tilted same direction, hollow inside?
       YES → {"boardPosition":"5-L","stickPosition":"6-5"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP C: LARGE FAN / PINWHEEL BLADES
   C: `GRAYSCALE spirograph. Identify the LARGE FAN or PINWHEEL BLADE pattern.
-STEP 1 — Look at the TIP of each blade. Do the tips end in a tiny LOOP or CURL?
+Long curved blades all sweeping in the same direction like a spinning fan.
+
+STEP 1 — Look at the TIP of each blade. Do the tips end in a tiny LOOP or CURL (a small closed loop at the end)?
   YES, each tip has a small loop/curl → {"boardPosition":"4-N","stickPosition":"5-5"}
-  NO, tips are plain → continue to STEP 2
-STEP 2 — Is each blade a SINGLE THIN LINE, or MULTIPLE PARALLEL LINES bundled together?
-  SINGLE THIN LINES, widely spaced, large open center → {"boardPosition":"2-M","stickPosition":"1-5"}
-  MULTIPLE BUNDLED LINES, blades look thick and bold, more packed, smaller center → {"boardPosition":"11-C","stickPosition":"5-1"}
+  NO, tips are plain (pointed or slightly oval) → continue to STEP 2
+
+STEP 2 — Look closely at each individual blade. Is each blade made of a SINGLE THIN LINE, or are the blades made of MULTIPLE PARALLEL LINES bundled together making each blade look THICK and BOLD?
+
+  SINGLE THIN LINES — each blade is just one thin line:
+    The blades are very thin, widely spaced, lots of white space clearly visible between each blade.
+    The centre hole is LARGE. Blades reach from near-centre out to near the disc edge.
+    → {"boardPosition":"2-M","stickPosition":"1-5"}
+
+  MULTIPLE BUNDLED LINES — each blade is made of several lines travelling together:
+    The blades look THICKER and BOLDER because multiple lines make up each blade.
+    Blades are more densely packed, less white space between them.
+    The centre hole is MEDIUM-SMALL. The overall pattern looks heavier/bolder.
+    → {"boardPosition":"11-C","stickPosition":"5-1"}
+
+KEY: 2-M = single thin lines, widely spaced, large open center.
+     11-C = bundled thick bold blades, more packed, smaller center.
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP D: FLOWER / PETAL
   D: `GRAYSCALE spirograph. Identify the FLOWER or PETAL pattern.
+
 TINY/SMALL (less than 1/3 of disc):
   Visible CIRCULAR OUTER BORDER surrounding the flower? → {"boardPosition":"2-C","stickPosition":"2-2"}
   Exactly 8 neat equal petals, no outer frame? → {"boardPosition":"7-C","stickPosition":"2-2"}
   7-8 round fatter overlapping petals, casual doodle flower? → {"boardPosition":"7-J","stickPosition":"1-1"}
+
 MEDIUM (1/3 to 2/3 of disc):
-  Dense WREATH/RING of many overlapping circular loops with a center hole? → {"boardPosition":"7-H","stickPosition":"3-3"}
-  Separate full ROUND CIRCLES overlapping like soap bubbles, no clear ring hole? → {"boardPosition":"3-C","stickPosition":"3-3"}
-  ALL lines meet at ONE SOLID CENTER POINT, no hole (starburst/firework)? → {"boardPosition":"12-C","stickPosition":"3-1"}
+  Dense WREATH/RING of many overlapping circular loops — looks like a donut with a center hole? → {"boardPosition":"7-H","stickPosition":"3-3"}
+  Separate full ROUND CIRCLES overlapping (like soap bubbles — no clear ring hole)? → {"boardPosition":"3-C","stickPosition":"3-3"}
+  ALL lines meet at ONE SOLID CENTER POINT — no hole at all (starburst/firework)? → {"boardPosition":"12-C","stickPosition":"3-1"}
+
 LARGE (fills most of disc):
-  ~20-25 WIDE BOLD separate oval petals ALL swirling strongly in ONE direction, polygon center hole, petals clearly countable? → {"boardPosition":"3-L","stickPosition":"1-5"}
+  ~20-25 WIDE BOLD oval petals ALL swirling strongly in ONE direction, polygon center hole? → {"boardPosition":"3-L","stickPosition":"1-5"}
   MANY large oval petals rotating around a small polygon center hole, not strongly directional? → {"boardPosition":"14-I","stickPosition":"4-4"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP E: STAR / SPOKE / ASTERISK
   E: `GRAYSCALE spirograph. Identify the STAR, SPOKE, or ASTERISK pattern.
-NO LOOPS:
-  Very small — neat OCTAGON or simple polygon ring? → {"boardPosition":"10-R","stickPosition":"1-1"}
+
+NO LOOPS — plain straight lines or sharp points at arm tips:
+  Very small — just a few lines making a neat OCTAGON or simple polygon ring? → {"boardPosition":"10-R","stickPosition":"1-1"}
   Small neat overlapping TRIANGLES, organized geometric star, clear polygon center hole? → {"boardPosition":"10-Q","stickPosition":"1-1"}
   Small CHAOTIC — many thin lines going all directions, messy explosion? → {"boardPosition":"10-Q","stickPosition":"1-2"}
   Small-medium — many lines in a DENSE TANGLE, very complex and busy? → {"boardPosition":"6-L","stickPosition":"1-1"}
   SHARP TRIANGULAR POINTS (shark fins) rotating around open center, fills disc well? → {"boardPosition":"4-P","stickPosition":"4-5"}
+
 YES LOOPS at arm tips:
   5-6 VERY LARGE BOLD OVAL LOOPS crossing each other, fills most of disc, polygon center hole? → {"boardPosition":"7-B","stickPosition":"7-4"}
   8 COMPACT FAT plump oval loops, short arms, dense star? → {"boardPosition":"9-B","stickPosition":"2-1"}
   8 MEDIUM-LENGTH arms each ending in a small rounded loop, open/sparse? → {"boardPosition":"9-B","stickPosition":"4-2"}
   8 VERY LONG WISPY barely-visible arms with tiny loops, huge white space? → {"boardPosition":"8-A","stickPosition":"3-2"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP F: SEPARATE OVAL/BUBBLE SHAPES IN A RING
   F: `GRAYSCALE spirograph. Identify the SEPARATE BUBBLE/OVAL CHAIN pattern.
-FIRST — Check for TILT: Are the shapes clearly TILTED or LEANING in a consistent rotational direction?
-  YES, shapes tilt/lean in one rotational direction → {"boardPosition":"5-L","stickPosition":"6-5"}
-  NO, shapes sit upright/neutral in a ring → continue below
-~7-8 LARGE FLOPPY ovals, each drawn with MULTIPLE OVERLAPPING LINES making them thick and messy. Large open center.
+
+~7-8 LARGE FLOPPY ovals, each drawn with MULTIPLE OVERLAPPING LINES making them thick and messy. Big and casual-looking. Large open center.
   → {"boardPosition":"13-R","stickPosition":"4-2"}
+
 ~12-14 CLEAN SINGLE-LINE neat oval shapes in a tidy ring. Each oval is a crisp single-stroke outline. Very large open center.
   → {"boardPosition":"1-E","stickPosition":"4-4"}
-~8-10 MEDIUM oval cluster shapes — small bundles of a few overlapping lines each.
+
+~8-10 MEDIUM oval cluster shapes — small bundles of a few overlapping lines each. Not as large as 13-R, not as neat as 1-E.
   → {"boardPosition":"2-F","stickPosition":"3-3"}
+
 MANY small loops OVERLAPPING continuously — ring looks nearly continuous, loops blend into each other.
   → {"boardPosition":"9-O","stickPosition":"5-5"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP G: TINY CENTERED PATTERN
   G: `GRAYSCALE spirograph. Identify the TINY CENTERED pattern.
+Entire pattern is small at the disc center with large white space around it.
+
 OUTWARD SPIKES radiating in all directions from center — spiky ball or sea urchin look. Has a tiny center hole.
   → {"boardPosition":"7-A","stickPosition":"1-2"}
-Just ONE plain simple RING or CIRCLE — very minimal, no complexity at all.
+
+Just ONE plain simple RING or CIRCLE — like a single drawn ring band. Very minimal, no complexity at all.
   → {"boardPosition":"11-L","stickPosition":"1-1"}
-NEAT ORDERLY tightly-wound coil — concentric arcs wound around each other precisely. NOT messy. Small center hole.
+
+NEAT ORDERLY tightly-wound coil — concentric arcs wound around each other precisely. NOT messy. Small center hole. Looks like a neatly coiled spring from above.
   → {"boardPosition":"G-6","stickPosition":"1-2"}
-MESSY CHAOTIC scribble donut — overlapping circular scribble lines forming a small messy donut. Lines are RANDOM.
+
+MESSY CHAOTIC scribble donut — overlapping circular scribble lines forming a small messy donut. Lines are RANDOM. Has a center hole.
   → {"boardPosition":"4-C","stickPosition":"2-2"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP H: FULL DISC SCALLOP / PETAL GRID
   H: `GRAYSCALE spirograph. Identify the LARGE SCALLOPED or PETAL DISC pattern.
+
 ENTIRE DISC filled from edge to edge — petal/scallop texture covers ALL space, no background gap outside. Clear ROUND center hole.
   → {"boardPosition":"11-J","stickPosition":"4-4"}
-VERY WIDE RING covering most of disc — VERY SMALL center hole. Thin gap of background at outer disc edge. Arcs overlap in scalloped wave pattern.
+
+VERY WIDE RING covering most of disc — VERY SMALL center hole. Thin gap of background at outer disc edge.
   → {"boardPosition":"3-R","stickPosition":"4-2"}
-MEDIUM-LARGE RING — visible white gap outside ring, MEDIUM-SIZED center hole. Overlapping loops/petals form the ring. Smaller than 3-R.
+
+MEDIUM-LARGE RING — visible white gap outside ring, MEDIUM-SIZED center hole. Overlapping loops/petals form the ring.
   → {"boardPosition":"3-D","stickPosition":"3-3"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP I: PLAIN CROSSING-LINE RING
   I: `GRAYSCALE spirograph. Identify the PLAIN CROSSING-LINE RING.
-FIRST — Do the lines CROSS each other (making X intersections and diamond-shaped gaps)?
-  YES, lines cross each other making clean diamond gaps, smooth inner and outer edges → {"boardPosition":"10-A","stickPosition":"4-4"}
-  NO, lines are PARALLEL (they curve together but do NOT intersect) → {"boardPosition":"9-M","stickPosition":"2-7"}
+
+Crossing lines making diamond-shaped gaps — BOTH inner and outer edges are perfectly smooth curves. Elegant and clean. Large round open center.
+  → {"boardPosition":"10-A","stickPosition":"4-4"}
+
+Thick ring of large CHUNKY ROUNDED BLOB-LIKE sections — sections look thick and rounded/lens-shaped. Very large open center.
+  → {"boardPosition":"9-M","stickPosition":"2-7"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP J: TEARDROP/HEART LOOP TIPS AT OUTER EDGE
   J: `GRAYSCALE spirograph. Identify the OUTER-LOOP TIP pattern.
-Many thin spokes where EACH TIP ends in a TEARDROP or HEART-SHAPED LOOP at the outer edge. Loops are clearly teardrop/heart shaped.
+
+Many thin spokes where EACH TIP ends in a TEARDROP or HEART-SHAPED LOOP at the outer edge. Loops are clearly teardrop/heart shaped. Fills most of disc. Large open center.
   → {"boardPosition":"6-Q","stickPosition":"5-4"}
-A ring of HUNDREDS of tiny small loops — very dense lacy ring. Loops are side by side without crossing.
+
+A ring of HUNDREDS of tiny small loops — very dense lacy ring. Loops are side by side without crossing. Large open center.
   → {"boardPosition":"4-H","stickPosition":"3-6"}
+
 A ring of HUNDREDS of tiny loops that CRISS-CROSS and interweave with each other. Busier and more tangled than 4-H.
   → {"boardPosition":"15-Q","stickPosition":"2-1"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
+  // GROUP L: LARGE SWEEPING PETAL LOOPS (16-L type)
   L: `GRAYSCALE spirograph. Identify the LARGE SWEEPING LOOP pattern.
-5-6 VERY LARGE GRACEFUL SMOOTH CURVES sweeping across the disc. Very few curves (5 or 6 only), very open. Polygon-shaped center hole.
+
+5-6 VERY LARGE GRACEFUL SMOOTH CURVES sweeping across the disc. Very few curves, very open. Polygon-shaped center hole. Fills most of disc.
   → {"boardPosition":"16-L","stickPosition":"4-6"}
-~20-25 wide bold oval petals ALL swirling strongly in ONE direction — polygon center hole, petals are INDIVIDUALLY COUNTABLE. Only select 3-L if you can actually count individual separate petal shapes.
+
+~20-25 wide bold oval petals ALL swirling strongly in ONE direction — polygon center hole, pinwheel-like rotation.
   → {"boardPosition":"3-L","stickPosition":"1-5"}
+
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 };
 
-// ─── STEP 3: Verification prompts — unchanged ─────────────────────────────────
+// ─── STEP 3: Verification prompts for the most visually similar pairs ─────────
 const VERIFY_PROMPTS = {
+
   "11-J": `GRAYSCALE spirograph verification. Classifier said 11-J (full disc scallop pattern).
 Does the petal/arc texture reach ALL THE WAY to the disc rim with NO white gap outside?
   YES fills entire disc → {"boardPosition":"11-J","stickPosition":"4-4"}
   NO gap outside, very small center hole → {"boardPosition":"3-R","stickPosition":"4-2"}
   NO gap outside, medium center hole → {"boardPosition":"3-D","stickPosition":"3-3"}
 Respond ONLY with JSON.`,
+
   "3-D": `GRAYSCALE spirograph verification. Classifier said 3-D (medium ring, does not fill full disc).
 Is there a visible white background gap between the outer ring edge and disc rim?
   YES clear gap, medium center hole → {"boardPosition":"3-D","stickPosition":"3-3"}
   YES clear gap, very small center hole → {"boardPosition":"3-R","stickPosition":"4-2"}
   NO fills entire disc edge to edge → {"boardPosition":"11-J","stickPosition":"4-4"}
 Respond ONLY with JSON.`,
+
   "3-R": `GRAYSCALE spirograph verification. Classifier said 3-R (nearly full disc, very small center hole).
 Is the center hole VERY SMALL, and is there a thin white gap at the outer disc edge?
   YES very small hole + thin outer gap → {"boardPosition":"3-R","stickPosition":"4-2"}
   NO medium-sized hole → {"boardPosition":"3-D","stickPosition":"3-3"}
   NO fills entire disc → {"boardPosition":"11-J","stickPosition":"4-4"}
 Respond ONLY with JSON.`,
-  "5-L": `GRAYSCALE spirograph verification. Classifier said 5-L.
-STEP 1 — Look carefully INSIDE one oval/leaf shape. Can you see FINE PARALLEL LINES (hatching/veins) drawn across the INTERIOR?
-  YES fine interior hatch lines clearly inside shapes → {"boardPosition":"6-N","stickPosition":"5-6"}
-  NO shapes are plain hollow outlines → STEP 2
-STEP 2 — Are the shapes clearly TILTED/LEANING in one rotational direction?
-  NO shapes sit upright, ~12-14 neat single outlines → {"boardPosition":"1-E","stickPosition":"4-4"}
-  NO shapes sit upright, ~10 very faint/light ovals → {"boardPosition":"2-F","stickPosition":"3-3"}
-  YES shapes tilt/lean wreath-like → {"boardPosition":"5-L","stickPosition":"6-5"}
+
+  "5-L": `GRAYSCALE spirograph verification. Classifier said 5-L (plain hollow oval outlines, nothing inside).
+Look very carefully INSIDE one oval/leaf shape. Can you see FINE PARALLEL LINES drawn across the INTERIOR of the shape — actual additional lines inside the body (not just the outline)?
+  YES fine interior lines → {"boardPosition":"6-N","stickPosition":"5-6"}
+  NO plain hollow outlines → {"boardPosition":"5-L","stickPosition":"6-5"}
 Respond ONLY with JSON.`,
+
   "6-N": `GRAYSCALE spirograph verification. Classifier said 6-N (feather shapes with interior hatching lines).
 Can you clearly see fine hatching/vein lines drawn INSIDE the shape body?
   YES interior lines clearly visible → {"boardPosition":"6-N","stickPosition":"5-6"}
   NO plain hollow outlines → {"boardPosition":"5-L","stickPosition":"6-5"}
 Respond ONLY with JSON.`,
-  "11-A": `GRAYSCALE spirograph verification. Classifier said 11-A.
+
+  "11-A": `GRAYSCALE spirograph verification. Classifier said 11-A (plain crossing-line ring, no features).
 Do the crossing lines form clear DIAMOND-SHAPED GAPS and are both edges smooth curves?
   YES diamond gaps, smooth edges → {"boardPosition":"10-A","stickPosition":"4-4"}
   Tiny SQUIGGLY CURLS on outer rim? → {"boardPosition":"2-J","stickPosition":"6-6"}
   Plain ring, no distinctive features → {"boardPosition":"11-A","stickPosition":"6-6"}
 Respond ONLY with JSON.`,
-  "13-R": `GRAYSCALE spirograph verification. Classifier said 13-R.
+
+  "13-R": `GRAYSCALE spirograph verification. Classifier said 13-R (7-8 large floppy multi-stroked ovals).
 Are there MORE than 8 ovals with clean single-line outlines?
   YES more than 8, clean single-line → {"boardPosition":"1-E","stickPosition":"4-4"}
   YES more than 8, small oval clusters → {"boardPosition":"2-F","stickPosition":"3-3"}
   NO clearly 7-8 large floppy multi-stroked ovals → {"boardPosition":"13-R","stickPosition":"4-2"}
 Respond ONLY with JSON.`,
+
   "1-E": `GRAYSCALE spirograph verification. Classifier said 1-E (~12-14 clean single-line ovals).
-FIRST — Are the oval shapes clearly TILTED or LEANING in a consistent rotational direction?
-  YES shapes all tilt/lean same direction → {"boardPosition":"5-L","stickPosition":"6-5"}
-  NO shapes sit upright/neutral in ring → continue below
 Are there only 7-8 ovals, each with multiple messy overlapping lines (floppy, thick)?
   YES only 7-8 large messy multi-stroked ovals → {"boardPosition":"13-R","stickPosition":"4-2"}
   NO about 12-14 clean neat single-line ovals → {"boardPosition":"1-E","stickPosition":"4-4"}
 Respond ONLY with JSON.`,
+
   "9-B_4-2": `GRAYSCALE spirograph verification. Classifier said 9-B sticks 4-2 (8 medium arms, small loops).
 Are the arms EXTREMELY long and wispy, reaching more than 2/3 to disc edge, with barely-visible loops?
   YES extremely long wispy arms → {"boardPosition":"8-A","stickPosition":"3-2"}
   NO medium-length arms, loops clearly visible → {"boardPosition":"9-B","stickPosition":"4-2"}
 Respond ONLY with JSON.`,
-  "10-Q_1-1": `GRAYSCALE spirograph verification. Classifier said 10-Q sticks 1-1.
+
+  "10-Q_1-1": `GRAYSCALE spirograph verification. Classifier said 10-Q sticks 1-1 (neat overlapping triangles).
 Is the pattern actually CHAOTIC — many thin lines going in all directions, messy explosion?
   YES chaotic lines everywhere → {"boardPosition":"10-Q","stickPosition":"1-2"}
   NO neat organized triangles, polygon center hole → {"boardPosition":"10-Q","stickPosition":"1-1"}
 Respond ONLY with JSON.`,
-  "12-C": `GRAYSCALE spirograph verification. Classifier said 12-C.
-Is the pattern VERY SMALL — coin-sized with large empty disc area around it?
-  YES tiny small centered spiky pattern → {"boardPosition":"7-A","stickPosition":"1-2"}
-  NO medium-sized, lines spreading outward from solid center → {"boardPosition":"12-C","stickPosition":"3-1"}
-Respond ONLY with JSON.`,
-  "G-6": `GRAYSCALE spirograph verification. Classifier said G-6.
+
+  "G-6": `GRAYSCALE spirograph verification. Classifier said G-6 (neat tightly-wound coil donut).
   OUTWARD SPIKES radiating in all directions (sea urchin)? → {"boardPosition":"7-A","stickPosition":"1-2"}
   Lines are MESSY and CHAOTIC? → {"boardPosition":"4-C","stickPosition":"2-2"}
   Just a plain single ring/circle? → {"boardPosition":"11-L","stickPosition":"1-1"}
   Neat orderly coiled arcs → {"boardPosition":"G-6","stickPosition":"1-2"}
 Respond ONLY with JSON.`,
-  "4-C": `GRAYSCALE spirograph verification. Classifier said 4-C.
+
+  "4-C": `GRAYSCALE spirograph verification. Classifier said 4-C (messy chaotic scribble donut).
   OUTWARD SPIKES radiating in all directions? → {"boardPosition":"7-A","stickPosition":"1-2"}
   Lines are NEAT and ORDERLY? → {"boardPosition":"G-6","stickPosition":"1-2"}
   Just a plain single ring/circle? → {"boardPosition":"11-L","stickPosition":"1-1"}
   Messy chaotic scribble with center hole → {"boardPosition":"4-C","stickPosition":"2-2"}
 Respond ONLY with JSON.`,
-  "4-H": `GRAYSCALE spirograph verification. Classifier said 4-H.
-Do the loops visibly CRISS-CROSS and interweave with each other?
+
+  "4-H": `GRAYSCALE spirograph verification. Classifier said 4-H (dense lacy ring of small loops).
+Do the loops visibly CRISS-CROSS and interweave with each other, making it look busier and more tangled?
   YES loops criss-cross and interweave → {"boardPosition":"15-Q","stickPosition":"2-1"}
   NO loops are side by side, not crossing → {"boardPosition":"4-H","stickPosition":"3-6"}
 Respond ONLY with JSON.`,
-  "9-M": `GRAYSCALE spirograph verification. Classifier said 9-M.
-Do the lines CROSS each other making X-shaped intersections and diamond-shaped gaps?
-  YES lines clearly cross each other, diamond gaps visible → {"boardPosition":"10-A","stickPosition":"4-4"}
-  NO lines curve parallel to each other, NO crossings → {"boardPosition":"9-M","stickPosition":"2-7"}
-Respond ONLY with JSON.`,
-  "9-O": `GRAYSCALE spirograph verification. Classifier said 9-O.
-Are there clearly fewer than 15 DISTINCT separate oval shapes in the ring?
-  YES ~12-14 clean neat separate ovals → {"boardPosition":"1-E","stickPosition":"4-4"}
-  YES ~10 very faint/light separate ovals → {"boardPosition":"2-F","stickPosition":"3-3"}
-  NO loops are numerous and overlap continuously, ring looks nearly solid → {"boardPosition":"9-O","stickPosition":"5-5"}
-Respond ONLY with JSON.`,
-  "6-Q": `GRAYSCALE spirograph verification. Classifier said 6-Q.
-Are the tip-loops clearly TEARDROP or HEART SHAPED — distinct shaped loops at end of each spoke?
+
+  "6-Q": `GRAYSCALE spirograph verification. Classifier said 6-Q (spokes with teardrop/heart loops at outer tips).
+Are the tip-loops clearly TEARDROP or HEART SHAPED — distinct shaped loops at end of each spoke (not tiny lacy loops)?
   YES distinct teardrop/heart loops at spoke tips → {"boardPosition":"6-Q","stickPosition":"5-4"}
   NO looks like hundreds of tiny lacy loops forming a dense ring → {"boardPosition":"4-H","stickPosition":"3-6"}
 Respond ONLY with JSON.`,
-  "16-O": `GRAYSCALE spirograph verification. Classifier said 16-O.
-STEP 1 — Does the INNER EDGE have JAGGED/SPIKY/ZIGZAG teeth pointing inward?
-  YES jagged spiky inner border → {"boardPosition":"12-J","stickPosition":"5-5"}
-  NO smooth inner edge → STEP 2
-STEP 2 — Can you see 3-4 large bold DIAGONAL S-CURVES cutting through the grid body?
-  YES bold S-curves through grid → {"boardPosition":"2-P","stickPosition":"6-6"}
-  NO — can you see tiny small CURL or LOOP shapes on the INNER EDGE pointing inward?
-  YES tiny curls on inner edge → {"boardPosition":"16-O","stickPosition":"6-3"}
-  NO plain grid, no curls → {"boardPosition":"11-A","stickPosition":"6-6"}
-Respond ONLY with JSON.`,
-  "3-L": `GRAYSCALE spirograph verification. Classifier said 3-L.
-STEP 1 — Can you clearly COUNT about 20-25 INDIVIDUAL SEPARATE PETAL shapes?
-  NO — pattern looks like a DENSE WOVEN or SCALLOPED ring → go to STEP 2
-  YES — clearly about 20-25 countable individual petals all swirling same direction → {"boardPosition":"3-L","stickPosition":"1-5"}
-STEP 2:
-  Ring is VERY WIDE, nearly fills disc, arcs overlap in scalloped wave — small center hole → {"boardPosition":"3-R","stickPosition":"4-2"}
-  Ring fills ENTIRE disc edge to edge — clear round center hole → {"boardPosition":"11-J","stickPosition":"4-4"}
-  Ring has FEATHER/LEAF shapes with lines inside each shape → {"boardPosition":"6-N","stickPosition":"5-6"}
-  Ring has PARALLEL stacked arcs, lines do NOT cross — large open center → {"boardPosition":"9-M","stickPosition":"2-7"}
-  Many large overlapping petals in all directions, polygon center → {"boardPosition":"14-I","stickPosition":"4-4"}
-Respond ONLY with JSON.`,
-  "16-L": `GRAYSCALE spirograph verification. Classifier said 16-L.
+
+  "16-L": `GRAYSCALE spirograph verification. Classifier said 16-L (5-6 very large graceful sweeping curves).
 Are there only 5-6 very large smooth curves (very few, very grand scale)?
   YES just 5-6 giant graceful curves, very open → {"boardPosition":"16-L","stickPosition":"4-6"}
   NO many more petals (~20+) swirling strongly in one direction → {"boardPosition":"3-L","stickPosition":"1-5"}
 Respond ONLY with JSON.`,
-  "11-C": `GRAYSCALE spirograph verification. Classifier said 11-C.
+
+  "11-C": `GRAYSCALE spirograph verification. Classifier said 11-C (thick bold fan blades, multiple lines per blade).
+CRITICAL CHECK — Look at ONE individual blade closely:
 Is each blade made of a SINGLE THIN LINE (one thin stroke per blade, widely spaced, lots of white between blades)?
   YES single thin lines, widely spaced, large open center → {"boardPosition":"2-M","stickPosition":"1-5"}
-  NO each blade is made of MULTIPLE LINES bundled together → {"boardPosition":"11-C","stickPosition":"5-1"}
+  NO each blade is made of MULTIPLE LINES bundled together (blades look thick/bold, more packed) → {"boardPosition":"11-C","stickPosition":"5-1"}
 Respond ONLY with JSON.`,
-  "7-J": `GRAYSCALE spirograph verification. Classifier said 7-J.
-Are the petals EXACTLY 8, perfectly symmetrical and equal — like a neat clean stamp?
-  YES exactly 8 equal neat petals, perfectly symmetrical → {"boardPosition":"7-C","stickPosition":"2-2"}
-  NO petals are irregular/casual, roughly 7-8 but not perfectly equal → {"boardPosition":"7-J","stickPosition":"1-1"}
-Respond ONLY with JSON.`,
-  "7-H": `GRAYSCALE spirograph verification. Classifier said 7-H.
+
+  "7-H": `GRAYSCALE spirograph verification. Classifier said 7-H (wreath/donut ring of overlapping loops, has center hole).
 Are the shapes actually FULL SEPARATE CIRCLES overlapping (like soap bubble rings), with no clear donut hole?
   YES full overlapping circles, no donut hole → {"boardPosition":"3-C","stickPosition":"3-3"}
   NO clearly a wreath/donut ring with a visible center hole → {"boardPosition":"7-H","stickPosition":"3-3"}
 Respond ONLY with JSON.`,
-  "14-I": `GRAYSCALE spirograph verification. Classifier said 14-I.
-STEP 1 — Do the petals ALL rotate strongly in ONE direction like a spinning pinwheel?
-  YES strong single-direction swirl, ~20-25 countable petals → {"boardPosition":"3-L","stickPosition":"1-5"}
-  NO petals point in various directions around center → STEP 2
-STEP 2:
-  6-7 VERY LARGE WIDE bold petals, giant and bold like a big rose → {"boardPosition":"1-P","stickPosition":"4-4"}
-  Many (10-15+) medium oval petals spread across disc, elegant and open → {"boardPosition":"14-I","stickPosition":"4-4"}
-Respond ONLY with JSON.`,
-  "1-P": `GRAYSCALE spirograph verification. Classifier said 1-P (6-7 giant wide bold oval loops).
+
+  "1-P": `GRAYSCALE spirograph verification. Classifier said 1-P (6-7 giant wide bold oval loops like huge rose petals).
 Are there actually MANY MORE petals (20+) swirling strongly in one direction?
   YES many petals swirling same direction, polygon center → {"boardPosition":"3-L","stickPosition":"1-5"}
   YES many rotating petals, small polygon hole, not strongly directional → {"boardPosition":"14-I","stickPosition":"4-4"}
@@ -700,10 +952,10 @@ Are there actually MANY MORE petals (20+) swirling strongly in one direction?
 Respond ONLY with JSON.`,
 };
 
+// Boards that get a verification pass
 const VERIFY_BOARDS = new Set([
   "11-J","3-D","3-R","5-L","6-N","11-A","13-R","1-E",
-  "4-H","11-C","1-P","7-H","G-6","4-C","6-Q","16-L",
-  "9-O","3-L","14-I","9-M","7-J","12-C","16-O"
+  "4-H","11-C","1-P","7-H","G-6","4-C","6-Q","16-L"
 ]);
 
 function getVerifyKey(board, stick) {
@@ -712,20 +964,15 @@ function getVerifyKey(board, stick) {
   return board;
 }
 
-// =============================================================================
-// Gemini Vision Call — replaces gptVisionCall
-// Sends base64 image inline as inline_data (NOT as a URL).
-// temperature=0 for deterministic classification.
-// =============================================================================
-async function geminiVisionCall(prompt, grayscaleDataUrl, geminiKey, maxTokens = 10) {
-  // Strip the data:image/...;base64, prefix — Gemini wants raw base64
-  const base64 = grayscaleDataUrl.startsWith("data:")
-    ? grayscaleDataUrl.split(",")[1]
-    : grayscaleDataUrl;
+async function gptVisionCall(prompt, imageUrl, apiKey, maxTokens = 10) {
+  // Now uses Gemini 2.0 Flash vision — imageUrl is a base64 data URL
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (!geminiKey) return null;
 
-  const r = await fetch(
-    `${GEMINI_BASE}/${MODEL_FLASH}:generateContent?key=${geminiKey}`,
-    {
+  const base64 = imageUrl.startsWith("data:") ? imageUrl.split(",")[1] : imageUrl;
+
+  try {
+    const r = await fetch(`${GEMINI_BASE}/${MODEL_CHAT}:generateContent?key=${geminiKey}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -738,17 +985,19 @@ async function geminiVisionCall(prompt, grayscaleDataUrl, geminiKey, maxTokens =
         }],
         generationConfig: { temperature: 0, maxOutputTokens: maxTokens },
       }),
-    }
-  );
-  if (!r.ok) return null;
-  const data = await r.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+    });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+  } catch (_) {
+    return null;
+  }
 }
 
-async function classifyPatternFromImage(grayscaleImageUrl, geminiKey) {
+async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
   try {
     // ── STEP 1: Route to visual group ────────────────────────────────────────
-    const cat = await geminiVisionCall(STEP1_CATEGORY_PROMPT, grayscaleImageUrl, geminiKey, 5);
+    const cat = await gptVisionCall(STEP1_CATEGORY_PROMPT, grayscaleImageUrl, apiKey, 5);
     if (!cat) return null;
     const category = cat.trim().toUpperCase().charAt(0);
     console.log("Step 1 category:", category);
@@ -760,7 +1009,7 @@ async function classifyPatternFromImage(grayscaleImageUrl, geminiKey) {
     }
 
     // ── STEP 2: Identify exact board within group ────────────────────────────
-    const raw = await geminiVisionCall(step2Prompt, grayscaleImageUrl, geminiKey, 80);
+    const raw = await gptVisionCall(step2Prompt, grayscaleImageUrl, apiKey, 80);
     if (!raw) return null;
     console.log("Step 2 raw:", raw);
 
@@ -774,7 +1023,7 @@ async function classifyPatternFromImage(grayscaleImageUrl, geminiKey) {
     // ── STEP 3: Verification for known confusion pairs ───────────────────────
     const verifyKey = getVerifyKey(board, stick);
     if (VERIFY_BOARDS.has(board) && VERIFY_PROMPTS[verifyKey]) {
-      const rawV = await geminiVisionCall(VERIFY_PROMPTS[verifyKey], grayscaleImageUrl, geminiKey, 60);
+      const rawV = await gptVisionCall(VERIFY_PROMPTS[verifyKey], grayscaleImageUrl, apiKey, 60);
       if (rawV) {
         try {
           const cleanV = rawV.replace(/```json|```/g, "").trim();
@@ -823,77 +1072,46 @@ module.exports = async function handler(req, res) {
     const history = Array.isArray(body.history) ? body.history : Array.isArray(body.messages) ? body.messages : [];
     const attachment = body.attachment || null;
 
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
     const geminiKey = process.env.GEMINI_API_KEY;
     if (!geminiKey) return res.status(500).json({ error: "GEMINI_API_KEY is not set in env." });
-    if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY is not set — needed for embeddings." });
 
     // ========================================================================
-    // NANO BANANA — Image generation (works for ALL products)
-    // Must be checked BEFORE the message validation below
-    // Frontend: POST { action: "generate_image", prompt: "...", product: "..." }
+    // NANO BANANA — Image generation (MUST be before message validation)
+    // Works for both robocoders and spingenius
     // ========================================================================
     if (body.action === "generate_image") {
       const imgPrompt = String(body.prompt || "").trim();
-      const imgProduct = String(body.product || "robocoders").toLowerCase();
+      const imgProduct = String(body.product || product).toLowerCase();
       if (!imgPrompt) return res.status(400).json({ error: "prompt required." });
 
-      // ── SpinGenius: check KB pattern images FIRST before generating ────────
-      // If user asks for a known pattern (by name or board position),
-      // return the stored image from knowledge base — no generation needed.
+      // SpinGenius: check KB first for known patterns
       if (imgProduct === "spingenius") {
         const queryLower = imgPrompt.toLowerCase();
-
-        // Check by board position (e.g. "3-D", "10-A")
         const boardMatch = queryLower.match(/([0-9]{1,2}-[a-z])/i) || queryLower.match(/(g-[0-9])/i);
         const stickMatch = queryLower.match(/stick[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i) || queryLower.match(/([0-9]+-[0-9]+)/);
         const askedBoard = boardMatch?.[1]?.toUpperCase();
         const askedStick = stickMatch?.[1];
-
         let kbEntry = null;
         if (askedBoard && askedStick) kbEntry = lookupExact(askedBoard, askedStick);
         if (!kbEntry && askedBoard) kbEntry = lookupByBoard(askedBoard);
-
-        // Check by pattern name from PATTERN_NAME_MAP
         if (!kbEntry) {
-          const nameMatchedImage = findImageByPatternName(queryLower);
-          if (nameMatchedImage) {
-            return res.status(200).json({
-              type: "generated_image",
-              patternImageFilename: nameMatchedImage,
-              text: "Here is the pattern from the knowledge base! 🌀",
-            });
-          }
+          const nameImg = findImageByPatternName(queryLower);
+          if (nameImg) return res.status(200).json({ type: "generated_image", patternImageFilename: nameImg, text: "Here is the pattern from the knowledge base! 🌀" });
         }
-
         if (kbEntry?.patternImage) {
-          return res.status(200).json({
-            type: "generated_image",
-            patternImageFilename: kbEntry.patternImage,
-            text: `Here is the ${kbEntry.patternName || "pattern"} from the knowledge base! 🌀`,
-          });
+          return res.status(200).json({ type: "generated_image", patternImageFilename: kbEntry.patternImage, text: `Here is the ${kbEntry.patternName || "pattern"}! 🌀` });
         }
-        // Pattern not in KB — fall through to Nano Banana generation
       }
 
-      // ── Generate with Nano Banana (for unknown patterns or Robocoders) ──────
-      try {
-        const imageUrl = await generateImageWithNanoBanana(imgPrompt, geminiKey);
-        if (imageUrl) {
-          return res.status(200).json({ type: "generated_image", image: imageUrl });
-        }
-        return res.status(200).json({
-          type: "generated_image",
-          text: "Image generation is not available right now. Try describing what you want and I'll help with text! 🎨",
-        });
-      } catch (err) {
-        return res.status(500).json({ error: "Image generation failed: " + String(err.message).slice(0, 200) });
-      }
+      // Generate with Nano Banana
+      const imageUrl = await generateImageWithNanoBanana(imgPrompt, geminiKey);
+      if (imageUrl) return res.status(200).json({ type: "generated_image", image: imageUrl });
+      return res.status(200).json({ type: "generated_image", text: "Image generation is not available right now. Try describing what you want! 🎨" });
     }
 
-    // ========================================================================
     // VEO — Video generation
-    // Frontend: POST { action: "generate_video", prompt: "..." }
-    // ========================================================================
     if (body.action === "generate_video") {
       const vidPrompt = String(body.prompt || "").trim();
       if (!vidPrompt) return res.status(400).json({ error: "prompt required." });
@@ -901,15 +1119,9 @@ module.exports = async function handler(req, res) {
         const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models/veo-2.0-generate-001:predictLongRunning", {
           method: "POST",
           headers: { "x-goog-api-key": geminiKey, "Content-Type": "application/json" },
-          body: JSON.stringify({
-            instances: [{ prompt: vidPrompt }],
-            parameters: { aspectRatio: "16:9", durationSeconds: 6 },
-          }),
+          body: JSON.stringify({ instances: [{ prompt: vidPrompt }], parameters: { aspectRatio: "16:9", durationSeconds: 6 } }),
         });
-        if (!r.ok) {
-          const t = await r.text().catch(() => "");
-          return res.status(500).json({ error: "Video generation failed: " + t.slice(0, 200) });
-        }
+        if (!r.ok) { const t = await r.text().catch(() => ""); return res.status(500).json({ error: "Video generation failed: " + t.slice(0, 200) }); }
         const data = await r.json();
         return res.status(200).json({ type: "video_job", operationName: data.name, status: "processing" });
       } catch (err) {
@@ -921,20 +1133,17 @@ module.exports = async function handler(req, res) {
       const opName = String(body.operationName || "").trim();
       if (!opName) return res.status(400).json({ error: "operationName required." });
       try {
-        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/${opName}`, {
-          headers: { "x-goog-api-key": geminiKey },
-        });
+        const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/${opName}`, { headers: { "x-goog-api-key": geminiKey } });
         if (!r.ok) return res.status(500).json({ error: "Poll failed." });
         const data = await r.json();
         if (!data.done) return res.status(200).json({ type: "video_poll", status: "processing" });
-        const videoUri = data.response?.predictions?.[0]?.videoUri || null;
-        return res.status(200).json({ type: "video_poll", status: "done", videoUrl: videoUri });
+        return res.status(200).json({ type: "video_poll", status: "done", videoUrl: data.response?.predictions?.[0]?.videoUri || null });
       } catch (err) {
         return res.status(500).json({ error: "Poll error: " + String(err.message).slice(0, 200) });
       }
     }
 
-    // ── Normal chat validation — only for non-action requests ─────────────
+    // ── Normal chat validation ────────────────────────────────────────────────
     if ((typeof message !== "string" || !message.trim()) && !attachment) {
       return res.status(400).json({ error: "Missing message or image input." });
     }
@@ -972,16 +1181,14 @@ module.exports = async function handler(req, res) {
         });
       }
       if (rawIntent.type === "PROJECT_VIDEOS") {
-        const { lastProject: historyProject } = resolveContextFromHistory(history, projectNames, componentsMap);
-        const videoProject = rawDetectedProject || historyProject;
-        if (!videoProject) {
+        if (!rawDetectedProject) {
           return res.status(200).json({ text: "Tell me the project/module name (example: Mood Lamp, Coin Counter, Game Controller), and I'll share all the relevant lesson videos for that project.", debug: { intent: rawIntent, product } });
         }
-        const videos = lessonsByProject[videoProject] || [];
+        const videos = lessonsByProject[rawDetectedProject] || [];
         if (!videos.length) {
-          return res.status(200).json({ text: `I found the project "${videoProject}", but no lesson videos are mapped for it yet.`, debug: { intent: rawIntent, product } });
+          return res.status(200).json({ text: `I found the project "${rawDetectedProject}", but no lesson videos are mapped for it yet.`, debug: { intent: rawIntent, product } });
         }
-        const out = `Lesson videos for ${videoProject}:\n\n` + videos.map((v, idx) => {
+        const out = `Lesson videos for ${rawDetectedProject}:\n\n` + videos.map((v, idx) => {
           const linksText = (v.videoLinks || []).map((u) => `- ${u}`).join("\n");
           return `${idx + 1}. ${v.lessonName}\n${v.explainLine ? `Why this helps: ${v.explainLine}\n` : ""}Links:\n${linksText}`;
         }).join("\n\n");
@@ -989,7 +1196,7 @@ module.exports = async function handler(req, res) {
       }
 
       let plannedUserText = rawUserText;
-      try { plannedUserText = await planChatPrompt(rawUserText, geminiKey); } catch (_) {}
+      try { plannedUserText = await planChatPrompt(rawUserText, apiKey); } catch (_) {}
 
       const { lastProject, lastComponent } = resolveContextFromHistory(history, projectNames, componentsMap);
       const detectedProject = rawDetectedProject || detectProject(plannedUserText, projectNames) || lastProject;
@@ -1010,14 +1217,14 @@ module.exports = async function handler(req, res) {
       let ragContext = "";
       let ragChunks = [];
       try {
-        const queryEmbedding = await embedText(plannedUserText || rawUserText, geminiKey);
+        const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
         ragChunks = await queryPinecone(queryEmbedding, "robocoders", 6);
         if (ragChunks.length > 0) {
-          ragContext = "=== RETRIEVED KNOWLEDGE (from vector search) ===" +
-            ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]${c.text}`).join("---");
+          ragContext = "=== RETRIEVED KNOWLEDGE (from vector search) ===\n" +
+            ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]\n${c.text}`).join("\n\n---\n\n");
         }
       } catch (ragErr) {
-        console.warn("RAG error (non-fatal):", ragErr.message);
+        console.error("RAG error:", ragErr.message);
       }
 
       const projectContext = detectedProject ? projectsByName[detectedProject] || null : null;
@@ -1025,41 +1232,43 @@ module.exports = async function handler(req, res) {
       const fullContext = ragContext ? ragContext + "\n\n" + deterministicContext : deterministicContext;
       const systemPrompt = buildRobocodersSystemPrompt(fullContext);
 
-      // Build Gemini-format messages
-      const geminiHistory = buildConversationHistory(history);
+      // Build user parts for Gemini format
       const userParts = [];
       if (plannedUserText?.trim()) userParts.push({ text: plannedUserText });
       if (attachment) {
-        // For Robocoders, image analysis is text-based — send as inline_data
         const base64 = attachment.startsWith("data:") ? attachment.split(",")[1] : attachment;
         userParts.push({ inline_data: { mime_type: "image/jpeg", data: base64 } });
       }
-      geminiHistory.push({ role: "user", parts: userParts });
 
       console.log("Product: robocoders | RAG chunks:", ragChunks.length, "| Intent:", rawIntent.type);
 
-      let reply = await geminiChat({
-        model: MODEL_LITE,
-        systemPrompt,
-        messages: geminiHistory,
-        temperature: 0.7,
-        maxTokens: 2500,
-        geminiKey,
-      });
-      reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
+      let reply;
+      try {
+        reply = await geminiChatCall({
+          systemPrompt,
+          history: buildConversationHistory(history),
+          userParts,
+          model: MODEL_CHAT,
+          temperature: 0.7,
+          maxTokens: 2000,
+          geminiKey,
+        });
+      } catch (chatErr) {
+        return res.status(500).json({ error: "Gemini chat error", details: String(chatErr.message).slice(0, 500) });
+      }
+      reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/{3,}/g, "");
 
       return res.status(200).json({
         text: reply,
-        debug: { product, detectedProject: detectedProject || null, detectedComponent: detectedComponent || null, intent: rawIntent, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length },
+        debug: { product, detectedProject: detectedProject || null, detectedComponent: detectedComponent || null, intent: rawIntent, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map((c) => c.type) },
       });
     }
-
     // ========================================================================
     // SPIN GENIUS PATH
     // ========================================================================
     if (product === "spingenius") {
       let plannedUserText = rawUserText;
-      try { plannedUserText = await planChatPrompt(rawUserText, geminiKey); } catch (_) {}
+      try { plannedUserText = await planChatPrompt(rawUserText, apiKey); } catch (_) {}
 
       let ragContext = "";
       let ragChunks = [];
@@ -1067,50 +1276,59 @@ module.exports = async function handler(req, res) {
       let grayscaleImageUrl = null;
       let classifiedPattern = null;
 
+      // ── STEP 1: Convert image to grayscale ONCE ───────────────────────────
+      // This physically strips color so GPT cannot use it as a shortcut.
+      // The same grayscale image is used for both the classifier and main call.
       if (attachment) {
         grayscaleImageUrl = await toGrayscaleBase64(attachment);
       }
 
       try {
+        // ── STEP 2A: IMAGE PATH — classify first, then RAG with board position ─
+        // CRITICAL FIX: RAG was previously skipped when image was present.
+        // Now: classify → get board/stick → query Pinecone with board name
+        // so the full KB description is always available to GPT.
         if (grayscaleImageUrl) {
           try {
-            const classified = await classifyPatternFromImage(grayscaleImageUrl, geminiKey);
+            const classified = await classifyPatternFromImage(grayscaleImageUrl, apiKey);
             console.log("Vision classifier result:", classified);
             if (classified?.patternImage) {
               patternImages = [classified.patternImage];
               classifiedPattern = classified;
+              // Query Pinecone using pattern name + board+stick for best semantic match
               const searchQuery = `${classified.patternName || ""} board ${classified.boardPosition} sticks ${classified.stickPosition} pattern`;
-              const queryEmbedding = await embedText(searchQuery, geminiKey);
+              const queryEmbedding = await embedText(searchQuery, apiKey);
               ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
             }
           } catch (classifyErr) {
             console.error("Vision classifier error:", classifyErr.message);
+            // Fallback: if classifier fails, run RAG on user text
             try {
-              const queryEmbedding = await embedText(plannedUserText || rawUserText, geminiKey);
+              const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
               ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
             } catch (_) {}
           }
         }
 
+        // ── STEP 2B: TEXT PATH — RAG on user text ────────────────────────────
         if (!grayscaleImageUrl) {
-          try {
-            const queryEmbedding = await embedText(plannedUserText || rawUserText, geminiKey);
-            ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
-          } catch (ragErr) {
-            console.warn("SpinGenius RAG error (non-fatal):", ragErr.message);
-          }
+          const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
+          ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
         }
 
+        // ── STEP 3: Build RAG context from retrieved chunks ───────────────────
         if (ragChunks.length > 0) {
           ragContext = "=== RETRIEVED KNOWLEDGE ===\n" +
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}]\n${c.text}`).join("\n\n---\n\n");
         }
 
+        // ── STEP 4: Text-path image matching (no image or classifier failed) ──
         if (!grayscaleImageUrl || patternImages.length === 0) {
           const configChunks = ragChunks.filter(c => c.type === "configuration" && c.patternImage);
           const queryText = (plannedUserText || rawUserText).toLowerCase();
 
-          const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-z])\b/i) || queryText.match(/\b(g-[0-9])\b/i);
+          const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-z])\b/i)
+            || queryText.match(/\b(g-[0-9])\b/i);
           const askedBoard = boardMatch?.[1]?.toUpperCase();
           const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
             || queryText.match(/position[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
@@ -1118,22 +1336,30 @@ module.exports = async function handler(req, res) {
           const askedStick = stickMatch?.[1];
 
           if (askedBoard || askedStick) {
+            // Use PATTERN_LOOKUP for exact match — never Pinecone rank
             let entry = null;
             if (askedBoard && askedStick) {
               entry = lookupExact(askedBoard, askedStick);
-              if (!entry) entry = lookupByBoard(askedBoard);
-            } else if (askedBoard) {
+            }
+            if (!entry && askedBoard) {
+              // Board only — safe if that board has exactly ONE config in lookup
               entry = lookupByBoard(askedBoard);
-            } else {
+            }
+            if (!entry && askedStick && !askedBoard) {
+              // Stick only — find the one config with that stick position
               const stickMatch2 = Object.entries(PATTERN_LOOKUP).find(([k]) => k.endsWith("|" + askedStick));
               entry = stickMatch2?.[1] || null;
             }
             patternImages = entry?.patternImage ? [entry.patternImage] : [];
           } else {
+            // Name-based lookup — PATTERN_NAME_MAP is the first gate
             const nameMatchedImage = findImageByPatternName(queryText);
             if (nameMatchedImage) {
               patternImages = [nameMatchedImage];
             } else {
+              // RAG fallback: only use top config chunk if score is high enough
+              // (it's the closest semantic match — not guaranteed exact)
+              // We allow this only when no other signal is available
               const topConfig = configChunks[0];
               patternImages = topConfig?.patternImage ? [topConfig.patternImage] : [];
             }
@@ -1144,13 +1370,22 @@ module.exports = async function handler(req, res) {
         console.error("Spin Genius RAG error:", ragErr.message);
       }
 
-      // Build messages — classifier result injected as text only (no image re-sent to final LLM)
+      // ── STEP 5: Build messages — inject classifier result as text (NO image re-sent) ──
+      //
+      // CRITICAL BUG FIX:
+      // Previously the grayscale image was sent to the final LLM call. GPT would see the
+      // image, re-identify the pattern itself, and override the classifier's correct answer.
+      // This caused the text reply (e.g. '11-C') to contradict patternImages (e.g. '7-A.jpeg').
+      // THE FIX: Do NOT send the image to the final LLM call.
+      // The classifier already ran 3 dedicated GPT-4o calls to identify the pattern.
+      // The final LLM only needs the text description — it must trust the classifier result.
+      //
       const systemPrompt = buildSpinGeniusSystemPrompt(ragContext);
-      const geminiHistory = buildConversationHistory(history);
-      const userParts = [];
-      if (plannedUserText?.trim()) userParts.push({ text: plannedUserText });
+      let userContent = [];
+      if (plannedUserText?.trim()) userContent.push({ type: "text", text: plannedUserText });
 
       if (grayscaleImageUrl && classifiedPattern) {
+        // Classifier succeeded — inject result as text only, never re-send the image
         const entry = lookupExact(classifiedPattern.boardPosition, classifiedPattern.stickPosition)
           || lookupByBoard(classifiedPattern.boardPosition);
         const kbDesc = ragChunks.find(c =>
@@ -1166,7 +1401,8 @@ module.exports = async function handler(req, res) {
           : entry
             ? `\n\nPattern Name: ${entry.patternName}\nFun Name: ${entry.funName}\nBoard Position: ${classifiedPattern.boardPosition}\nStick Position: ${entry.stickPosition || classifiedPattern.stickPosition}`
             : "";
-        userParts.push({
+        userContent.push({
+          type: "text",
           text: `[CLASSIFIER RESULT — DEFINITIVE IDENTIFICATION. DO NOT CHANGE OR QUESTION THIS.
 
 Board Position: ${classifiedPattern.boardPosition}
@@ -1190,32 +1426,46 @@ The pattern picture will appear below my response automatically! 🎨
 Do not write paragraphs. Do not suggest alternatives. Use EXACTLY the board and stick position above.${descText}]`
         });
       } else if (grayscaleImageUrl && !classifiedPattern) {
-        userParts.push({
+        // Image uploaded but classifier failed — ask user for more info
+        userContent.push({
+          type: "text",
           text: "[NOTE: An image was uploaded but the pattern classifier could not identify it confidently. Tell the user in a friendly way that you could not clearly identify this pattern, and ask them to try a clearer photo or share the board and stick positions directly.]"
         });
       }
 
-      geminiHistory.push({ role: "user", parts: userParts });
-
+      // userContent is used to build spinUserParts below
       console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages, "| Classified:", classifiedPattern?.boardPosition || "none");
 
-      let reply = await geminiChat({
-        model: MODEL_FLASH,
-        systemPrompt,
-        messages: geminiHistory,
-        temperature: 0.7,
-        maxTokens: 2500,
-        geminiKey,
-      });
-      reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
+      // Use Gemini Flash for SpinGenius — same model handles text and vision context
+      const spinUserParts = [];
+      for (const part of userContent) {
+        if (part.type === "text") spinUserParts.push({ text: part.text });
+        // Note: image is NOT re-sent to final call (classifier already ran 3 Gemini vision calls)
+        // Classifier result was injected as text above — this is intentional
+      }
+
+      let reply;
+      try {
+        reply = await geminiChatCall({
+          systemPrompt,
+          history: buildConversationHistory(history),
+          userParts: spinUserParts,
+          model: MODEL_CHAT,
+          temperature: 0.7,
+          maxTokens: 2000,
+          geminiKey,
+        });
+      } catch (chatErr) {
+        return res.status(500).json({ error: "Gemini chat error", details: String(chatErr.message).slice(0, 500) });
+      }
+      reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/{3,}/g, "");
 
       return res.status(200).json({
         text: reply,
         patternImages,
-        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, patternImagesReturned: patternImages, classifiedBoard: classifiedPattern?.boardPosition || null },
+        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map(c => c.type), patternImagesReturned: patternImages, classifiedBoard: classifiedPattern?.boardPosition || null },
       });
     }
-
     return res.status(400).json({ error: `Unknown product: "${product}". Use "robocoders" or "spingenius".` });
 
   } catch (err) {
@@ -1225,7 +1475,7 @@ Do not write paragraphs. Do not suggest alternatives. Use EXACTLY the board and 
 };
 
 // =============================================================================
-// System Prompts — unchanged
+// System Prompts
 // =============================================================================
 function buildRobocodersSystemPrompt(groundedContext) {
   return `You are Be Cre8v AI, a helpful and encouraging assistant for the Robocoders Kit.
@@ -1244,10 +1494,6 @@ Important guidelines:
 - When asked about SAFETY: It is SAFE to plug/unplug sensors while the Robocoders Brain is on (low voltage 5V USB)
 - When asked about PROJECT COUNT: Always say "There are 50 projects, out of which 21 are live. One project per week shall be launched."
 - STRICT SCOPE: If user asks about Spin Genius, spirograph, or drawing machines, say: "I'm the Robocoders assistant! For Spin Genius questions, switch the product from the dropdown above 🤖"
-- IMAGE REQUESTS: If the user asks to "generate an image", "draw something", "show a picture" etc. — say: "Use the 🎨 Image button in the chat to generate images! I'll help you with your Robocoders project questions."
-- ANSWER LENGTH: Keep answers SHORT and FOCUSED. If user asks one specific question, answer ONLY that question in 3-5 sentences max. Do NOT add extra info they did not ask for.
-- SPECIFIC QUESTIONS: If user asks "how to connect motor" — answer ONLY that. Do not explain the whole project.
-- VIDEO LINKS: If user asks for video links — give ONLY the video links, nothing else.
 
 KNOWLEDGE BASE:
 ${groundedContext}
@@ -1296,59 +1542,58 @@ Sure! ☀️ Here is the pattern:
 The pattern picture will appear below my response automatically! 🎨
 
 NEVER write a long paragraph. ALWAYS use this bullet point format.
-ANSWER LENGTH: Keep answers SHORT. If user asks one question, answer ONLY that in 3-4 lines max.
 
 ALL 50 PATTERN FUN NAMES (use these when describing patterns to kids):
-  - Board 3-D    Sticks 3-3 → "The Petal Loop Donut 🍩"
-  - Board 12-J   Sticks 5-5 → "The Jagged Grid Ring 🌿"
-  - Board 6-N    Sticks 5-6 → "The Swirling Feather Ring 🪶"
-  - Board 7-J    Sticks 1-1 → "The Round Petal Flower 🌸"
-  - Board 3-R    Sticks 4-2 → "The Woven Scallop Ring 🍩"
-  - Board 10-A   Sticks 4-4 → "The Crossing Arc Ring 🌟"
-  - Board 9-M    Sticks 2-7 → "The Thick Arc Donut 🍩"
-  - Board 2-P    Sticks 6-6 → "The Magic Grid Globe 🌐"
-  - Board 4-P    Sticks 4-5 → "The Spinning Shark Fin Star 🦈"
-  - Board 4-N    Sticks 5-5 → "The Spinning Fan Crown 🌀"
-  - Board 1-P    Sticks 4-4 → "The Big Bold Rose 🌹"
-  - Board 15-A   Sticks 4-6 → "The Scribble Tire 🛞"
-  - Board 2-J    Sticks 6-6 → "The Diamond Lace Ring 💎"
-  - Board 16-L   Sticks 4-6 → "The Swooping Snowflake ❄️"
-  - Board 9-B    Sticks 4-2 → "The Loopy Asterisk Star ⭐"
-  - Board 2-F    Sticks 3-3 → "The Soap Bubble Garland 🫧"
-  - Board 2-C    Sticks 2-2 → "The Secret Flower Globe 🔮"
-  - Board 4-C    Sticks 2-2 → "The Little Scribble Donut 🍩"
-  - Board 5-L    Sticks 6-5 → "The Blue Feather Wreath 🪶"
-  - Board 6-Q    Sticks 5-4 → "The Heart Tip Star 💝"
-  - Board 11-C   Sticks 5-1 → "The Spinning Fan 🌀"
-  - Board 16-O   Sticks 6-3 → "The Curly Grid Ring 🌊"
-  - Board 7-B    Sticks 7-4 → "The Bold Petal Star 🌟"
-  - Board 14-H   Sticks 4-3 → "The Dandelion Wish Ring 🌼"
-  - Board 15-F   Sticks 5-3 → "The Zigzag Gear ⚙️"
-  - Board 1-H    Sticks 3-5 → "The Lucky Pinecone Ring 🌲"
-  - Board 11-A   Sticks 6-6 → "The Golden Thread Ring ✨"
-  - Board 9-O    Sticks 5-5 → "The Delicate Loop Ring 🐦"
-  - Board 11-J   Sticks 4-4 → "The Scalloped Wonder Disc 🌀"
-  - Board 14-I   Sticks 4-4 → "The Grand Rose 🌹"
-  - Board 7-C    Sticks 2-2 → "The Eight Petal Stamp 🌼"
-  - Board 8-A    Sticks 3-2 → "The Wispy Magic Star ✨"
-  - Board 12-C   Sticks 3-1 → "The Exploding Sun ☀️"
-  - Board 7-H    Sticks 3-3 → "The Cozy Circle Wreath 🎄"
-  - Board 3-L    Sticks 1-5 → "The Bold Swirling Petals 🌸"
-  - Board 2-M    Sticks 1-5 → "The Spinning Pinwheel 🌸"
-  - Board 1-E    Sticks 4-4 → "The Oval Bubble Ring 🫧"
-  - Board 13-R   Sticks 4-2 → "The Floppy Oval Ring 🫧"
-  - Board 3-C    Sticks 3-3 → "The Circle Puzzle Flower 🌸"
-  - Board 1-I    Sticks 4-3 → "The Feather Grid Ring 🌿"
-  - Board 7-A    Sticks 1-2 → "The Spiky Sea Urchin 🦔"
-  - Board 11-L   Sticks 1-1 → "The Thin Magic Ring 💍"
-  - Board 10-R   Sticks 1-1 → "The Simple Magic Window ⭐"
-  - Board 10-Q   Sticks 1-1 → "The Triangle Magic Star 🔯"
-  - Board 6-L    Sticks 1-1 → "The Dense Tangle Star ⭐"
-  - Board 10-Q   Sticks 1-2 → "The Spiky Chaos Star 💥"
-  - Board 9-B    Sticks 2-1 → "The Compact Loopy Star 🌟"
-  - Board 4-H    Sticks 3-6 → "The Lacy Loop Ring 🍩"
-  - Board G-6    Sticks 1-2 → "The Tiny Sun Badge 🪙"
-  - Board 15-Q   Sticks 2-1 → "The Criss-Cross Magic Ring 💫"
+  - Board 3-D    Sticks 3-3 → "The Petal Loop Donut 🍩" (Petal Loop Donut)
+  - Board 12-J   Sticks 5-5 → "The Jagged Grid Ring 🌿" (Jagged Grid Ring)
+  - Board 6-N    Sticks 5-6 → "The Swirling Feather Ring 🪶" (Swirling Feather Ring)
+  - Board 7-J    Sticks 1-1 → "The Round Petal Flower 🌸" (Round Petal Flower)
+  - Board 3-R    Sticks 4-2 → "The Woven Scallop Ring 🍩" (Woven Scallop Ring)
+  - Board 10-A   Sticks 4-4 → "The Crossing Arc Ring 🌟" (Crossing Arc Ring)
+  - Board 9-M    Sticks 2-7 → "The Thick Arc Donut 🍩" (Arc Donut)
+  - Board 2-P    Sticks 6-6 → "The Magic Grid Globe 🌐" (Magic Grid Globe)
+  - Board 4-P    Sticks 4-5 → "The Spinning Shark Fin Star 🦈" (Shark Fin Star)
+  - Board 4-N    Sticks 5-5 → "The Spinning Fan Crown 🌀" (Spinning Fan Crown)
+  - Board 1-P    Sticks 4-4 → "The Big Bold Rose 🌹" (Bold Rose Flower)
+  - Board 15-A   Sticks 4-6 → "The Scribble Tire 🛞" (Scribble Tire)
+  - Board 2-J    Sticks 6-6 → "The Diamond Lace Ring 💎" (Diamond Lace Ring)
+  - Board 16-L   Sticks 4-6 → "The Swooping Snowflake ❄️" (Swooping Snowflake)
+  - Board 9-B    Sticks 4-2 → "The Loopy Asterisk Star ⭐" (Loopy Asterisk Star)
+  - Board 2-F    Sticks 3-3 → "The Soap Bubble Garland 🫧" (Soap Bubble Garland)
+  - Board 2-C    Sticks 2-2 → "The Secret Flower Globe 🔮" (Flower in a Globe)
+  - Board 4-C    Sticks 2-2 → "The Little Scribble Donut 🍩" (Scribble Donut)
+  - Board 5-L    Sticks 6-5 → "The Blue Feather Wreath 🪶" (Feather Wreath)
+  - Board 6-Q    Sticks 5-4 → "The Heart Tip Star 💝" (Heart Tip Starburst)
+  - Board 11-C   Sticks 5-1 → "The Spinning Fan 🌀" (Spinning Fan Blades)
+  - Board 16-O   Sticks 6-3 → "The Curly Grid Ring 🌊" (Grid with Curly Edge)
+  - Board 7-B    Sticks 7-4 → "The Bold Petal Star 🌟" (Petal Star)
+  - Board 14-H   Sticks 4-3 → "The Dandelion Wish Ring 🌼" (Dandelion Petal Ring)
+  - Board 15-F   Sticks 5-3 → "The Zigzag Gear ⚙️" (Zigzag Gear)
+  - Board 1-H    Sticks 3-5 → "The Lucky Pinecone Ring 🌲" (Pinecone Scale Ring)
+  - Board 11-A   Sticks 6-6 → "The Golden Thread Ring ✨" (Thread Ring)
+  - Board 9-O    Sticks 5-5 → "The Delicate Loop Ring 🐦" (Delicate Loop Ring)
+  - Board 11-J   Sticks 4-4 → "The Scalloped Wonder Disc 🌀" (Scalloped Woven Disc)
+  - Board 14-I   Sticks 4-4 → "The Grand Rose 🌹" (Grand Rose)
+  - Board 7-C    Sticks 2-2 → "The Eight Petal Stamp 🌼" (Eight Round Petals)
+  - Board 8-A    Sticks 3-2 → "The Wispy Magic Star ✨" (Wispy Asterisk)
+  - Board 12-C   Sticks 3-1 → "The Exploding Sun ☀️" (Exploding Sun)
+  - Board 7-H    Sticks 3-3 → "The Cozy Circle Wreath 🎄" (Circle Wreath)
+  - Board 3-L    Sticks 1-5 → "The Bold Swirling Petals 🌸" (Bold Swirling Petals)
+  - Board 2-M    Sticks 1-5 → "The Spinning Pinwheel 🌸" (Spinning Pinwheel)
+  - Board 1-E    Sticks 4-4 → "The Oval Bubble Ring 🫧" (Oval Bubble Ring)
+  - Board 13-R   Sticks 4-2 → "The Floppy Oval Ring 🫧" (Floppy Oval Ring)
+  - Board 3-C    Sticks 3-3 → "The Circle Puzzle Flower 🌸" (Overlapping Circles Flower)
+  - Board 1-I    Sticks 4-3 → "The Feather Grid Ring 🌿" (Feather Grid Ring)
+  - Board 7-A    Sticks 1-2 → "The Spiky Sea Urchin 🦔" (Spiky Sea Urchin)
+  - Board 11-L   Sticks 1-1 → "The Thin Magic Ring 💍" (Thin Circle Ring)
+  - Board 10-R   Sticks 1-1 → "The Simple Magic Window ⭐" (Simple Polygon Star)
+  - Board 10-Q   Sticks 1-1 → "The Triangle Magic Star 🔯" (Triangle Star)
+  - Board 6-L    Sticks 1-1 → "The Dense Tangle Star ⭐" (Dense Tangle Star)
+  - Board 10-Q   Sticks 1-2 → "The Spiky Chaos Star 💥" (Spiky Chaos Star)
+  - Board 9-B    Sticks 2-1 → "The Compact Loopy Star 🌟" (Compact Loopy Star)
+  - Board 4-H    Sticks 3-6 → "The Lacy Loop Ring 🍩" (Tiny Loop Lace Ring)
+  - Board G-6    Sticks 1-2 → "The Tiny Sun Badge 🪙" (Tiny Sun Badge)
+  - Board 15-Q   Sticks 2-1 → "The Criss-Cross Magic Ring 💫" (Criss-Cross Loop Ring)
 ================================================================================
 RULE ZERO — COLOR DOES NOT EXIST IN THIS IMAGE
 ================================================================================
@@ -1381,7 +1626,7 @@ If config not in knowledge base: "I don't have that one yet — try it out and d
 }
 
 // =============================================================================
-// All helper functions — unchanged from original
+// All Robocoders helper functions
 // =============================================================================
 function buildIndexes(kb) {
   const projectNames = extractProjectNames(kb);
@@ -1457,16 +1702,8 @@ function resolveContextFromHistory(history, projectNames, componentsMap) {
   let lastProject = null, lastComponent = null;
   for (let i = history.length - 1; i >= 0; i--) {
     const msg = history[i];
-    // Support OpenAI format (content string) and Gemini format (parts array)
-    let text = "";
-    if (msg?.content && typeof msg.content === "string") {
-      text = msg.content;
-    } else if (Array.isArray(msg?.parts)) {
-      text = msg.parts.map(p => p?.text || "").join(" ");
-    } else if (Array.isArray(msg?.content)) {
-      text = msg.content.map(p => (typeof p === "string" ? p : p?.text || "")).join(" ");
-    }
-    if (!text.trim()) continue;
+    if (!msg?.content) continue;
+    const text = String(msg.content);
     if (!lastProject) { const p = detectProject(text, projectNames); if (p) lastProject = p; }
     if (!lastComponent) { const c = detectComponent(text, componentsMap); if (c) lastComponent = c; }
     if (lastProject && lastComponent) break;
@@ -1502,16 +1739,11 @@ function buildGroundedContext({ detectedProject, projectContext, lessonsByProjec
   return sections.join("\n\n");
 }
 
-// buildConversationHistory now returns Gemini-format {role, parts} objects
 function buildConversationHistory(history) {
   const msgs = [];
   for (const h of history || []) {
-    if (h?.role === "user" && h?.content) {
-      msgs.push({ role: "user", parts: [{ text: String(h.content) }] });
-    } else if (h?.role === "assistant" && h?.content) {
-      // Gemini uses "model" not "assistant"
-      msgs.push({ role: "model", parts: [{ text: String(h.content) }] });
-    }
+    if (h?.role === "user" && h?.content) msgs.push({ role: "user", content: String(h.content) });
+    else if (h?.role === "assistant" && h?.content) msgs.push({ role: "assistant", content: String(h.content) });
   }
   return msgs;
 }
@@ -1533,7 +1765,7 @@ function extractKitOverview(kb) {
     if (o.ageRange) parts.push(`Age Range: ${o.ageRange}`);
     return parts.join("\n");
   }
-  return "The Robocoders Kit is an educational electronics and coding kit for children aged 8-14.";
+  return "The Robocoders Kit is an educational electronics and coding kit for children aged 8-14. It includes 21 exciting projects and 92 components to learn physical computing, Visual Block Coding, and creative project building.";
 }
 
 function extractComponentsSummary(kb) {
