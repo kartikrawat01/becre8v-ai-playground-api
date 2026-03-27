@@ -823,18 +823,13 @@ module.exports = async function handler(req, res) {
     const history = Array.isArray(body.history) ? body.history : Array.isArray(body.messages) ? body.messages : [];
     const attachment = body.attachment || null;
 
-    if ((typeof message !== "string" || !message.trim()) && !attachment) {
-      return res.status(400).json({ error: "Missing message or image input." });
-    }
-
-    const rawUserText = String(message || "").trim() || (attachment ? "Analyze the uploaded image and describe what you see in detail." : "");
-
     const geminiKey = process.env.GEMINI_API_KEY;
     if (!geminiKey) return res.status(500).json({ error: "GEMINI_API_KEY is not set in env." });
     if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: "OPENAI_API_KEY is not set — needed for embeddings." });
 
     // ========================================================================
     // NANO BANANA — Image generation (works for ALL products)
+    // Must be checked BEFORE the message validation below
     // Frontend: POST { action: "generate_image", prompt: "...", product: "..." }
     // ========================================================================
     if (body.action === "generate_image") {
@@ -842,9 +837,45 @@ module.exports = async function handler(req, res) {
       const imgProduct = String(body.product || "robocoders").toLowerCase();
       if (!imgPrompt) return res.status(400).json({ error: "prompt required." });
 
-      // SpinGenius: only generate patterns/spirograph images
-      // Robocoders: generate project diagrams, component illustrations
-      // Both: generate whatever user asks — no restriction on image content
+      // ── SpinGenius: check KB pattern images FIRST before generating ────────
+      // If user asks for a known pattern (by name or board position),
+      // return the stored image from knowledge base — no generation needed.
+      if (imgProduct === "spingenius") {
+        const queryLower = imgPrompt.toLowerCase();
+
+        // Check by board position (e.g. "3-D", "10-A")
+        const boardMatch = queryLower.match(/([0-9]{1,2}-[a-z])/i) || queryLower.match(/(g-[0-9])/i);
+        const stickMatch = queryLower.match(/stick[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i) || queryLower.match(/([0-9]+-[0-9]+)/);
+        const askedBoard = boardMatch?.[1]?.toUpperCase();
+        const askedStick = stickMatch?.[1];
+
+        let kbEntry = null;
+        if (askedBoard && askedStick) kbEntry = lookupExact(askedBoard, askedStick);
+        if (!kbEntry && askedBoard) kbEntry = lookupByBoard(askedBoard);
+
+        // Check by pattern name from PATTERN_NAME_MAP
+        if (!kbEntry) {
+          const nameMatchedImage = findImageByPatternName(queryLower);
+          if (nameMatchedImage) {
+            return res.status(200).json({
+              type: "generated_image",
+              patternImageFilename: nameMatchedImage,
+              text: "Here is the pattern from the knowledge base! 🌀",
+            });
+          }
+        }
+
+        if (kbEntry?.patternImage) {
+          return res.status(200).json({
+            type: "generated_image",
+            patternImageFilename: kbEntry.patternImage,
+            text: `Here is the ${kbEntry.patternName || "pattern"} from the knowledge base! 🌀`,
+          });
+        }
+        // Pattern not in KB — fall through to Nano Banana generation
+      }
+
+      // ── Generate with Nano Banana (for unknown patterns or Robocoders) ──────
       try {
         const imageUrl = await generateImageWithNanoBanana(imgPrompt, geminiKey);
         if (imageUrl) {
@@ -902,6 +933,12 @@ module.exports = async function handler(req, res) {
         return res.status(500).json({ error: "Poll error: " + String(err.message).slice(0, 200) });
       }
     }
+
+    // ── Normal chat validation — only for non-action requests ─────────────
+    if ((typeof message !== "string" || !message.trim()) && !attachment) {
+      return res.status(400).json({ error: "Missing message or image input." });
+    }
+    const rawUserText = String(message || "").trim() || (attachment ? "Analyze the uploaded image and describe what you see in detail." : "");
 
     // ========================================================================
     // ROBOCODERS PATH
@@ -976,14 +1013,8 @@ module.exports = async function handler(req, res) {
         const queryEmbedding = await embedText(plannedUserText || rawUserText, geminiKey);
         ragChunks = await queryPinecone(queryEmbedding, "robocoders", 6);
         if (ragChunks.length > 0) {
-          ragContext = "=== RETRIEVED KNOWLEDGE (from vector search) ===
-" +
-            ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]
-${c.text}`).join("
-
----
-
-");
+          ragContext = "=== RETRIEVED KNOWLEDGE (from vector search) ===" +
+            ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]${c.text}`).join("---");
         }
       } catch (ragErr) {
         console.warn("RAG error (non-fatal):", ragErr.message);
@@ -1213,7 +1244,10 @@ Important guidelines:
 - When asked about SAFETY: It is SAFE to plug/unplug sensors while the Robocoders Brain is on (low voltage 5V USB)
 - When asked about PROJECT COUNT: Always say "There are 50 projects, out of which 21 are live. One project per week shall be launched."
 - STRICT SCOPE: If user asks about Spin Genius, spirograph, or drawing machines, say: "I'm the Robocoders assistant! For Spin Genius questions, switch the product from the dropdown above 🤖"
-- IMAGE REQUESTS: If the user asks to "generate an image", "draw something", "show a picture" etc. of anything NOT related to Robocoders projects — say: "I can help with Robocoders project images! Use the Image button in the chat to generate images 🎨"
+- IMAGE REQUESTS: If the user asks to "generate an image", "draw something", "show a picture" etc. — say: "Use the 🎨 Image button in the chat to generate images! I'll help you with your Robocoders project questions."
+- ANSWER LENGTH: Keep answers SHORT and FOCUSED. If user asks one specific question, answer ONLY that question in 3-5 sentences max. Do NOT add extra info they did not ask for.
+- SPECIFIC QUESTIONS: If user asks "how to connect motor" — answer ONLY that. Do not explain the whole project.
+- VIDEO LINKS: If user asks for video links — give ONLY the video links, nothing else.
 
 KNOWLEDGE BASE:
 ${groundedContext}
@@ -1262,6 +1296,7 @@ Sure! ☀️ Here is the pattern:
 The pattern picture will appear below my response automatically! 🎨
 
 NEVER write a long paragraph. ALWAYS use this bullet point format.
+ANSWER LENGTH: Keep answers SHORT. If user asks one question, answer ONLY that in 3-4 lines max.
 
 ALL 50 PATTERN FUN NAMES (use these when describing patterns to kids):
   - Board 3-D    Sticks 3-3 → "The Petal Loop Donut 🍩"
