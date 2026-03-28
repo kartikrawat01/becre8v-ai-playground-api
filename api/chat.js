@@ -1,17 +1,17 @@
 // =============================================================================
 // Be Cre8v AI Backend — Multi-Product RAG (Robocoders + Spin Genius)
-// Chat/Vision model  : Gemini 3 Flash  (gemini-3-flash)
+// Chat/Vision model  : Gemini 2.0 Flash  (gemini-2.0-flash)
 // Embeddings         : OpenAI text-embedding-3-small  (unchanged)
-// Image generation   : Nano Banana  (via /generate route)
-// Video generation   : Veo          (via /generate route)
+// Image generation   : Imagen 3  (imagen-3.0-generate-002) via Nano Banana slot
+// Video generation   : Veo 2     (veo-2.0-generate-001)
 // =============================================================================
 
 // ── Gemini endpoints ──────────────────────────────────────────────────────────
 const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1beta/models";
-const GEMINI_CHAT_MODEL      = "gemini-3-flash";
-const GEMINI_VISION_MODEL    = "gemini-3-flash";       // same model handles vision
-const NANO_BANANA_MODEL      = "nano-banana-2";        // image generation sub-model
-const VEO_MODEL              = "veo-3.1";              // video generation sub-model
+const GEMINI_CHAT_MODEL      = "gemini-2.0-flash";               // stable, fast, multimodal
+const GEMINI_VISION_MODEL    = "gemini-2.0-flash";               // same model handles vision
+const NANO_BANANA_MODEL      = "imagen-3.0-generate-002";        // image generation (Imagen 3)
+const VEO_MODEL              = "veo-2.0-generate-001";           // video generation (Veo 2)
 
 // ── OpenAI embedding (unchanged) ─────────────────────────────────────────────
 const OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings";
