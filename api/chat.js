@@ -1,10 +1,25 @@
 // =============================================================================
 // Be Cre8v AI Backend — Multi-Product RAG (Robocoders + Spin Genius)
+// Chat/Vision model  : Gemini 2.0 Flash  (gemini-2.0-flash)
+// Embeddings         : OpenAI text-embedding-3-small  (unchanged)
+// Image generation   : Imagen 3  (imagen-3.0-generate-002) via Nano Banana slot
+// Video generation   : Veo 2     (veo-2.0-generate-001)
 // =============================================================================
-const OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions";
-const OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings";
-const EMBED_MODEL = "text-embedding-3-small";
 
+// ── Gemini endpoints ──────────────────────────────────────────────────────────
+const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1beta/models";
+const GEMINI_CHAT_MODEL      = "gemini-2.0-flash";               // stable, fast, multimodal
+const GEMINI_VISION_MODEL    = "gemini-2.0-flash";               // same model handles vision
+const NANO_BANANA_MODEL      = "imagen-3.0-generate-002";        // image generation (Imagen 3)
+const VEO_MODEL              = "veo-2.0-generate-001";           // video generation (Veo 2)
+
+// ── OpenAI embedding (unchanged) ─────────────────────────────────────────────
+const OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings";
+const EMBED_MODEL      = "text-embedding-3-small";
+
+// =============================================================================
+// CORS helpers
+// =============================================================================
 function origins() {
   return (process.env.ALLOWED_ORIGIN || "").split(",").map((s) => s.trim()).filter(Boolean);
 }
@@ -22,6 +37,116 @@ function allow(res, origin) {
   return false;
 }
 
+// =============================================================================
+// Gemini API helpers
+// =============================================================================
+
+/**
+ * Call Gemini chat (text only or multimodal).
+ * parts — array of Gemini part objects: { text } or { inlineData: { mimeType, data } }
+ * systemInstruction — string (Gemini system prompt)
+ * temperature — float
+ * maxOutputTokens — int
+ */
+async function geminiChat({ geminiApiKey, model = GEMINI_CHAT_MODEL, systemInstruction, parts, temperature = 0.7, maxOutputTokens = 1000 }) {
+  const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${geminiApiKey}`;
+  const body = {
+    contents: [{ role: "user", parts }],
+    generationConfig: { temperature, maxOutputTokens },
+  };
+  if (systemInstruction) {
+    body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  }
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error("Gemini API error: " + t.slice(0, 800));
+  }
+  const data = await r.json();
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+}
+
+/**
+ * Build a Gemini multi-turn conversation history from history array.
+ * Returns Gemini `contents` array (alternating user/model roles).
+ */
+function buildGeminiHistory(history) {
+  const contents = [];
+  for (const h of history || []) {
+    if (h?.role === "user" && h?.content) {
+      contents.push({ role: "user", parts: [{ text: String(h.content) }] });
+    } else if (h?.role === "assistant" && h?.content) {
+      contents.push({ role: "model", parts: [{ text: String(h.content) }] });
+    }
+  }
+  return contents;
+}
+
+/**
+ * Call Gemini with full conversation history + new user parts.
+ */
+async function geminiChatWithHistory({ geminiApiKey, model = GEMINI_CHAT_MODEL, systemInstruction, history, newUserParts, temperature = 0.7, maxOutputTokens = 1000 }) {
+  const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${geminiApiKey}`;
+  const contents = [
+    ...buildGeminiHistory(history),
+    { role: "user", parts: newUserParts },
+  ];
+  const body = {
+    contents,
+    generationConfig: { temperature, maxOutputTokens },
+  };
+  if (systemInstruction) {
+    body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  }
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error("Gemini API error: " + t.slice(0, 800));
+  }
+  const data = await r.json();
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+}
+
+/**
+ * Single-turn Gemini vision call — for the pattern classifier.
+ * promptText — the vision prompt string
+ * imageBase64 — base64 image string (without data: prefix)
+ * mimeType — image MIME type (default: image/jpeg)
+ * maxOutputTokens — small for classifier, larger for free-text
+ */
+async function geminiVisionCall(promptText, imageBase64, geminiApiKey, maxOutputTokens = 80, mimeType = "image/jpeg") {
+  const url = `${GEMINI_BASE_URL}/${GEMINI_VISION_MODEL}:generateContent?key=${geminiApiKey}`;
+  const body = {
+    contents: [{
+      role: "user",
+      parts: [
+        { text: promptText },
+        { inlineData: { mimeType, data: imageBase64 } },
+      ],
+    }],
+    generationConfig: { temperature: 0, maxOutputTokens },
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) return null;
+  const data = await r.json();
+  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+}
+
+// =============================================================================
+// Chat Planner — rewrites user message into a clearer version (Gemini)
+// =============================================================================
 const CHAT_PLANNER_PROMPT = `
 You are Be Cre8v AI Conversation Planner.
 Rewrite the user's message into a clearer, more intelligent version BEFORE it is answered.
@@ -35,28 +160,25 @@ Rules:
 - Do not add adult/unsafe content.
 `.trim();
 
-async function planChatPrompt(userText, apiKey) {
-  const r = await fetch(OPENAI_CHAT_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.4,
-      messages: [
-        { role: "system", content: CHAT_PLANNER_PROMPT },
-        { role: "user", content: String(userText || "").trim() },
-      ],
-    }),
+async function planChatPrompt(userText, geminiApiKey) {
+  const reply = await geminiChat({
+    geminiApiKey,
+    model: GEMINI_CHAT_MODEL,
+    systemInstruction: CHAT_PLANNER_PROMPT,
+    parts: [{ text: String(userText || "").trim() }],
+    temperature: 0.4,
+    maxOutputTokens: 400,
   });
-  if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Planner error: " + t.slice(0, 800)); }
-  const data = await r.json();
-  return data?.choices?.[0]?.message?.content?.trim() || String(userText || "").trim();
+  return reply || String(userText || "").trim();
 }
 
-async function embedText(text, apiKey) {
+// =============================================================================
+// OpenAI Embeddings — unchanged
+// =============================================================================
+async function embedText(text, openaiApiKey) {
   const r = await fetch(OPENAI_EMBED_URL, {
     method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+    headers: { Authorization: `Bearer ${openaiApiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({ model: EMBED_MODEL, input: String(text || "").trim() }),
   });
   if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Embedding error: " + t.slice(0, 800)); }
@@ -64,8 +186,11 @@ async function embedText(text, apiKey) {
   return data.data[0].embedding;
 }
 
+// =============================================================================
+// Pinecone — unchanged
+// =============================================================================
 async function queryPinecone(queryEmbedding, namespace, topK = 6) {
-  const host = process.env.PINECONE_INDEX_HOST;
+  const host   = process.env.PINECONE_INDEX_HOST;
   const apiKey = process.env.PINECONE_API_KEY;
   if (!host || !apiKey) throw new Error("PINECONE_INDEX_HOST or PINECONE_API_KEY not set in env.");
   const r = await fetch(`${host}/query`, {
@@ -76,22 +201,22 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
   if (!r.ok) { const t = await r.text().catch(() => ""); throw new Error("Pinecone query error: " + t.slice(0, 800)); }
   const data = await r.json();
   return (data.matches || []).map((m) => ({
-    text: m.metadata?.text || "",
-    type: m.metadata?.type || "general",
-    projectName: m.metadata?.projectName || null,
-    patternImage: m.metadata?.patternImage || null,
+    text:          m.metadata?.text          || "",
+    type:          m.metadata?.type          || "general",
+    projectName:   m.metadata?.projectName   || null,
+    patternImage:  m.metadata?.patternImage  || null,
     boardPosition: m.metadata?.boardPosition || null,
     stickPosition: m.metadata?.stickPosition || null,
-    patternName: m.metadata?.patternName || null,
-    score: m.score,
+    patternName:   m.metadata?.patternName   || null,
+    score:         m.score,
   }));
 }
 
 // =============================================================================
-// IMAGE PREPROCESSING — Convert to grayscale before sending to GPT
+// IMAGE PREPROCESSING — Convert to grayscale before sending to Gemini
 //
 // ROOT CAUSE OF COLOR MISIDENTIFICATION:
-// GPT-4o-mini uses color as a visual shortcut even when told not to in the prompt.
+// Vision models use color as a visual shortcut even when told not to in the prompt.
 // Prompt instructions alone cannot fully override the model's internal vision
 // processing which detects color automatically.
 //
@@ -108,8 +233,8 @@ async function queryPinecone(queryEmbedding, namespace, topK = 6) {
 async function toGrayscaleBase64(imageData) {
   try {
     const sharp = require("sharp");
-    const base64 = imageData.startsWith("data:") ? imageData.split(",")[1] : imageData;
-    const inputBuffer = Buffer.from(base64, "base64");
+    const base64     = imageData.startsWith("data:") ? imageData.split(",")[1] : imageData;
+    const inputBuffer  = Buffer.from(base64, "base64");
     const outputBuffer = await sharp(inputBuffer)
       .grayscale()
       .normalise()
@@ -120,6 +245,16 @@ async function toGrayscaleBase64(imageData) {
     console.warn("Grayscale conversion failed, using original:", err.message);
     return imageData.startsWith("data:") ? imageData : `data:image/png;base64,${imageData}`;
   }
+}
+
+// Extract raw base64 and MIME type from a data URL
+function splitDataUrl(dataUrl) {
+  if (dataUrl.startsWith("data:")) {
+    const [header, data] = dataUrl.split(",");
+    const mimeType = header.replace("data:", "").replace(";base64", "");
+    return { mimeType: mimeType || "image/jpeg", data };
+  }
+  return { mimeType: "image/jpeg", data: dataUrl };
 }
 
 // =============================================================================
@@ -175,11 +310,9 @@ const PATTERN_NAME_MAP = [
   // ── STAR PATTERNS ──────────────────────────────────────────────────────────
   { image: "8-A.jpeg",  names: ["magic thread snowflake","magic snowflake star","thin star snowflake","delicate snowflake star","snowflake star","magic thread star","thin star","magic snowflake"] },
   { image: "10-R.jpeg", names: ["magic castle window","castle star window","star window castle","steady star castle","straight line star","strong star","castle window","balanced star"] },
-  // 10-Q has TWO different configurations — each has its own unique image
   { image: "10-Q-1.jpeg", names: ["ancient mystery star","triangle star","overlapping triangles star","geometric triangle star","mystery star","triangle circle","triangles in circle"] },
   { image: "10-Q-2.jpeg", names: ["night air sparkle","spinning sparkle","thin rotating points","thin sharp sparkle","fast spinning star","sparkle star","rotating sparkle"] },
   { image: "6-L.jpeg",  names: ["beautiful tangle","tangle star","complex crossing star","neat tangle","detailed crossing star","crossing line star","complex star tangle","tangle pattern"] },
-  // 9-B has TWO different configurations — each has its own unique image
   { image: "9-B-1.jpeg",  names: ["treasure map star","compass star","explorer star","long thin star points","skinny star","compass rose star","twinkling compass","star compass","skinny star points"] },
   { image: "4-P.jpeg",  names: ["royal star crown","star crown","pointy star crown","star crown border","triangular crown","sharp triangle crown","king queen crown star","crown star"] },
   { image: "2-J.jpeg",  names: ["star bicycle wheel","star wheel","bicycle wheel stars","thin crisp star ring","neat star ring","round star path","bicycle wheel","star ring"] },
@@ -211,279 +344,76 @@ function findImageByPatternName(queryText) {
 }
 
 // =============================================================================
-// Vision Pattern Classifier
-// Receives a GRAYSCALE image — color already eliminated before this call.
-// temperature=0 + JSON-only output = deterministic, reliable classification.
-// =============================================================================
-// =============================================================================
 // EXACT PATTERN LOOKUP TABLE — hardcoded from spingenius.json
 // This is the single source of truth for board+stick → image mapping.
-// No Pinecone ranking involved — always exact, never "closest match".
-// When classifier identifies a board, this table gives the precise image.
 // =============================================================================
 const PATTERN_LOOKUP = {
-  "3-D|3-3":   { patternImage: "3-D.jpeg", patternName: "Petal Loop Donut", funName: "The Petal Loop Donut 🍩" },
-  "12-J|5-5":   { patternImage: "12-J.jpeg", patternName: "Jagged Grid Ring", funName: "The Jagged Grid Ring 🌿" },
-  "6-N|5-6":   { patternImage: "6-N.jpeg", patternName: "Swirling Feather Ring", funName: "The Swirling Feather Ring 🪶" },
-  "7-J|1-1":   { patternImage: "7-J.jpeg", patternName: "Round Petal Flower", funName: "The Round Petal Flower 🌸" },
-  "3-R|4-2":   { patternImage: "3-R.jpeg", patternName: "Woven Scallop Ring", funName: "The Woven Scallop Ring 🍩" },
-  "10-A|4-4":   { patternImage: "10-A.jpeg", patternName: "Crossing Arc Ring", funName: "The Crossing Arc Ring 🌟" },
-  "9-M|2-7":   { patternImage: "9-M.jpeg", patternName: "Arc Donut", funName: "The Thick Arc Donut 🍩" },
-  "2-P|6-6":   { patternImage: "2-P.jpeg", patternName: "Magic Grid Globe", funName: "The Magic Grid Globe 🌐" },
-  "4-P|4-5":   { patternImage: "4-P.jpeg", patternName: "Shark Fin Star", funName: "The Spinning Shark Fin Star 🦈" },
-  "4-N|5-5":   { patternImage: "4-N.jpeg", patternName: "Spinning Fan Crown", funName: "The Spinning Fan Crown 🌀" },
-  "1-P|4-4":   { patternImage: "1-P.jpeg", patternName: "Bold Rose Flower", funName: "The Big Bold Rose 🌹" },
-  "15-A|4-6":   { patternImage: "15-A.jpeg", patternName: "Scribble Tire", funName: "The Scribble Tire 🛞" },
-  "2-J|6-6":   { patternImage: "2-J.jpeg", patternName: "Diamond Lace Ring", funName: "The Diamond Lace Ring 💎" },
-  "16-L|4-6":   { patternImage: "16-L.jpeg", patternName: "Swooping Snowflake", funName: "The Swooping Snowflake ❄️" },
-  "9-B|4-2":   { patternImage: "9-B-1.jpeg", patternName: "Loopy Asterisk Star", funName: "The Loopy Asterisk Star ⭐" },
-  "2-F|3-3":   { patternImage: "2-F.jpeg", patternName: "Soap Bubble Garland", funName: "The Soap Bubble Garland 🫧" },
-  "2-C|2-2":   { patternImage: "2-C.jpeg", patternName: "Flower in a Globe", funName: "The Secret Flower Globe 🔮" },
-  "4-C|2-2":   { patternImage: "4-C.jpeg", patternName: "Scribble Donut", funName: "The Little Scribble Donut 🍩" },
-  "5-L|6-5":   { patternImage: "5-L.jpeg", patternName: "Feather Wreath", funName: "The Blue Feather Wreath 🪶" },
-  "6-Q|5-4":   { patternImage: "6-Q.jpeg", patternName: "Heart Tip Starburst", funName: "The Heart Tip Star 💝" },
-  "11-C|5-1":   { patternImage: "11-C.jpeg", patternName: "Spinning Fan Blades", funName: "The Spinning Fan 🌀" },
-  "16-O|6-3":   { patternImage: "16-O.jpeg", patternName: "Grid with Curly Edge", funName: "The Curly Grid Ring 🌊" },
-  "7-B|7-4":   { patternImage: "7-B.jpeg", patternName: "Petal Star", funName: "The Bold Petal Star 🌟" },
-  "14-H|4-3":   { patternImage: "14-H.jpeg", patternName: "Dandelion Petal Ring", funName: "The Dandelion Wish Ring 🌼" },
-  "15-F|5-3":   { patternImage: "15-F.jpeg", patternName: "Zigzag Gear", funName: "The Zigzag Gear ⚙️" },
-  "1-H|3-5":   { patternImage: "1-H.jpeg", patternName: "Pinecone Scale Ring", funName: "The Lucky Pinecone Ring 🌲" },
-  "11-A|6-6":   { patternImage: "11-A.jpeg", patternName: "Thread Ring", funName: "The Golden Thread Ring ✨" },
-  "9-O|5-5":   { patternImage: "9-O.jpeg", patternName: "Delicate Loop Ring", funName: "The Delicate Loop Ring 🐦" },
-  "11-J|4-4":   { patternImage: "11-J.jpeg", patternName: "Scalloped Woven Disc", funName: "The Scalloped Wonder Disc 🌀" },
-  "14-I|4-4":   { patternImage: "14-I.jpeg", patternName: "Grand Rose", funName: "The Grand Rose 🌹" },
-  "7-C|2-2":   { patternImage: "7-C.jpeg", patternName: "Eight Round Petals", funName: "The Eight Petal Stamp 🌼" },
-  "8-A|3-2":   { patternImage: "8-A.jpeg", patternName: "Wispy Asterisk", funName: "The Wispy Magic Star ✨" },
-  "12-C|3-1":   { patternImage: "12-C.jpeg", patternName: "Exploding Sun", funName: "The Exploding Sun ☀️" },
-  "7-H|3-3":   { patternImage: "7-H.jpeg", patternName: "Circle Wreath", funName: "The Cozy Circle Wreath 🎄" },
-  "3-L|1-5":   { patternImage: "3-L.jpeg", patternName: "Bold Swirling Petals", funName: "The Bold Swirling Petals 🌸" },
-  "2-M|1-5":   { patternImage: "2-M.jpeg", patternName: "Spinning Pinwheel", funName: "The Spinning Pinwheel 🌸" },
-  "1-E|4-4":   { patternImage: "1-E.jpeg", patternName: "Oval Bubble Ring", funName: "The Oval Bubble Ring 🫧" },
-  "13-R|4-2":   { patternImage: "13-R.jpeg", patternName: "Floppy Oval Ring", funName: "The Floppy Oval Ring 🫧" },
-  "3-C|3-3":   { patternImage: "3-C.jpeg", patternName: "Overlapping Circles Flower", funName: "The Circle Puzzle Flower 🌸" },
-  "1-I|4-3":   { patternImage: "1-I.jpeg", patternName: "Feather Grid Ring", funName: "The Feather Grid Ring 🌿" },
-  "7-A|1-2":   { patternImage: "7-A.jpeg", patternName: "Spiky Sea Urchin", funName: "The Spiky Sea Urchin 🦔" },
-  "11-L|1-1":   { patternImage: "11-L.jpeg", patternName: "Thin Circle Ring", funName: "The Thin Magic Ring 💍" },
-  "10-R|1-1":   { patternImage: "10-R.jpeg", patternName: "Simple Polygon Star", funName: "The Simple Magic Window ⭐" },
-  "10-Q|1-1":   { patternImage: "10-Q-1.jpeg", patternName: "Triangle Star", funName: "The Triangle Magic Star 🔯" },
-  "6-L|1-1":   { patternImage: "6-L.jpeg", patternName: "Dense Tangle Star", funName: "The Dense Tangle Star ⭐" },
-  "10-Q|1-2":   { patternImage: "10-Q-2.jpeg", patternName: "Spiky Chaos Star", funName: "The Spiky Chaos Star 💥" },
-  "9-B|2-1":   { patternImage: "9-B-2.jpeg", patternName: "Compact Loopy Star", funName: "The Compact Loopy Star 🌟" },
-  "4-H|3-6":   { patternImage: "4-H.jpeg", patternName: "Tiny Loop Lace Ring", funName: "The Lacy Loop Ring 🍩" },
-  "G-6|1-2":   { patternImage: "G-6.jpeg", patternName: "Tiny Sun Badge", funName: "The Tiny Sun Badge 🪙" },
-  "15-Q|2-1":   { patternImage: "15-Q.jpeg", patternName: "Criss-Cross Loop Ring", funName: "The Criss-Cross Magic Ring 💫" },
+  "3-D|3-3":   { patternImage: "3-D.jpeg",    patternName: "Petal Loop Donut",       funName: "The Petal Loop Donut 🍩" },
+  "12-J|5-5":  { patternImage: "12-J.jpeg",   patternName: "Jagged Grid Ring",        funName: "The Jagged Grid Ring 🌿" },
+  "6-N|5-6":   { patternImage: "6-N.jpeg",    patternName: "Swirling Feather Ring",   funName: "The Swirling Feather Ring 🪶" },
+  "7-J|1-1":   { patternImage: "7-J.jpeg",    patternName: "Round Petal Flower",      funName: "The Round Petal Flower 🌸" },
+  "3-R|4-2":   { patternImage: "3-R.jpeg",    patternName: "Woven Scallop Ring",      funName: "The Woven Scallop Ring 🍩" },
+  "10-A|4-4":  { patternImage: "10-A.jpeg",   patternName: "Crossing Arc Ring",       funName: "The Crossing Arc Ring 🌟" },
+  "9-M|2-7":   { patternImage: "9-M.jpeg",    patternName: "Arc Donut",               funName: "The Thick Arc Donut 🍩" },
+  "2-P|6-6":   { patternImage: "2-P.jpeg",    patternName: "Magic Grid Globe",        funName: "The Magic Grid Globe 🌐" },
+  "4-P|4-5":   { patternImage: "4-P.jpeg",    patternName: "Shark Fin Star",          funName: "The Spinning Shark Fin Star 🦈" },
+  "4-N|5-5":   { patternImage: "4-N.jpeg",    patternName: "Spinning Fan Crown",      funName: "The Spinning Fan Crown 🌀" },
+  "1-P|4-4":   { patternImage: "1-P.jpeg",    patternName: "Bold Rose Flower",        funName: "The Big Bold Rose 🌹" },
+  "15-A|4-6":  { patternImage: "15-A.jpeg",   patternName: "Scribble Tire",           funName: "The Scribble Tire 🛞" },
+  "2-J|6-6":   { patternImage: "2-J.jpeg",    patternName: "Diamond Lace Ring",       funName: "The Diamond Lace Ring 💎" },
+  "16-L|4-6":  { patternImage: "16-L.jpeg",   patternName: "Swooping Snowflake",      funName: "The Swooping Snowflake ❄️" },
+  "9-B|4-2":   { patternImage: "9-B-1.jpeg",  patternName: "Loopy Asterisk Star",     funName: "The Loopy Asterisk Star ⭐" },
+  "2-F|3-3":   { patternImage: "2-F.jpeg",    patternName: "Soap Bubble Garland",     funName: "The Soap Bubble Garland 🫧" },
+  "2-C|2-2":   { patternImage: "2-C.jpeg",    patternName: "Flower in a Globe",       funName: "The Secret Flower Globe 🔮" },
+  "4-C|2-2":   { patternImage: "4-C.jpeg",    patternName: "Scribble Donut",          funName: "The Little Scribble Donut 🍩" },
+  "5-L|6-5":   { patternImage: "5-L.jpeg",    patternName: "Feather Wreath",          funName: "The Blue Feather Wreath 🪶" },
+  "6-Q|5-4":   { patternImage: "6-Q.jpeg",    patternName: "Heart Tip Starburst",     funName: "The Heart Tip Star 💝" },
+  "11-C|5-1":  { patternImage: "11-C.jpeg",   patternName: "Spinning Fan Blades",     funName: "The Spinning Fan 🌀" },
+  "16-O|6-3":  { patternImage: "16-O.jpeg",   patternName: "Grid with Curly Edge",    funName: "The Curly Grid Ring 🌊" },
+  "7-B|7-4":   { patternImage: "7-B.jpeg",    patternName: "Petal Star",              funName: "The Bold Petal Star 🌟" },
+  "14-H|4-3":  { patternImage: "14-H.jpeg",   patternName: "Dandelion Petal Ring",    funName: "The Dandelion Wish Ring 🌼" },
+  "15-F|5-3":  { patternImage: "15-F.jpeg",   patternName: "Zigzag Gear",             funName: "The Zigzag Gear ⚙️" },
+  "1-H|3-5":   { patternImage: "1-H.jpeg",    patternName: "Pinecone Scale Ring",     funName: "The Lucky Pinecone Ring 🌲" },
+  "11-A|6-6":  { patternImage: "11-A.jpeg",   patternName: "Thread Ring",             funName: "The Golden Thread Ring ✨" },
+  "9-O|5-5":   { patternImage: "9-O.jpeg",    patternName: "Delicate Loop Ring",      funName: "The Delicate Loop Ring 🐦" },
+  "11-J|4-4":  { patternImage: "11-J.jpeg",   patternName: "Scalloped Woven Disc",    funName: "The Scalloped Wonder Disc 🌀" },
+  "14-I|4-4":  { patternImage: "14-I.jpeg",   patternName: "Grand Rose",              funName: "The Grand Rose 🌹" },
+  "7-C|2-2":   { patternImage: "7-C.jpeg",    patternName: "Eight Round Petals",      funName: "The Eight Petal Stamp 🌼" },
+  "8-A|3-2":   { patternImage: "8-A.jpeg",    patternName: "Wispy Asterisk",          funName: "The Wispy Magic Star ✨" },
+  "12-C|3-1":  { patternImage: "12-C.jpeg",   patternName: "Exploding Sun",           funName: "The Exploding Sun ☀️" },
+  "7-H|3-3":   { patternImage: "7-H.jpeg",    patternName: "Circle Wreath",           funName: "The Cozy Circle Wreath 🎄" },
+  "3-L|1-5":   { patternImage: "3-L.jpeg",    patternName: "Bold Swirling Petals",    funName: "The Bold Swirling Petals 🌸" },
+  "2-M|1-5":   { patternImage: "2-M.jpeg",    patternName: "Spinning Pinwheel",       funName: "The Spinning Pinwheel 🌸" },
+  "1-E|4-4":   { patternImage: "1-E.jpeg",    patternName: "Oval Bubble Ring",        funName: "The Oval Bubble Ring 🫧" },
+  "13-R|4-2":  { patternImage: "13-R.jpeg",   patternName: "Floppy Oval Ring",        funName: "The Floppy Oval Ring 🫧" },
+  "3-C|3-3":   { patternImage: "3-C.jpeg",    patternName: "Overlapping Circles Flower", funName: "The Circle Puzzle Flower 🌸" },
+  "1-I|4-3":   { patternImage: "1-I.jpeg",    patternName: "Feather Grid Ring",       funName: "The Feather Grid Ring 🌿" },
+  "7-A|1-2":   { patternImage: "7-A.jpeg",    patternName: "Spiky Sea Urchin",        funName: "The Spiky Sea Urchin 🦔" },
+  "11-L|1-1":  { patternImage: "11-L.jpeg",   patternName: "Thin Circle Ring",        funName: "The Thin Magic Ring 💍" },
+  "10-R|1-1":  { patternImage: "10-R.jpeg",   patternName: "Simple Polygon Star",     funName: "The Simple Magic Window ⭐" },
+  "10-Q|1-1":  { patternImage: "10-Q-1.jpeg", patternName: "Triangle Star",           funName: "The Triangle Magic Star 🔯" },
+  "6-L|1-1":   { patternImage: "6-L.jpeg",    patternName: "Dense Tangle Star",       funName: "The Dense Tangle Star ⭐" },
+  "10-Q|1-2":  { patternImage: "10-Q-2.jpeg", patternName: "Spiky Chaos Star",        funName: "The Spiky Chaos Star 💥" },
+  "9-B|2-1":   { patternImage: "9-B-2.jpeg",  patternName: "Compact Loopy Star",      funName: "The Compact Loopy Star 🌟" },
+  "4-H|3-6":   { patternImage: "4-H.jpeg",    patternName: "Tiny Loop Lace Ring",     funName: "The Lacy Loop Ring 🍩" },
+  "G-6|1-2":   { patternImage: "G-6.jpeg",    patternName: "Tiny Sun Badge",          funName: "The Tiny Sun Badge 🪙" },
+  "15-Q|2-1":  { patternImage: "15-Q.jpeg",   patternName: "Criss-Cross Loop Ring",   funName: "The Criss-Cross Magic Ring 💫" },
 };
 
-// Lookup by board only (for cases where only board is known, no stick)
-// Returns the entry if that board has exactly ONE configuration, else null.
 function lookupByBoard(board) {
   const upper = board.toUpperCase();
   const matches = Object.entries(PATTERN_LOOKUP).filter(([k]) => k.startsWith(upper + "|"));
   return matches.length === 1 ? matches[0][1] : null;
 }
 
-// Lookup by board+stick — always exact, never approximate
 function lookupExact(board, stick) {
   const key = `${board.toUpperCase()}|${stick}`;
   return PATTERN_LOOKUP[key] || null;
 }
 
 // =============================================================================
-// Vision Pattern Classifier — GPT-4o + precise fingerprints for all 50 patterns
-// Upgraded from gpt-4o-mini to gpt-4o for superior fine geometric detail vision.
-// Precise distinguishing fingerprints added for every visually similar pair.
-// Returns boardPosition + stickPosition. Image filename resolved via PATTERN_LOOKUP.
-// =============================================================================
-const VISION_CLASSIFIER_PROMPT = `You are an expert Spin Genius pattern classifier. You will be shown a GRAYSCALE spirograph pattern drawn on paper.
-The image is grayscale — identify by GEOMETRY AND STRUCTURAL DETAILS ONLY. Color does not exist.
-
-YOUR JOB: Identify the exact board position and stick position from the descriptions below.
-Study carefully before deciding. Use the distinguishing fingerprints.
-
-════════════════════════════════════════════════════════
-STEP 1 — SIZE AND POSITION OF THE PATTERN ON THE DISC
-════════════════════════════════════════════════════════
-
-TINY / SMALL pattern concentrated near center of disc (lots of empty white space around it):
-  → Could be: 10-R, 11-L, 9-B(2-1), 10-Q(1-1), 10-Q(1-2), 6-L, 8-A, 9-B(4-2), 7-J, 4-C, G-6, 7-A, 2-C
-
-MEDIUM pattern filling roughly half the disc:
-  → Could be: 7-B, 7-H, 7-C, 3-C, 1-I, 13-R, 1-E, 2-F, 3-D
-
-LARGE pattern filling most or all of the disc:
-  → Could be: 11-J, 14-I, 2-P, 12-J, 3-R, 6-N, 11-A, 9-M, 10-A, 3-L, all ring patterns
-
-════════════════════════════════════════════════════════
-STEP 2 — OVERALL STRUCTURE TYPE
-════════════════════════════════════════════════════════
-
-A) GRID/NET — Lines cross making square/rectangular gaps in a ring. Look for distinctive inner border.
-B) CROSSING-ARC RING — Lines sweep and cross in a ring making diamond gaps. Smooth edges.
-C) SCALLOPED/WOVEN DISC — Large disc-filling overlapping arcs making petal/scallop shapes.
-D) PARALLEL-ARC RING — Lines are PARALLEL (NOT crossing) curved arcs stacked in a ring.
-E) FEATHER/SCALE RING — Feather, leaf, or scale shapes all tilted in same swirling direction.
-F) FLOWER/PETAL — Curved petal or oval shapes meeting or overlapping at/near center.
-G) OVERLAPPING CIRCLES — Full round circles overlapping each other (not petals — full circles).
-H) STAR/SPOKE — Straight lines radiating outward forming a star or spoke pattern.
-I) FAN/PINWHEEL — Curved arms all sweeping in ONE direction like a fan or pinwheel.
-J) OUTER-LOOP RING — Shapes only on outer edge, large empty center.
-K) BUBBLE/OVAL CHAIN — Separate oval or bubble shapes linked in a ring.
-L) DENSE/SOLID RING — Ring looks very thick and dense, arcs nearly filling the ring.
-M) TINY DENSE CENTER — Very small dense pattern concentrated at center of disc.
-
-════════════════════════════════════════════════════════
-STEP 3 — EXACT BOARD FROM OBSERVED FINGERPRINTS
-════════════════════════════════════════════════════════
-
-── TYPE A: GRID/NET — CRITICAL DISAMBIGUATION ─────────────
-  These 5 patterns all have crossing lines. Use this STRICT DECISION TREE:
-
-  QUESTION 1: Does the center hole have JAGGED/SPIKY/ZIGZAG points?
-    YES → 12-J sticks 5-5
-      (Large grid ring. Inner border has sharp notched teeth pointing inward all around the hole.)
-    NO → continue to Q2
-
-  QUESTION 2: Are there short spiky or feather shapes pointing OUTWARD on the outer edge?
-    YES → 1-I sticks 4-3
-      (Medium ring. Grid inside + distinctive spikes/feathers on outer edge. Two features combined.)
-    NO → continue to Q3
-
-  QUESTION 3: Are there tiny loop or knot shapes on the outer edge?
-    YES → 2-J sticks 6-6
-      (Ring with diamond grid inside. Outer edge has tiny curl/knot decorations. Ring is moderately sized, large open center.)
-    NO → continue to Q4
-
-  QUESTION 4: Can you see 3 or 4 large sweeping S-CURVE or diagonal wave lines cutting through the grid?
-    YES → 2-P sticks 6-6
-      (Large ring/disc. The most distinctive feature: 3-4 bold curved lines sweep diagonally across the whole pattern making an S or wave shape through the grid. Fills large area.)
-    NO → 11-A sticks 6-6
-      (Clean thin ring of crossing lines only. No spikes, no knots, no S-curves, no jagged border. Just a plain neat woven thread ring. Large open center. This is the simplest of the group.)
-
-── TYPE B: CROSSING-ARC RING ─────────────────────────────
-  10-A sticks 4-4  — Ring where lines sweep and cross making a woven band with diamond/square gaps. Both inner and outer edges are smooth curves. Large round open center.
-  2-J  sticks 6-6  — Similar ring but with tiny loop or knot shapes decorating the outer edge. Inner crossing lines make diamond gaps. Distinctive outer knot decoration.
-
-── TYPE C: SCALLOPED/WOVEN DISC ──────────────────────────
-  KEY QUESTION: How much of the disc is filled, and what is the gap/center size?
-
-  11-J sticks 4-4  — ENTIRE DISC filled. Overlapping curved arcs make a beautiful scalloped petal grid covering the WHOLE disc from edge to edge. The arcs create a regular repeating petal pattern like fish scales. Center hole is ROUND and clearly defined.
-  3-R  sticks 4-2  — LARGE RING but NOT filling full disc — wide thick ring with medium center hole. The overlapping scalloped arcs form a wide band. You can clearly see individual arc shapes. The ring band is VERY WIDE and thick, almost but not quite filling the disc.
-  3-D  sticks 3-3  — MEDIUM RING, smaller than 3-R, more concentrated. The overlapping loops/arcs are packed into a ring that does NOT fill the full disc. Has a clear medium center hole. Less grand than 3-R. More like a thick donut ring than a full disc pattern.
-
-── TYPE D: PARALLEL-ARC RING ─────────────────────────────
-  9-M  sticks 2-7  — Thick ring of PARALLEL (non-crossing) curved arcs all stacked together. Very clean and regular. Lines do NOT cross each other — they are parallel. Large open center.
-
-── TYPE E: FEATHER/SCALE RING ────────────────────────────
-  KEY QUESTION: Do the individual shapes have visible lines INSIDE them (internal texture)?
-
-  6-N  sticks 5-6  — YES internal texture. Each feather/leaf shape has many tiny lines INSIDE it making it look like a real feather with detail. The feathers also CROSS each other with crossing lines visible between them. Large open center. Ring fills large area of disc.
-  5-L  sticks 6-5  — NO internal texture. Each shape is a plain clean oval or leaf with NO lines inside. Just simple clean oval outlines all tilted the same direction. Large open center. Simpler, cleaner look than 6-N.
-  1-H  sticks 3-5  — Scale shapes like pinecone or fish scales. Each scale leans over neighbor in ONE consistent direction. Scales are more rounded/compact than 5-L's ovals. Open center.
-
-── TYPE F: FLOWER/PETAL ──────────────────────────────────
-  Size and petal shape are key. Compare carefully:
-
-  7-J  sticks 1-1  — SMALL compact. 7-8 round fat oval petals overlapping at center. Centered on disc with lots of white space around. Looks like a cheerful doodle flower.
-  7-C  sticks 2-2  — SMALL. Exactly 8 equal round petals perfectly symmetrical, like a stamp. Clean and neat. Small.
-  7-H  sticks 3-3  — MEDIUM-SMALL. Dense circle wreath — many overlapping circular loops packed into a thick ring. More like a wreath than a flower. Small center hole.
-  3-C  sticks 3-3  — MEDIUM. 8-10 large full CIRCLES (not petals) overlapping each other filling an area. Like overlapping rings. NO clear center hole.
-  2-C  sticks 2-2  — TINY. A very small 4-petal flower ENCLOSED INSIDE a circular outer border. Has a visible circle outline surrounding it. Very small, centered.
-  1-P  sticks 4-4  — LARGE. Big bold wide petals like a rose. Bigger and bolder than 7-J. Fills more of disc.
-  14-I sticks 4-4  — LARGE. Grand rose — many large oval petals slightly rotated, spreading across most of disc. Elegant, open. Small center.
-  3-L  sticks 1-5  — LARGE. 20-25 big bold oval petals all swirling in ONE direction. Strong rotation sense. Polygon-shaped center hole.
-  12-C sticks 3-1  — MEDIUM-SMALL. ALL lines meet at ONE SOLID CENTER POINT. No hole at all. Like an exploding sun or firework from center. Starburst with solid center.
-
-── TYPE G: OVERLAPPING CIRCLES ───────────────────────────
-  3-C  sticks 3-3  — 8-10 large full circles overlapping. (Also listed in Type F above)
-
-── TYPE H: STAR/SPOKE ────────────────────────────────────
-  Compare by size, number of arms, and arm style:
-
-  10-R sticks 1-1  — VERY SMALL. Just a few straight lines making a clean simple polygon star or octagon. Minimal lines. Very tiny on disc.
-  8-A  sticks 3-2  — SMALL-MEDIUM. 8 very long thin wispy arms, each ending in tiny loop. Very sparse — lots of empty space between arms. Larger than 9-B(4-2). Like a wispy asterisk.
-  9-B  sticks 4-2  — SMALL-MEDIUM. 8 long thin arms each ending in small rounded loop. More defined than 8-A but similar. Like a loopy asterisk star. Slightly smaller than 8-A.
-  9-B  sticks 2-1  — SMALL. 8 shorter FATTER arms with BIGGER oval loops. More compact and concentrated. Looks like a compact badge star.
-  7-B  sticks 7-4  — MEDIUM-LARGE. 5-6 LARGE bold oval loop petals all crossing each other at center. Very open and airy. Each loop is big. Open star shape.
-  6-L  sticks 1-1  — SMALL-MEDIUM. Many straight lines crossing in a DENSE TANGLE. Busier and more complex than other stars. Small open center barely visible.
-  10-Q sticks 1-1  — SMALL. Clean geometric star of neat overlapping TRIANGLES. Polygon center hole clearly visible. Organized and mathematical-looking.
-  10-Q sticks 1-2  — SMALL. Many thin straight lines shooting in all DIRECTIONS making a chaotic spiky explosion. Messy and energetic. Small center.
-  4-P  sticks 4-5  — MEDIUM-LARGE. Sharp SHARK FIN star points (triangular, straight one side / diagonal other). Points rotate around open center. Fills disc well.
-
-── TYPE I: FAN/PINWHEEL ──────────────────────────────────
-  11-C sticks 5-1  — 20-25 curved blades sweeping in ONE direction. Open round center. Medium disc coverage. Classic fan blade look.
-  2-M  sticks 1-5  — ~25 long smooth curved arms sweeping in one direction with pointed tips. More open spacing between arms than 11-C. Round open center.
-  3-L  sticks 1-5  — 20-25 large bold oval petals swirling one direction. (Also listed in Type F)
-  4-N  sticks 5-5  — Fan-shaped triangular blades with tiny loop tip on each one. Distinctive loop at tip of every blade. Rotation direction visible.
-  16-L sticks 4-6  — Large smooth sweeping snowflake/pinwheel curves. Very large, open, graceful. Much bigger than 11-C.
-
-── TYPE J: OUTER-LOOP RING ───────────────────────────────
-  6-Q  sticks 5-4  — Many thin radiating lines ALL ending in tiny TEARDROP/HEART loops at outer tips. Like a starburst where every tip has a tiny heart. Open center.
-  4-H  sticks 3-6  — Ring of HUNDREDS of tiny loops. Very dense lacy ring. Large open center. Looks like detailed lacework.
-  15-Q sticks 2-1  — Ring of HUNDREDS of tiny CRISS-CROSSING loops. Busier and more tangled than 4-H. Loops cross each other.
-
-── TYPE K: BUBBLE/OVAL CHAIN ─────────────────────────────
-  CRITICAL GROUP — compare carefully by oval COUNT and SIZE:
-
-  13-R sticks 4-2  — 6-8 LARGE FLOPPY ovals loosely arranged in a ring. Each oval is big and casual. Very open. Large open center. Ovals are the biggest of the group.
-  1-E  sticks 4-4  — ~12 THIN SMALLER ovals linked side by side in a chain ring. More numerous and thinner than 13-R. Light and delicate. Large open center.
-  2-F  sticks 3-3  — ~10 VERY THIN DELICATE ovals. Even lighter/fainter/smaller than 1-E. Very airy and ghostly. Large open center.
-  9-O  sticks 5-5  — Many thin loops slightly overlapping and dancing. More numerous than others. Loops touch and overlap neighbors. Ring looks more continuous than a chain.
-
-  DISAMBIGUATION: Count ovals and check thickness.
-  6-8 large floppy → 13-R
-  ~12 thin medium  → 1-E
-  ~10 very faint   → 2-F
-  many overlapping → 9-O
-
-── TYPE L: DENSE/SOLID RING ──────────────────────────────
-  11-L sticks 1-1  — TINY NARROW RING. Looks like a thin simple circle/wedding ring. Very small, minimal lines, very thin band. Sits in center of disc. The simplest ring.
-  15-A sticks 4-6  — Thick messy SCRIBBLY ring. Lines look rough, tangled, and random. Like a tire drawn by scribbling. Small center hole.
-  16-O sticks 6-3  — Large grid filling most of disc. Distinctive SMALL CURL/LOOP shapes on the INNER EDGE pointing inward. Main body is a crossing-line grid.
-  G-6  sticks 1-2  — TINY SMALL dense circular scribble concentrated at center of disc. Very small. Like a tiny badge or coin. Lots of empty disc space around it.
-  7-A  sticks 1-2  — TINY SMALL dense SPIKY pattern at center. Many very short spiky lines shooting outward. Like a tiny sea urchin or spiky ball. Very small.
-  4-C  sticks 2-2  — SMALL messy scribble donut. Small overlapping circular scribbles making a tiny donut shape. Small center hole.
-
-── TYPE M: FUZZY/THREAD TUNNEL ───────────────────────────
-  1-I  sticks 4-3  — Ring with GRID inside + SHORT SPIKES/FEATHERS on outer edge. Two combined features. (Also in Type A above)
-
-════════════════════════════════════════════════════════
-CRITICAL CONFUSION RULES
-════════════════════════════════════════════════════════
-
-12-J vs 2-P: 12-J has JAGGED inner border. 2-P has smooth inner border and fills full disc.
-3-R vs 11-J vs 3-D: 11-J fills ENTIRE disc with scalloped grid. 3-R is a thick wide ring with visible arcs. 3-D is smaller/more concentrated.
-1-E vs 13-R vs 2-F: Count ovals. 6-8 big floppy=13-R. ~12 thin=1-E. ~10 very faint=2-F.
-9-B(4-2) vs 8-A: Both 8 arms with loops. 8-A arms are LONGER and THINNER. 9-B(4-2) slightly more defined/compact.
-9-B(2-1) vs 9-B(4-2): 9-B(2-1) has SHORTER FATTER arms with BIGGER loops, more compact overall.
-10-Q(1-1) vs 10-Q(1-2): 10-Q(1-1) has neat overlapping TRIANGLES and is organized. 10-Q(1-2) has chaotic spiky lines going everywhere.
-11-L vs G-6 vs 7-A vs 4-C: 11-L=thin ring. G-6=tiny dense scribble badge. 7-A=tiny spiky sea urchin. 4-C=tiny scribble donut with hole.
-11-C vs 2-M vs 4-N: 11-C=clean curved blades. 2-M=longer arms pointed tips. 4-N=blades with tiny loop at each tip (distinctive loop tip).
-NEVER output 12-J unless inner border is clearly JAGGED/ZIGZAG/SPIKY.
-11-A vs 2-P vs 1-I vs 2-J vs 12-J: Use the STRICT DECISION TREE in Type A above. Ask each question in order.
-  11-A = plain woven ring, no extra features. 2-P = S-curves through grid. 2-J = outer knots. 1-I = outer spikes. 12-J = jagged inner border.
-5-L vs 6-N: 6-N has lines INSIDE each feather (internal texture + crossing between feathers). 5-L shapes are PLAIN clean ovals with nothing inside.
-11-C vs 2-M vs 4-N: 4-N has LOOPS at blade tips. 11-C has bare pointed tips, ~20-25 blades. 2-M has bare pointed tips, longer arms, more open spacing.
-11-J vs 3-R vs 3-D: 11-J fills ENTIRE disc. 3-R is a very wide thick ring, NOT full disc. 3-D is a smaller medium ring.
-NEVER output 3-R unless arcs are clearly visible in a scalloped wide ring.
-ALWAYS output a board from the lists above.
-
-Respond ONLY with valid JSON, no other text:
-{"boardPosition":"1-E","stickPosition":"4-4","patternImage":"1-E.jpeg"}`;
-
-// =============================================================================
-// THREE-STEP CLASSIFIER — Grounded in direct observation of all 50 real patterns
-//
-// CONFIRMED FAILURES FIXED IN THIS VERSION:
-//   11-J → 11-A  (scalloped disc misrouted to grid group)
-//   13-R → 3-L   (floppy oval loops misrouted to flower group)
-//   5-L  → 6-N   (pen line width confused with interior hatching)
-//   16-L → 7-H   (large sweeping loops misrouted to flower/wreath group)
-//   6-Q  → 9-M   (teardrop-tip starburst misrouted to large ring group)
-//
-// APPROACH:
-//   Step 1 — Sequential YES/NO questions route image to correct group (A-L)
-//   Step 2 — Within that group, identify the exact board
-//   Step 3 — Verification pass for the most visually similar pairs
+// THREE-STEP VISION CLASSIFIER — now using Gemini 3 Flash vision
+// All prompts are identical to the GPT-4o version; only the API call changes.
 // =============================================================================
 
 // ─── STEP 1 ──────────────────────────────────────────────────────────────────
@@ -545,7 +475,6 @@ Output ONLY the single letter. Nothing else.`;
 // ─── STEP 2 PROMPTS ──────────────────────────────────────────────────────────
 const STEP2_PROMPTS = {
 
-  // GROUP A: GRID / CROSSING-LINE RINGS
   A: `GRAYSCALE spirograph. Identify the GRID or CROSSING-LINE RING.
 Answer each question in order. Stop at first YES.
 
@@ -566,7 +495,6 @@ Q5: Plain ring of crossing lines — smooth edges both sides, no extra features?
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP B: LEAF / FEATHER / SCALE RING
   B: `GRAYSCALE spirograph. Identify the LEAF, FEATHER, or SCALE RING.
 
 CRITICAL — Look carefully INSIDE one leaf/feather shape:
@@ -582,7 +510,6 @@ Can you see MULTIPLE FINE LINES running across the INTERIOR of each shape — li
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP C: LARGE FAN / PINWHEEL BLADES
   C: `GRAYSCALE spirograph. Identify the LARGE FAN or PINWHEEL BLADE pattern.
 Long curved blades all sweeping in the same direction like a spinning fan.
 
@@ -608,7 +535,6 @@ KEY: 2-M = single thin lines, widely spaced, large open center.
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP D: FLOWER / PETAL
   D: `GRAYSCALE spirograph. Identify the FLOWER or PETAL pattern.
 
 TINY/SMALL (less than 1/3 of disc):
@@ -627,7 +553,6 @@ LARGE (fills most of disc):
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP E: STAR / SPOKE / ASTERISK
   E: `GRAYSCALE spirograph. Identify the STAR, SPOKE, or ASTERISK pattern.
 
 NO LOOPS — plain straight lines or sharp points at arm tips:
@@ -645,7 +570,6 @@ YES LOOPS at arm tips:
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP F: SEPARATE OVAL/BUBBLE SHAPES IN A RING
   F: `GRAYSCALE spirograph. Identify the SEPARATE BUBBLE/OVAL CHAIN pattern.
 
 ~7-8 LARGE FLOPPY ovals, each drawn with MULTIPLE OVERLAPPING LINES making them thick and messy. Big and casual-looking. Large open center.
@@ -662,7 +586,6 @@ MANY small loops OVERLAPPING continuously — ring looks nearly continuous, loop
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP G: TINY CENTERED PATTERN
   G: `GRAYSCALE spirograph. Identify the TINY CENTERED pattern.
 Entire pattern is small at the disc center with large white space around it.
 
@@ -680,7 +603,6 @@ MESSY CHAOTIC scribble donut — overlapping circular scribble lines forming a s
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP H: FULL DISC SCALLOP / PETAL GRID
   H: `GRAYSCALE spirograph. Identify the LARGE SCALLOPED or PETAL DISC pattern.
 
 ENTIRE DISC filled from edge to edge — petal/scallop texture covers ALL space, no background gap outside. Clear ROUND center hole.
@@ -694,7 +616,6 @@ MEDIUM-LARGE RING — visible white gap outside ring, MEDIUM-SIZED center hole. 
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP I: PLAIN CROSSING-LINE RING
   I: `GRAYSCALE spirograph. Identify the PLAIN CROSSING-LINE RING.
 
 Crossing lines making diamond-shaped gaps — BOTH inner and outer edges are perfectly smooth curves. Elegant and clean. Large round open center.
@@ -705,7 +626,6 @@ Thick ring of large CHUNKY ROUNDED BLOB-LIKE sections — sections look thick an
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP J: TEARDROP/HEART LOOP TIPS AT OUTER EDGE
   J: `GRAYSCALE spirograph. Identify the OUTER-LOOP TIP pattern.
 
 Many thin spokes where EACH TIP ends in a TEARDROP or HEART-SHAPED LOOP at the outer edge. Loops are clearly teardrop/heart shaped. Fills most of disc. Large open center.
@@ -719,7 +639,6 @@ A ring of HUNDREDS of tiny loops that CRISS-CROSS and interweave with each other
 
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 
-  // GROUP L: LARGE SWEEPING PETAL LOOPS (16-L type)
   L: `GRAYSCALE spirograph. Identify the LARGE SWEEPING LOOP pattern.
 
 5-6 VERY LARGE GRACEFUL SMOOTH CURVES sweeping across the disc. Very few curves, very open. Polygon-shaped center hole. Fills most of disc.
@@ -731,9 +650,8 @@ Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 Respond ONLY with JSON: {"boardPosition":"...","stickPosition":"..."}`,
 };
 
-// ─── STEP 3: Verification prompts for the most visually similar pairs ─────────
+// ─── STEP 3: Verification prompts ─────────────────────────────────────────────
 const VERIFY_PROMPTS = {
-
   "11-J": `GRAYSCALE spirograph verification. Classifier said 11-J (full disc scallop pattern).
 Does the petal/arc texture reach ALL THE WAY to the disc rim with NO white gap outside?
   YES fills entire disc → {"boardPosition":"11-J","stickPosition":"4-4"}
@@ -852,41 +770,26 @@ Are there actually MANY MORE petals (20+) swirling strongly in one direction?
 Respond ONLY with JSON.`,
 };
 
-// Boards that get a verification pass
 const VERIFY_BOARDS = new Set([
   "11-J","3-D","3-R","5-L","6-N","11-A","13-R","1-E",
   "4-H","11-C","1-P","7-H","G-6","4-C","6-Q","16-L"
 ]);
 
 function getVerifyKey(board, stick) {
-  if (board === "9-B" && stick === "4-2") return "9-B_4-2";
+  if (board === "9-B"  && stick === "4-2") return "9-B_4-2";
   if (board === "10-Q" && stick === "1-1") return "10-Q_1-1";
   return board;
 }
 
-async function gptVisionCall(prompt, imageUrl, apiKey, maxTokens = 10) {
-  const r = await fetch(OPENAI_CHAT_URL, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "gpt-4o",
-      temperature: 0,
-      max_tokens: maxTokens,
-      messages: [{ role: "user", content: [
-        { type: "text", text: prompt },
-        { type: "image_url", image_url: { url: imageUrl } }
-      ]}]
-    }),
-  });
-  if (!r.ok) return null;
-  const data = await r.json();
-  return data?.choices?.[0]?.message?.content?.trim() || null;
-}
-
-async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
+// =============================================================================
+// Vision classifier — now calls Gemini 3 Flash instead of GPT-4o
+// =============================================================================
+async function classifyPatternFromImage(grayscaleImageUrl, geminiApiKey) {
   try {
+    const { mimeType, data: imageBase64 } = splitDataUrl(grayscaleImageUrl);
+
     // ── STEP 1: Route to visual group ────────────────────────────────────────
-    const cat = await gptVisionCall(STEP1_CATEGORY_PROMPT, grayscaleImageUrl, apiKey, 5);
+    const cat = await geminiVisionCall(STEP1_CATEGORY_PROMPT, imageBase64, geminiApiKey, 5, mimeType);
     if (!cat) return null;
     const category = cat.trim().toUpperCase().charAt(0);
     console.log("Step 1 category:", category);
@@ -898,11 +801,11 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
     }
 
     // ── STEP 2: Identify exact board within group ────────────────────────────
-    const raw = await gptVisionCall(step2Prompt, grayscaleImageUrl, apiKey, 80);
+    const raw = await geminiVisionCall(step2Prompt, imageBase64, geminiApiKey, 80, mimeType);
     if (!raw) return null;
     console.log("Step 2 raw:", raw);
 
-    const clean2 = raw.replace(/```json|```/g, "").trim();
+    const clean2  = raw.replace(/```json|```/g, "").trim();
     const parsed2 = JSON.parse(clean2);
     if (!parsed2?.boardPosition) return null;
 
@@ -912,10 +815,10 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
     // ── STEP 3: Verification for known confusion pairs ───────────────────────
     const verifyKey = getVerifyKey(board, stick);
     if (VERIFY_BOARDS.has(board) && VERIFY_PROMPTS[verifyKey]) {
-      const rawV = await gptVisionCall(VERIFY_PROMPTS[verifyKey], grayscaleImageUrl, apiKey, 60);
+      const rawV = await geminiVisionCall(VERIFY_PROMPTS[verifyKey], imageBase64, geminiApiKey, 60, mimeType);
       if (rawV) {
         try {
-          const cleanV = rawV.replace(/```json|```/g, "").trim();
+          const cleanV  = rawV.replace(/```json|```/g, "").trim();
           const parsedV = JSON.parse(cleanV);
           if (parsedV?.boardPosition) {
             console.log(`Step 3 verify: ${board} → ${parsedV.boardPosition} (stick: ${parsedV.stickPosition})`);
@@ -934,14 +837,99 @@ async function classifyPatternFromImage(grayscaleImageUrl, apiKey) {
     return {
       boardPosition: board,
       stickPosition: stick || entry.stickPosition || "",
-      patternImage: entry.patternImage,
-      patternName: entry.patternName,
-      funName: entry.funName,
+      patternImage:  entry.patternImage,
+      patternName:   entry.patternName,
+      funName:       entry.funName,
     };
   } catch (err) {
     console.error("Classifier error:", err.message);
     return null;
   }
+}
+
+// =============================================================================
+// Nano Banana — Image Generation
+// Generates images using the Nano Banana sub-model via Gemini API.
+// Called from the /generate?type=image route.
+// =============================================================================
+async function generateImageWithNanoBanana(prompt, geminiApiKey) {
+  const url = `${GEMINI_BASE_URL}/${NANO_BANANA_MODEL}:generateImages?key=${geminiApiKey}`;
+  const body = {
+    prompt: { text: prompt },
+    number_of_images: 1,
+    safety_filter_level: "block_medium_and_above",
+    person_generation: "dont_allow",
+  };
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => "");
+    throw new Error("Nano Banana image generation error: " + t.slice(0, 800));
+  }
+  const data = await r.json();
+  // Nano Banana returns generated images as base64 in the response
+  const generated = data?.generatedImages?.[0];
+  if (!generated?.image?.imageBytes) {
+    throw new Error("Nano Banana returned no image data.");
+  }
+  return {
+    imageBase64: generated.image.imageBytes,
+    mimeType: "image/png",
+    model: NANO_BANANA_MODEL,
+  };
+}
+
+// =============================================================================
+// Veo — Video Generation
+// Generates videos using the Veo sub-model via Gemini API (async/polling).
+// Called from the /generate?type=video route.
+// =============================================================================
+async function generateVideoWithVeo(prompt, geminiApiKey) {
+  // Step 1: Submit video generation job
+  const submitUrl = `${GEMINI_BASE_URL}/${VEO_MODEL}:predictLongRunning?key=${geminiApiKey}`;
+  const body = {
+    instances: [{ prompt }],
+    parameters: {
+      aspectRatio: "16:9",
+      durationSeconds: 5,
+      outputOptions: { mimeType: "video/mp4" },
+    },
+  };
+  const submitResp = await fetch(submitUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!submitResp.ok) {
+    const t = await submitResp.text().catch(() => "");
+    throw new Error("Veo video generation submit error: " + t.slice(0, 800));
+  }
+  const opData = await submitResp.json();
+  const operationName = opData?.name;
+  if (!operationName) throw new Error("Veo did not return an operation name.");
+
+  // Step 2: Poll for completion (max 60s, polling every 5s)
+  const pollUrl = `https://generativelanguage.googleapis.com/v1/${operationName}?key=${geminiApiKey}`;
+  const maxAttempts = 12;
+  for (let i = 0; i < maxAttempts; i++) {
+    await new Promise((res) => setTimeout(res, 5000));
+    const pollResp = await fetch(pollUrl);
+    if (!pollResp.ok) continue;
+    const pollData = await pollResp.json();
+    if (pollData?.done) {
+      const videoBytes = pollData?.response?.predictions?.[0]?.bytesBase64Encoded;
+      if (!videoBytes) throw new Error("Veo completed but returned no video data.");
+      return {
+        videoBase64: videoBytes,
+        mimeType: "video/mp4",
+        model: VEO_MODEL,
+      };
+    }
+  }
+  throw new Error("Veo video generation timed out after 60 seconds.");
 }
 
 // =============================================================================
@@ -955,10 +943,54 @@ module.exports = async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed. Use POST." });
 
   try {
-    const body = req.body || {};
-    const product = (typeof body.product === "string" ? body.product : "robocoders").toLowerCase().trim();
-    const message = typeof body.message === "string" ? body.message : typeof body.input === "string" ? body.input : "";
-    const history = Array.isArray(body.history) ? body.history : Array.isArray(body.messages) ? body.messages : [];
+    const body     = req.body || {};
+    const geminiApiKey  = process.env.GEMINI_API_KEY;
+    const openaiApiKey  = process.env.OPENAI_API_KEY;   // used ONLY for embeddings
+
+    if (!geminiApiKey)  return res.status(500).json({ error: "GEMINI_API_KEY is not set in env." });
+    if (!openaiApiKey)  return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
+
+    // ========================================================================
+    // SUB-MODEL ROUTES: /generate?type=image  and  /generate?type=video
+    // These are triggered by the separate Image / Video buttons in the frontend.
+    // ========================================================================
+    const generateType = req.query?.type || body?.generateType || null;
+
+    if (generateType === "image") {
+      const prompt = String(body.prompt || "").trim();
+      if (!prompt) return res.status(400).json({ error: "Missing prompt for image generation." });
+
+      // Guard: only allow Spin Genius image generation (spirograph patterns)
+      // For safety, we pass the prompt through but the frontend button is only
+      // shown when the user is in the Spin Genius product context.
+      const result = await generateImageWithNanoBanana(prompt, geminiApiKey);
+      return res.status(200).json({
+        imageBase64: result.imageBase64,
+        mimeType:    result.mimeType,
+        model:       result.model,
+        prompt,
+      });
+    }
+
+    if (generateType === "video") {
+      const prompt = String(body.prompt || "").trim();
+      if (!prompt) return res.status(400).json({ error: "Missing prompt for video generation." });
+
+      const result = await generateVideoWithVeo(prompt, geminiApiKey);
+      return res.status(200).json({
+        videoBase64: result.videoBase64,
+        mimeType:    result.mimeType,
+        model:       result.model,
+        prompt,
+      });
+    }
+
+    // ========================================================================
+    // MAIN CHAT ROUTE
+    // ========================================================================
+    const product    = (typeof body.product  === "string" ? body.product  : "robocoders").toLowerCase().trim();
+    const message    = typeof body.message   === "string" ? body.message  : typeof body.input === "string" ? body.input : "";
+    const history    = Array.isArray(body.history) ? body.history : Array.isArray(body.messages) ? body.messages : [];
     const attachment = body.attachment || null;
 
     if ((typeof message !== "string" || !message.trim()) && !attachment) {
@@ -966,8 +998,6 @@ module.exports = async function handler(req, res) {
     }
 
     const rawUserText = String(message || "").trim() || (attachment ? "Analyze the uploaded image and describe what you see in detail." : "");
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set in env." });
 
     // ========================================================================
     // ROBOCODERS PATH
@@ -983,9 +1013,9 @@ module.exports = async function handler(req, res) {
       const { projectNames, projectsByName, lessonsByProject, canonicalPinsText, safetyText,
         kitOverview, componentsSummary, projectsSummary, componentsMap, supportConfig } = buildIndexes(kb);
 
-      const rawIntent = detectIntent(rawUserText, projectNames, componentsMap);
+      const rawIntent          = detectIntent(rawUserText, projectNames, componentsMap);
       const rawDetectedProject = detectProject(rawUserText, projectNames);
-      let detectedComponent = detectComponent(rawUserText, componentsMap);
+      let   detectedComponent  = detectComponent(rawUserText, componentsMap);
 
       if (rawIntent.type === "KIT_OVERVIEW") {
         return res.status(200).json({ text: kitOverview, debug: { intent: rawIntent, kbMode: "deterministic_overview", product } });
@@ -1016,11 +1046,11 @@ module.exports = async function handler(req, res) {
       }
 
       let plannedUserText = rawUserText;
-      try { plannedUserText = await planChatPrompt(rawUserText, apiKey); } catch (_) {}
+      try { plannedUserText = await planChatPrompt(rawUserText, geminiApiKey); } catch (_) {}
 
       const { lastProject, lastComponent } = resolveContextFromHistory(history, projectNames, componentsMap);
       const detectedProject = rawDetectedProject || detectProject(plannedUserText, projectNames) || lastProject;
-      detectedComponent = detectComponent(plannedUserText, componentsMap) || detectedComponent || lastComponent;
+      detectedComponent     = detectComponent(plannedUserText, componentsMap) || detectedComponent || lastComponent;
 
       const supportReason = detectSupportFailure({
         userText: rawUserText, intent: rawIntent, detectedProject,
@@ -1035,10 +1065,10 @@ module.exports = async function handler(req, res) {
       }
 
       let ragContext = "";
-      let ragChunks = [];
+      let ragChunks  = [];
       try {
-        const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
-        ragChunks = await queryPinecone(queryEmbedding, "robocoders", 6);
+        const queryEmbedding = await embedText(plannedUserText || rawUserText, openaiApiKey);
+        ragChunks  = await queryPinecone(queryEmbedding, "robocoders", 6);
         if (ragChunks.length > 0) {
           ragContext = "=== RETRIEVED KNOWLEDGE (from vector search) ===\n" +
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}${c.projectName ? ` | project: ${c.projectName}` : ""}]\n${c.text}`).join("\n\n---\n\n");
@@ -1047,34 +1077,35 @@ module.exports = async function handler(req, res) {
         console.error("RAG error:", ragErr.message);
       }
 
-      const projectContext = detectedProject ? projectsByName[detectedProject] || null : null;
+      const projectContext      = detectedProject ? projectsByName[detectedProject] || null : null;
       const deterministicContext = buildGroundedContext({ detectedProject, projectContext, lessonsByProject, canonicalPinsText, safetyText, kitOverview, componentsSummary, projectsSummary });
-      const fullContext = ragContext ? ragContext + "\n\n" + deterministicContext : deterministicContext;
-      const systemPrompt = buildRobocodersSystemPrompt(fullContext);
+      const fullContext         = ragContext ? ragContext + "\n\n" + deterministicContext : deterministicContext;
+      const systemPrompt        = buildRobocodersSystemPrompt(fullContext);
 
-      let userContent = [];
-      if (plannedUserText?.trim()) userContent.push({ type: "text", text: plannedUserText });
+      // Build Gemini user parts
+      const newUserParts = [];
+      if (plannedUserText?.trim()) newUserParts.push({ text: plannedUserText });
       if (attachment) {
-        const imageUrl = attachment.startsWith("data:") ? attachment : `data:image/png;base64,${attachment}`;
-        userContent.push({ type: "image_url", image_url: { url: imageUrl } });
+        const { mimeType, data } = splitDataUrl(attachment.startsWith("data:") ? attachment : `data:image/png;base64,${attachment}`);
+        newUserParts.push({ inlineData: { mimeType, data } });
       }
 
-      const messages = [{ role: "system", content: systemPrompt }, ...buildConversationHistory(history), { role: "user", content: userContent }];
-      console.log("Product: robocoders | RAG chunks:", ragChunks.length, "| Intent:", rawIntent.type);
+      console.log("Product: robocoders | RAG chunks:", ragChunks.length, "| Intent:", rawIntent.type, "| Model:", GEMINI_CHAT_MODEL);
 
-      const r = await fetch(OPENAI_CHAT_URL, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: "gpt-4o-mini", temperature: 0.7, max_tokens: 1000, messages }),
+      let reply = await geminiChatWithHistory({
+        geminiApiKey,
+        model: GEMINI_CHAT_MODEL,
+        systemInstruction: systemPrompt,
+        history,
+        newUserParts,
+        temperature: 0.7,
+        maxOutputTokens: 1000,
       });
-      if (!r.ok) { const t = await r.text().catch(() => ""); return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) }); }
-      const data = await r.json();
-      let reply = data?.choices?.[0]?.message?.content?.trim() || "";
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
 
       return res.status(200).json({
         text: reply,
-        debug: { product, detectedProject: detectedProject || null, detectedComponent: detectedComponent || null, intent: rawIntent, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map((c) => c.type) },
+        debug: { product, detectedProject: detectedProject || null, detectedComponent: detectedComponent || null, intent: rawIntent, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map((c) => c.type), model: GEMINI_CHAT_MODEL },
       });
     }
 
@@ -1083,43 +1114,36 @@ module.exports = async function handler(req, res) {
     // ========================================================================
     if (product === "spingenius") {
       let plannedUserText = rawUserText;
-      try { plannedUserText = await planChatPrompt(rawUserText, apiKey); } catch (_) {}
+      try { plannedUserText = await planChatPrompt(rawUserText, geminiApiKey); } catch (_) {}
 
-      let ragContext = "";
-      let ragChunks = [];
-      let patternImages = [];
+      let ragContext        = "";
+      let ragChunks         = [];
+      let patternImages     = [];
       let grayscaleImageUrl = null;
       let classifiedPattern = null;
 
       // ── STEP 1: Convert image to grayscale ONCE ───────────────────────────
-      // This physically strips color so GPT cannot use it as a shortcut.
-      // The same grayscale image is used for both the classifier and main call.
       if (attachment) {
         grayscaleImageUrl = await toGrayscaleBase64(attachment);
       }
 
       try {
-        // ── STEP 2A: IMAGE PATH — classify first, then RAG with board position ─
-        // CRITICAL FIX: RAG was previously skipped when image was present.
-        // Now: classify → get board/stick → query Pinecone with board name
-        // so the full KB description is always available to GPT.
+        // ── STEP 2A: IMAGE PATH — classify first, then RAG with board position
         if (grayscaleImageUrl) {
           try {
-            const classified = await classifyPatternFromImage(grayscaleImageUrl, apiKey);
+            const classified = await classifyPatternFromImage(grayscaleImageUrl, geminiApiKey);
             console.log("Vision classifier result:", classified);
             if (classified?.patternImage) {
-              patternImages = [classified.patternImage];
+              patternImages     = [classified.patternImage];
               classifiedPattern = classified;
-              // Query Pinecone using pattern name + board+stick for best semantic match
               const searchQuery = `${classified.patternName || ""} board ${classified.boardPosition} sticks ${classified.stickPosition} pattern`;
-              const queryEmbedding = await embedText(searchQuery, apiKey);
+              const queryEmbedding = await embedText(searchQuery, openaiApiKey);
               ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
             }
           } catch (classifyErr) {
             console.error("Vision classifier error:", classifyErr.message);
-            // Fallback: if classifier fails, run RAG on user text
             try {
-              const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
+              const queryEmbedding = await embedText(plannedUserText || rawUserText, openaiApiKey);
               ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
             } catch (_) {}
           }
@@ -1127,23 +1151,22 @@ module.exports = async function handler(req, res) {
 
         // ── STEP 2B: TEXT PATH — RAG on user text ────────────────────────────
         if (!grayscaleImageUrl) {
-          const queryEmbedding = await embedText(plannedUserText || rawUserText, apiKey);
+          const queryEmbedding = await embedText(plannedUserText || rawUserText, openaiApiKey);
           ragChunks = await queryPinecone(queryEmbedding, "spingenius", 6);
         }
 
-        // ── STEP 3: Build RAG context from retrieved chunks ───────────────────
+        // ── STEP 3: Build RAG context ─────────────────────────────────────────
         if (ragChunks.length > 0) {
           ragContext = "=== RETRIEVED KNOWLEDGE ===\n" +
             ragChunks.map((c, i) => `[Chunk ${i + 1} | type: ${c.type}]\n${c.text}`).join("\n\n---\n\n");
         }
 
-        // ── STEP 4: Text-path image matching (no image or classifier failed) ──
+        // ── STEP 4: Text-path image matching ─────────────────────────────────
         if (!grayscaleImageUrl || patternImages.length === 0) {
           const configChunks = ragChunks.filter(c => c.type === "configuration" && c.patternImage);
-          const queryText = (plannedUserText || rawUserText).toLowerCase();
+          const queryText    = (plannedUserText || rawUserText).toLowerCase();
 
-          const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-z])\b/i)
-            || queryText.match(/\b(g-[0-9])\b/i);
+          const boardMatch = queryText.match(/\b([0-9]{1,2}-[a-z])\b/i) || queryText.match(/\b(g-[0-9])\b/i);
           const askedBoard = boardMatch?.[1]?.toUpperCase();
           const stickMatch = queryText.match(/stick[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
             || queryText.match(/position[s]?\s*[:\-\s]*([0-9]+-[0-9]+)/i)
@@ -1151,32 +1174,21 @@ module.exports = async function handler(req, res) {
           const askedStick = stickMatch?.[1];
 
           if (askedBoard || askedStick) {
-            // Use PATTERN_LOOKUP for exact match — never Pinecone rank
             let entry = null;
-            if (askedBoard && askedStick) {
-              entry = lookupExact(askedBoard, askedStick);
-            }
-            if (!entry && askedBoard) {
-              // Board only — safe if that board has exactly ONE config in lookup
-              entry = lookupByBoard(askedBoard);
-            }
+            if (askedBoard && askedStick) { entry = lookupExact(askedBoard, askedStick); }
+            if (!entry && askedBoard)     { entry = lookupByBoard(askedBoard); }
             if (!entry && askedStick && !askedBoard) {
-              // Stick only — find the one config with that stick position
-              const stickMatch2 = Object.entries(PATTERN_LOOKUP).find(([k]) => k.endsWith("|" + askedStick));
-              entry = stickMatch2?.[1] || null;
+              const sm = Object.entries(PATTERN_LOOKUP).find(([k]) => k.endsWith("|" + askedStick));
+              entry = sm?.[1] || null;
             }
             patternImages = entry?.patternImage ? [entry.patternImage] : [];
           } else {
-            // Name-based lookup — PATTERN_NAME_MAP is the first gate
             const nameMatchedImage = findImageByPatternName(queryText);
             if (nameMatchedImage) {
               patternImages = [nameMatchedImage];
             } else {
-              // RAG fallback: only use top config chunk if score is high enough
-              // (it's the closest semantic match — not guaranteed exact)
-              // We allow this only when no other signal is available
               const topConfig = configChunks[0];
-              patternImages = topConfig?.patternImage ? [topConfig.patternImage] : [];
+              patternImages   = topConfig?.patternImage ? [topConfig.patternImage] : [];
             }
           }
         }
@@ -1185,23 +1197,16 @@ module.exports = async function handler(req, res) {
         console.error("Spin Genius RAG error:", ragErr.message);
       }
 
-      // ── STEP 5: Build messages — inject classifier result as text (NO image re-sent) ──
-      //
-      // CRITICAL BUG FIX:
-      // Previously the grayscale image was sent to the final LLM call. GPT would see the
-      // image, re-identify the pattern itself, and override the classifier's correct answer.
-      // This caused the text reply (e.g. '11-C') to contradict patternImages (e.g. '7-A.jpeg').
-      // THE FIX: Do NOT send the image to the final LLM call.
-      // The classifier already ran 3 dedicated GPT-4o calls to identify the pattern.
-      // The final LLM only needs the text description — it must trust the classifier result.
-      //
+      // ── STEP 5: Build Gemini user parts ──────────────────────────────────────
+      // CRITICAL: Do NOT re-send the image to the final LLM call.
+      // The classifier already ran 3 dedicated vision calls. The final LLM
+      // receives only text describing the classifier result.
       const systemPrompt = buildSpinGeniusSystemPrompt(ragContext);
-      let userContent = [];
-      if (plannedUserText?.trim()) userContent.push({ type: "text", text: plannedUserText });
+      const newUserParts = [];
+      if (plannedUserText?.trim()) newUserParts.push({ text: plannedUserText });
 
       if (grayscaleImageUrl && classifiedPattern) {
-        // Classifier succeeded — inject result as text only, never re-send the image
-        const entry = lookupExact(classifiedPattern.boardPosition, classifiedPattern.stickPosition)
+        const entry  = lookupExact(classifiedPattern.boardPosition, classifiedPattern.stickPosition)
           || lookupByBoard(classifiedPattern.boardPosition);
         const kbDesc = ragChunks.find(c =>
           c.type === "configuration" &&
@@ -1216,8 +1221,7 @@ module.exports = async function handler(req, res) {
           : entry
             ? `\n\nPattern Name: ${entry.patternName}\nFun Name: ${entry.funName}\nBoard Position: ${classifiedPattern.boardPosition}\nStick Position: ${entry.stickPosition || classifiedPattern.stickPosition}`
             : "";
-        userContent.push({
-          type: "text",
+        newUserParts.push({
           text: `[CLASSIFIER RESULT — DEFINITIVE IDENTIFICATION. DO NOT CHANGE OR QUESTION THIS.
 
 Board Position: ${classifiedPattern.boardPosition}
@@ -1241,35 +1245,28 @@ The pattern picture will appear below my response automatically! 🎨
 Do not write paragraphs. Do not suggest alternatives. Use EXACTLY the board and stick position above.${descText}]`
         });
       } else if (grayscaleImageUrl && !classifiedPattern) {
-        // Image uploaded but classifier failed — ask user for more info
-        userContent.push({
-          type: "text",
+        newUserParts.push({
           text: "[NOTE: An image was uploaded but the pattern classifier could not identify it confidently. Tell the user in a friendly way that you could not clearly identify this pattern, and ask them to try a clearer photo or share the board and stick positions directly.]"
         });
       }
 
-      const messages = [
-        { role: "system", content: systemPrompt },
-        ...buildConversationHistory(history),
-        { role: "user", content: userContent }
-      ];
-      console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages, "| Classified:", classifiedPattern?.boardPosition || "none");
+      console.log("Product: spingenius | RAG chunks:", ragChunks.length, "| Pattern images:", patternImages, "| Classified:", classifiedPattern?.boardPosition || "none", "| Model:", GEMINI_CHAT_MODEL);
 
-      const spinModel = grayscaleImageUrl ? "gpt-4o" : "gpt-4o-mini";
-      const r = await fetch(OPENAI_CHAT_URL, {
-        method: "POST",
-        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ model: spinModel, temperature: 0.7, max_tokens: 1000, messages }),
+      let reply = await geminiChatWithHistory({
+        geminiApiKey,
+        model: GEMINI_CHAT_MODEL,
+        systemInstruction: systemPrompt,
+        history,
+        newUserParts,
+        temperature: 0.7,
+        maxOutputTokens: 1000,
       });
-      if (!r.ok) { const t = await r.text().catch(() => ""); return res.status(500).json({ error: "OpenAI API error", details: t.slice(0, 800) }); }
-      const data = await r.json();
-      let reply = data?.choices?.[0]?.message?.content?.trim() || "";
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
 
       return res.status(200).json({
         text: reply,
         patternImages,
-        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map(c => c.type), patternImagesReturned: patternImages, classifiedBoard: classifiedPattern?.boardPosition || null },
+        debug: { product, kbMode: "rag+llm", ragChunksRetrieved: ragChunks.length, ragChunkTypes: ragChunks.map(c => c.type), patternImagesReturned: patternImages, classifiedBoard: classifiedPattern?.boardPosition || null, model: GEMINI_CHAT_MODEL },
       });
     }
 
@@ -1323,7 +1320,7 @@ WHAT YOU CAN HELP WITH:
 ABOUT PATTERN IMAGES:
 - You CANNOT generate or draw images yourself — you are a text AI
 - When a user asks to "generate an image" or "show me the pattern image", respond:
-  "I can't draw images myself, but the picture of this pattern will pop up automatically below my answer if it's in my knowledge base! 🌀"
+  "I can't draw images myself, but the picture of this pattern will pop up automatically below my answer if it's in my knowledge base! 🌀 Use the 🖼️ Generate Image button to create a custom AI image with Nano Banana!"
 - When a user UPLOADS a photo, analyse the GEOMETRIC SHAPE AND STRUCTURE ONLY
 
 STRICT OUT-OF-SCOPE RULE:
@@ -1433,25 +1430,25 @@ If config not in knowledge base: "I don't have that one yet — try it out and d
 }
 
 // =============================================================================
-// All Robocoders helper functions
+// All Robocoders helper functions (unchanged)
 // =============================================================================
 function buildIndexes(kb) {
-  const projectNames = extractProjectNames(kb);
-  const projectsByName = {};
+  const projectNames    = extractProjectNames(kb);
+  const projectsByName  = {};
   const lessonsByProject = {};
   for (const pName of projectNames) {
-    projectsByName[pName] = extractProjectBlock(kb, pName);
+    projectsByName[pName]   = extractProjectBlock(kb, pName);
     lessonsByProject[pName] = extractLessons(kb, pName).sort((a, b) => lessonRank(a.lessonName) - lessonRank(b.lessonName));
   }
   return {
     projectNames, projectsByName, lessonsByProject,
     canonicalPinsText: extractCanonicalPins(kb),
-    safetyText: extractSafety(kb),
-    kitOverview: extractKitOverview(kb),
+    safetyText:        extractSafety(kb),
+    kitOverview:       extractKitOverview(kb),
     componentsSummary: extractComponentsSummary(kb),
-    projectsSummary: extractProjectsSummary(kb),
-    componentsMap: extractComponentsMap(kb),
-    supportConfig: extractSupportConfig(kb),
+    projectsSummary:   extractProjectsSummary(kb),
+    componentsMap:     extractComponentsMap(kb),
+    supportConfig:     extractSupportConfig(kb),
   };
 }
 
@@ -1508,10 +1505,10 @@ function detectComponent(text, componentsMap) {
 function resolveContextFromHistory(history, projectNames, componentsMap) {
   let lastProject = null, lastComponent = null;
   for (let i = history.length - 1; i >= 0; i--) {
-    const msg = history[i];
+    const msg  = history[i];
     if (!msg?.content) continue;
     const text = String(msg.content);
-    if (!lastProject) { const p = detectProject(text, projectNames); if (p) lastProject = p; }
+    if (!lastProject)   { const p = detectProject(text, projectNames);   if (p) lastProject   = p; }
     if (!lastComponent) { const c = detectComponent(text, componentsMap); if (c) lastComponent = c; }
     if (lastProject && lastComponent) break;
   }
@@ -1520,14 +1517,14 @@ function resolveContextFromHistory(history, projectNames, componentsMap) {
 
 function getComponentVariations(name) {
   const variations = [name];
-  if (name.includes("robocoders brain")) variations.push("brain", "main board", "robocoders");
-  if (name.includes("ir sensor")) variations.push("infrared", "ir", "proximity sensor");
-  if (name.includes("ldr")) variations.push("light sensor", "light dependent resistor");
-  if (name.includes("potentiometer")) variations.push("knob", "pot", "dial");
-  if (name.includes("servo motor")) variations.push("servo");
-  if (name.includes("dc motor")) variations.push("motor");
-  if (name.includes("rgb led")) variations.push("rgb", "color led");
-  if (name.includes("keys pcb")) variations.push("keys", "buttons", "button panel");
+  if (name.includes("robocoders brain"))  variations.push("brain", "main board", "robocoders");
+  if (name.includes("ir sensor"))         variations.push("infrared", "ir", "proximity sensor");
+  if (name.includes("ldr"))               variations.push("light sensor", "light dependent resistor");
+  if (name.includes("potentiometer"))     variations.push("knob", "pot", "dial");
+  if (name.includes("servo motor"))       variations.push("servo");
+  if (name.includes("dc motor"))          variations.push("motor");
+  if (name.includes("rgb led"))           variations.push("rgb", "color led");
+  if (name.includes("keys pcb"))          variations.push("keys", "buttons", "button panel");
   return variations;
 }
 
@@ -1537,22 +1534,13 @@ function buildGroundedContext({ detectedProject, projectContext, lessonsByProjec
   if (safetyText) sections.push("=== SAFETY RULES ===\n" + safetyText + "\n\nIMPORTANT SAFETY NOTES:\n- It is SAFE to plug and unplug sensors and components while the Robocoders Brain is powered on.\n- The system uses low voltage (5V from USB), so there is no risk of electric shock.\n- Always handle components gently to avoid physical damage.\n- Do not force connections - they should fit smoothly.");
   if (canonicalPinsText) sections.push("=== PORT MAPPINGS ===\n" + canonicalPinsText);
   if (componentsSummary) sections.push("=== COMPONENTS SUMMARY ===\n" + `Total Components: ${componentsSummary.totalCount}\nCategories available: ${Object.keys(componentsSummary.categories || {}).join(", ")}`);
-  if (projectsSummary) sections.push("=== PROJECTS SUMMARY ===\n" + `There are 50 projects, out of which ${projectsSummary.totalCount} are live. One project per week shall be launched.\nAvailable Projects: ${projectsSummary.projectList.join(", ")}`);
+  if (projectsSummary)   sections.push("=== PROJECTS SUMMARY ===\n" + `There are 50 projects, out of which ${projectsSummary.totalCount} are live. One project per week shall be launched.\nAvailable Projects: ${projectsSummary.projectList.join(", ")}`);
   if (detectedProject && projectContext) {
     sections.push(`=== PROJECT: ${detectedProject} ===\n${projectContext}`);
     const lessons = lessonsByProject[detectedProject] || [];
     if (lessons.length) sections.push(`=== LESSONS FOR ${detectedProject} ===\n` + lessons.map((l) => `- ${l.lessonName}\n  ${l.explainLine || ""}\n  Videos: ${l.videoLinks.join(", ")}`).join("\n\n"));
   }
   return sections.join("\n\n");
-}
-
-function buildConversationHistory(history) {
-  const msgs = [];
-  for (const h of history || []) {
-    if (h?.role === "user" && h?.content) msgs.push({ role: "user", content: String(h.content) });
-    else if (h?.role === "assistant" && h?.content) msgs.push({ role: "assistant", content: String(h.content) });
-  }
-  return msgs;
 }
 
 function extractProjectNames(kb) {
@@ -1563,13 +1551,13 @@ function extractKitOverview(kb) {
   if (kb?.overview) {
     const o = kb.overview;
     const parts = [];
-    if (o.kitName) parts.push(`Kit: ${o.kitName}`);
-    if (o.description) parts.push(o.description);
-    if (o.whatIsInside) parts.push(`\nWhat's Inside:\n${o.whatIsInside}`);
-    if (o.keyFeatures) parts.push(`\nKey Features:\n${o.keyFeatures.map((f) => `- ${f}`).join("\n")}`);
-    if (o.totalProjects) parts.push(`\nTotal Projects: ${o.totalProjects}`);
+    if (o.kitName)        parts.push(`Kit: ${o.kitName}`);
+    if (o.description)    parts.push(o.description);
+    if (o.whatIsInside)   parts.push(`\nWhat's Inside:\n${o.whatIsInside}`);
+    if (o.keyFeatures)    parts.push(`\nKey Features:\n${o.keyFeatures.map((f) => `- ${f}`).join("\n")}`);
+    if (o.totalProjects)  parts.push(`\nTotal Projects: ${o.totalProjects}`);
     if (o.totalComponents) parts.push(`Total Components: ${o.totalComponents}`);
-    if (o.ageRange) parts.push(`Age Range: ${o.ageRange}`);
+    if (o.ageRange)       parts.push(`Age Range: ${o.ageRange}`);
     return parts.join("\n");
   }
   return "The Robocoders Kit is an educational electronics and coding kit for children aged 8-14. It includes 21 exciting projects and 92 components to learn physical computing, Visual Block Coding, and creative project building.";
@@ -1611,7 +1599,7 @@ function extractDescriptionFromText(text) {
 
 function extractProjectBlock(kb, projectName) {
   if (Array.isArray(kb?.pages)) {
-    const norm = (s) => s.toLowerCase();
+    const norm  = (s) => s.toLowerCase();
     const pNorm = norm(projectName);
     for (const page of kb.pages) {
       if (page?.type === "project" && norm(page.projectName || "") === pNorm) return sanitizeChunk(page.text || "");
@@ -1626,10 +1614,10 @@ function extractProjectBlock(kb, projectName) {
   const p = (kb?.projects && kb.projects[projectName]) || (Array.isArray(kb?.projects) ? kb.projects.find((x) => x?.name === projectName) : null);
   if (p) {
     const parts = [];
-    if (p.description) parts.push(p.description);
-    if (p.componentsUsed) parts.push("Components Used:\n" + p.componentsUsed.join("\n"));
-    if (p.connections) parts.push("Connections:\n" + p.connections.join("\n"));
-    if (p.steps) parts.push("Build Steps:\n" + p.steps.join("\n"));
+    if (p.description)     parts.push(p.description);
+    if (p.componentsUsed)  parts.push("Components Used:\n" + p.componentsUsed.join("\n"));
+    if (p.connections)     parts.push("Connections:\n" + p.connections.join("\n"));
+    if (p.steps)           parts.push("Build Steps:\n" + p.steps.join("\n"));
     return sanitizeChunk(parts.join("\n\n"));
   }
   return "";
@@ -1647,8 +1635,8 @@ function extractLessons(kb, projectName) {
   }
   const lessons = [];
   if (Array.isArray(kb?.pages)) {
-    const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-    const p = projectName.toLowerCase();
+    const pages   = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
+    const p       = projectName.toLowerCase();
     let inProject = false;
     for (let i = 0; i < pages.length; i++) {
       const txt = pages[i];
@@ -1657,9 +1645,9 @@ function extractLessons(kb, projectName) {
       if (!inProject) continue;
       const blocks = txt.split(/(Lesson ID\s*[:\-]|Build\s*\d+|Coding\s*Part\s*\d+)/i);
       for (let b = 1; b < blocks.length; b++) {
-        const block = blocks[b];
+        const block      = blocks[b];
         const lessonName = matchLine(block, /Lesson Name\s*(?:\(Canonical\))?\s*:\s*([^\n]+)/i) || matchLine(block, /(Build\s*\d+)/i) || matchLine(block, /(Coding\s*Part\s*\d+)/i) || "";
-        const links = block.match(/https?:\/\/[^\s\]\)\}\n]+/gi) || [];
+        const links      = block.match(/https?:\/\/[^\s\]\)\}\n]+/gi) || [];
         const explainLine = matchLine(block, /What this lesson helps with.*?:\s*([\s\S]*?)(?:When the AI|$)/i) || "";
         if (lessonName && links.length) { lessons.push({ lessonName: lessonName.trim(), videoLinks: uniq(links), explainLine: cleanExplain(explainLine) }); }
       }
@@ -1671,7 +1659,7 @@ function extractLessons(kb, projectName) {
 function extractCanonicalPins(kb) {
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-    const idx = pages.findIndex((t) => t.toLowerCase().includes("fixed port mappings"));
+    const idx   = pages.findIndex((t) => t.toLowerCase().includes("fixed port mappings"));
     if (idx >= 0) return sanitizeChunk(pages.slice(idx, idx + 3).join("\n\n"));
   }
   return "";
@@ -1680,7 +1668,7 @@ function extractCanonicalPins(kb) {
 function extractSafety(kb) {
   if (Array.isArray(kb?.pages)) {
     const pages = kb.pages.map((pg) => (pg?.text ? String(pg.text) : ""));
-    const idx = pages.findIndex((t) => t.toLowerCase().includes("global safety"));
+    const idx   = pages.findIndex((t) => t.toLowerCase().includes("global safety"));
     if (idx >= 0) return sanitizeChunk(pages.slice(idx, idx + 2).join("\n\n"));
   }
   return "";
@@ -1691,15 +1679,15 @@ function formatComponentsList(componentsSummary) {
   lines.push(`The Robocoders Kit contains ${componentsSummary.totalCount || 92} components including:\n`);
   if (componentsSummary.categories) {
     const cats = componentsSummary.categories;
-    if (cats.controller) { lines.push(`**Controller (${cats.controller.count}):**`); lines.push(`- ${cats.controller.components.join(", ")}`); lines.push(""); }
-    if (cats.sensors) { lines.push(`**Sensors (${cats.sensors.count}):**`); lines.push(`- ${cats.sensors.components.join(", ")}`); lines.push(""); }
-    if (cats.actuators) { lines.push(`**Actuators (${cats.actuators.count}):**`); lines.push(`- ${cats.actuators.components.join(", ")}`); lines.push(""); }
-    if (cats.lights) { lines.push(`**Lights (${cats.lights.count}):**`); lines.push(`- ${cats.lights.components.join(", ")}`); lines.push(""); }
-    if (cats.power) { lines.push(`**Power (${cats.power.count}):**`); lines.push(`- ${cats.power.components.join(", ")}`); lines.push(""); }
-    if (cats.structural) { lines.push(`**Structural Components (${cats.structural.count}):**`); lines.push(`- ${cats.structural.description}`); lines.push(""); }
-    if (cats.craft) { lines.push(`**Craft Materials (${cats.craft.count}):**`); lines.push(`- ${cats.craft.components.join(", ")}`); lines.push(""); }
-    if (cats.mechanical) { lines.push(`**Mechanical Parts (${cats.mechanical.count}):**`); lines.push(`- ${cats.mechanical.components.join(", ")}`); lines.push(""); }
-    if (cats.wiring) { lines.push(`**Wiring (${cats.wiring.count}):**`); lines.push(`- ${cats.wiring.description}`); lines.push(""); }
+    if (cats.controller)  { lines.push(`**Controller (${cats.controller.count}):**`);  lines.push(`- ${cats.controller.components.join(", ")}`);  lines.push(""); }
+    if (cats.sensors)     { lines.push(`**Sensors (${cats.sensors.count}):**`);         lines.push(`- ${cats.sensors.components.join(", ")}`);     lines.push(""); }
+    if (cats.actuators)   { lines.push(`**Actuators (${cats.actuators.count}):**`);     lines.push(`- ${cats.actuators.components.join(", ")}`);   lines.push(""); }
+    if (cats.lights)      { lines.push(`**Lights (${cats.lights.count}):**`);           lines.push(`- ${cats.lights.components.join(", ")}`);      lines.push(""); }
+    if (cats.power)       { lines.push(`**Power (${cats.power.count}):**`);             lines.push(`- ${cats.power.components.join(", ")}`);       lines.push(""); }
+    if (cats.structural)  { lines.push(`**Structural Components (${cats.structural.count}):**`); lines.push(`- ${cats.structural.description}`);  lines.push(""); }
+    if (cats.craft)       { lines.push(`**Craft Materials (${cats.craft.count}):**`);   lines.push(`- ${cats.craft.components.join(", ")}`);      lines.push(""); }
+    if (cats.mechanical)  { lines.push(`**Mechanical Parts (${cats.mechanical.count}):**`); lines.push(`- ${cats.mechanical.components.join(", ")}`); lines.push(""); }
+    if (cats.wiring)      { lines.push(`**Wiring (${cats.wiring.count}):**`);           lines.push(`- ${cats.wiring.description}`);               lines.push(""); }
   }
   lines.push("\nWould you like to know more about any specific component?");
   return lines.join("\n");
@@ -1707,9 +1695,9 @@ function formatComponentsList(componentsSummary) {
 
 function detectSupportFailure({ userText, detectedProject, projectContext, detectedComponent }) {
   const lower = String(userText || "").toLowerCase();
-  if (/contact|customer support|support team|call|email|phone|helpline/i.test(lower)) return "USER_REQUESTED_SUPPORT";
-  if (/missing|not in kit|not included|lost|component missing|nahi mila|gayab/i.test(lower)) return "PART_MISSING";
-  if (/broken|damaged|burnt|burned|melted|smoke|dead|faulty|cracked|not powering/i.test(lower)) return "HARDWARE_DAMAGED";
+  if (/contact|customer support|support team|call|email|phone|helpline/i.test(lower))             return "USER_REQUESTED_SUPPORT";
+  if (/missing|not in kit|not included|lost|component missing|nahi mila|gayab/i.test(lower))      return "PART_MISSING";
+  if (/broken|damaged|burnt|burned|melted|smoke|dead|faulty|cracked|not powering/i.test(lower))   return "HARDWARE_DAMAGED";
   if (/sensor|motor|board|wire|led|wheel|fan|blade|battery|switch|sheet/i.test(lower) && !detectedComponent && !detectedProject) return "UNKNOWN_COMPONENT";
   if (detectedProject && !projectContext) return "PROJECT_NOT_IN_KB";
   return null;
@@ -1718,10 +1706,10 @@ function detectSupportFailure({ userText, detectedProject, projectContext, detec
 function lessonRank(lessonName = "") {
   const n = String(lessonName || "").toLowerCase();
   if (n.includes("connection")) return 1;
-  if (n.includes("build")) return 2;
-  if (n.includes("coding")) return 3;
-  if (n.includes("working")) return 4;
-  if (n.includes("intro")) return 5;
+  if (n.includes("build"))      return 2;
+  if (n.includes("coding"))     return 3;
+  if (n.includes("working"))    return 4;
+  if (n.includes("intro"))      return 5;
   return 99;
 }
 
