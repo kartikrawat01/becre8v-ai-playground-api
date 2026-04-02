@@ -1,6 +1,6 @@
 // =============================================================================
 // Be Cre8v AI Backend — Multi-Product RAG (Robocoders + Spin Genius)
-// Chat/Vision model  : Gemini 2.0 Flash  (gemini-2.0-flash)
+// Chat/Vision model  : Gemini 2.5 Flash  (gemini-2.5-flash-preview-05-20)
 // Embeddings         : OpenAI text-embedding-3-small  (unchanged)
 // Image generation   : Imagen 3  (imagen-3.0-generate-002) via Nano Banana slot
 // Video generation   : Veo 2     (veo-2.0-generate-001)
@@ -8,8 +8,8 @@
 
 // ── Gemini endpoints ──────────────────────────────────────────────────────────
 const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1beta/models";
-const GEMINI_CHAT_MODEL      = "gemini-2.0-flash";               // stable, fast, multimodal
-const GEMINI_VISION_MODEL    = "gemini-2.0-flash";               // same model handles vision
+const GEMINI_CHAT_MODEL      = "gemini-2.5-flash-preview-05-20"; // Gemini 2.5 Flash (latest stable)
+const GEMINI_VISION_MODEL    = "gemini-2.5-flash-preview-05-20"; // same model handles vision
 const NANO_BANANA_MODEL      = "imagen-3.0-generate-002";        // image generation (Imagen 3)
 const VEO_MODEL              = "veo-2.0-generate-001";           // video generation (Veo 2)
 
