@@ -7,8 +7,8 @@
 // =============================================================================
 
 // ── Gemini base URLs — IMPORTANT: chat uses v1, image/video use v1beta ────────
-const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1/models";      // v1 for Gemini 3 Flash chat
-const GEMINI_BASE_URL_BETA   = "https://generativelanguage.googleapis.com/v1beta/models";  // v1beta for image/video gen
+const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1beta/models"; // v1beta for all chat + vision
+const GEMINI_BASE_URL_BETA   = "https://generativelanguage.googleapis.com/v1beta/models"; // v1beta for image/video gen
 const GEMINI_CHAT_MODEL      = "gemini-3-flash-preview";          // ✅ Gemini 3 Flash — confirmed working
 const GEMINI_VISION_MODEL    = "gemini-3-flash-preview";          // ✅ same model handles vision
 const NANO_BANANA_MODEL      = "gemini-3.1-flash-image-preview";  // ✅ Nano Banana 2 — confirmed
