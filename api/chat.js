@@ -1,17 +1,18 @@
 // =============================================================================
 // Be Cre8v AI Backend — Multi-Product RAG (Robocoders + Spin Genius)
-// Chat/Vision model  : Gemini 2.5 Flash  (gemini-2.5-flash)
+// Chat/Vision model  : Gemini 3 Flash   (gemini-3-flash-preview)          → v1 API
 // Embeddings         : OpenAI text-embedding-3-small  (unchanged)
-// Image generation   : Imagen 3  (imagen-3.0-generate-002) via Nano Banana slot
-// Video generation   : Veo 2     (veo-2.0-generate-001)
+// Image generation   : Nano Banana 2    (gemini-3.1-flash-image-preview)  → generateContent + responseModalities
+// Video generation   : Veo 3.1         (veo-3.1-generate-preview)        → generateVideos polling
 // =============================================================================
 
-// ── Gemini endpoints ──────────────────────────────────────────────────────────
-const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1beta/models";
-const GEMINI_CHAT_MODEL      = "gemini-2.5-flash";  // ✅ Official stable string — no date suffix
-const GEMINI_VISION_MODEL    = "gemini-2.5-flash";  // ✅ same model handles vision
-const NANO_BANANA_MODEL      = "imagen-3.0-generate-002";        // image generation (Imagen 3)
-const VEO_MODEL              = "veo-2.0-generate-001";           // video generation (Veo 2)
+// ── Gemini base URLs — IMPORTANT: chat uses v1, image/video use v1beta ────────
+const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1/models";      // v1 for Gemini 3 Flash chat
+const GEMINI_BASE_URL_BETA   = "https://generativelanguage.googleapis.com/v1beta/models";  // v1beta for image/video gen
+const GEMINI_CHAT_MODEL      = "gemini-3-flash-preview";          // ✅ Gemini 3 Flash — confirmed working
+const GEMINI_VISION_MODEL    = "gemini-3-flash-preview";          // ✅ same model handles vision
+const NANO_BANANA_MODEL      = "gemini-3.1-flash-image-preview";  // ✅ Nano Banana 2 — confirmed
+const VEO_MODEL              = "veo-3.1-generate-preview";        // ✅ Veo 3.1 — confirmed
 
 // ── OpenAI embedding (unchanged) ─────────────────────────────────────────────
 const OPENAI_EMBED_URL = "https://api.openai.com/v1/embeddings";
@@ -848,17 +849,19 @@ async function classifyPatternFromImage(grayscaleImageUrl, geminiApiKey) {
 }
 
 // =============================================================================
-// Nano Banana — Image Generation
-// Generates images using the Nano Banana sub-model via Gemini API.
-// Called from the /generate?type=image route.
+// Nano Banana 2 -- Image Generation
+// Uses gemini-3.1-flash-image-preview via generateContent + responseModalities.
+// IMPORTANT: Must use v1beta URL and responseModalities:["TEXT","IMAGE"] -- confirmed by official docs.
+// Called from the generateType=image route.
 // =============================================================================
 async function generateImageWithNanoBanana(prompt, geminiApiKey) {
-  const url = `${GEMINI_BASE_URL}/${NANO_BANANA_MODEL}:generateImages?key=${geminiApiKey}`;
+  // Nano Banana 2 uses generateContent (NOT generateImages) with responseModalities
+  const url = `${GEMINI_BASE_URL_BETA}/${NANO_BANANA_MODEL}:generateContent?key=${geminiApiKey}`;
   const body = {
-    prompt: { text: prompt },
-    number_of_images: 1,
-    safety_filter_level: "block_medium_and_above",
-    person_generation: "dont_allow",
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+    generationConfig: {
+      responseModalities: ["TEXT", "IMAGE"],
+    },
   };
   const r = await fetch(url, {
     method: "POST",
@@ -870,32 +873,32 @@ async function generateImageWithNanoBanana(prompt, geminiApiKey) {
     throw new Error("Nano Banana image generation error: " + t.slice(0, 800));
   }
   const data = await r.json();
-  // Nano Banana returns generated images as base64 in the response
-  const generated = data?.generatedImages?.[0];
-  if (!generated?.image?.imageBytes) {
+  const parts = data?.candidates?.[0]?.content?.parts || [];
+  const imagePart = parts.find(p => p.inlineData?.data);
+  if (!imagePart?.inlineData?.data) {
     throw new Error("Nano Banana returned no image data.");
   }
   return {
-    imageBase64: generated.image.imageBytes,
-    mimeType: "image/png",
-    model: NANO_BANANA_MODEL,
+    imageBase64: imagePart.inlineData.data,
+    mimeType:    imagePart.inlineData.mimeType || "image/png",
+    model:       NANO_BANANA_MODEL,
   };
 }
 
 // =============================================================================
-// Veo — Video Generation
-// Generates videos using the Veo sub-model via Gemini API (async/polling).
-// Called from the /generate?type=video route.
+// Veo 3.1 -- Video Generation
+// Uses veo-3.1-generate-preview via generateVideos endpoint (async polling).
+// IMPORTANT: Uses v1beta URL and generateVideos -- confirmed by official docs.
+// Called from the generateType=video route.
 // =============================================================================
 async function generateVideoWithVeo(prompt, geminiApiKey) {
-  // Step 1: Submit video generation job
-  const submitUrl = `${GEMINI_BASE_URL}/${VEO_MODEL}:predictLongRunning?key=${geminiApiKey}`;
+  // Step 1: Submit video generation job via generateVideos
+  const submitUrl = `${GEMINI_BASE_URL_BETA}/${VEO_MODEL}:generateVideos?key=${geminiApiKey}`;
   const body = {
-    instances: [{ prompt }],
-    parameters: {
+    prompt,
+    generationConfig: {
+      durationSeconds: 8,
       aspectRatio: "16:9",
-      durationSeconds: 5,
-      outputOptions: { mimeType: "video/mp4" },
     },
   };
   const submitResp = await fetch(submitUrl, {
@@ -911,25 +914,27 @@ async function generateVideoWithVeo(prompt, geminiApiKey) {
   const operationName = opData?.name;
   if (!operationName) throw new Error("Veo did not return an operation name.");
 
-  // Step 2: Poll for completion (max 60s, polling every 5s)
-  const pollUrl = `https://generativelanguage.googleapis.com/v1/${operationName}?key=${geminiApiKey}`;
+  // Step 2: Poll for completion (max 120s, polling every 10s)
+  const pollUrl = `https://generativelanguage.googleapis.com/v1beta/${operationName}?key=${geminiApiKey}`;
   const maxAttempts = 12;
   for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((res) => setTimeout(res, 5000));
+    await new Promise((res) => setTimeout(res, 10000));
     const pollResp = await fetch(pollUrl);
     if (!pollResp.ok) continue;
     const pollData = await pollResp.json();
     if (pollData?.done) {
-      const videoBytes = pollData?.response?.predictions?.[0]?.bytesBase64Encoded;
+      // Response has generatedVideos array with video bytes
+      const videos = pollData?.response?.generatedVideos || [];
+      const videoBytes = videos[0]?.video?.videoBytes || videos[0]?.videoBytes;
       if (!videoBytes) throw new Error("Veo completed but returned no video data.");
       return {
         videoBase64: videoBytes,
-        mimeType: "video/mp4",
-        model: VEO_MODEL,
+        mimeType:    "video/mp4",
+        model:       VEO_MODEL,
       };
     }
   }
-  throw new Error("Veo video generation timed out after 60 seconds.");
+  throw new Error("Veo video generation timed out after 120 seconds.");
 }
 
 // =============================================================================
