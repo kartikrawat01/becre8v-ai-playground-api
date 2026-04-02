@@ -9,8 +9,9 @@
 // ── Gemini base URLs — IMPORTANT: chat uses v1, image/video use v1beta ────────
 const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1beta/models"; // v1beta for all chat + vision
 const GEMINI_BASE_URL_BETA   = "https://generativelanguage.googleapis.com/v1beta/models"; // v1beta for image/video gen
-const GEMINI_CHAT_MODEL      = "gemini-3-flash-preview";          // ✅ Gemini 3 Flash — confirmed working
-const GEMINI_VISION_MODEL    = "gemini-3-flash-preview";          // ✅ same model handles vision
+const GEMINI_CHAT_MODEL      = "gemini-3-flash-preview";  // ✅ primary — Gemini 3 Flash
+const GEMINI_VISION_MODEL    = "gemini-3-flash-preview";  // ✅ same model handles vision
+const GEMINI_CHAT_FALLBACK   = "gemini-2.5-flash";        // ✅ fallback — auto-used on 503
 const NANO_BANANA_MODEL      = "gemini-3.1-flash-image-preview";  // ✅ Nano Banana 2 — confirmed
 const VEO_MODEL              = "veo-3.1-generate-preview";        // ✅ Veo 3.1 — confirmed
 
@@ -91,29 +92,48 @@ function buildGeminiHistory(history) {
  * Call Gemini with full conversation history + new user parts.
  */
 async function geminiChatWithHistory({ geminiApiKey, model = GEMINI_CHAT_MODEL, systemInstruction, history, newUserParts, temperature = 0.7, maxOutputTokens = 1000 }) {
-  const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${geminiApiKey}`;
-  const contents = [
-    ...buildGeminiHistory(history),
-    { role: "user", parts: newUserParts },
-  ];
-  const body = {
-    contents,
-    generationConfig: { temperature, maxOutputTokens },
-  };
-  if (systemInstruction) {
-    body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  // Auto-retry with fallback model on 503 (server overloaded) — confirmed pattern from Google forums
+  const modelsToTry = model === GEMINI_CHAT_MODEL
+    ? [GEMINI_CHAT_MODEL, GEMINI_CHAT_FALLBACK]
+    : [model];
+
+  let lastError = null;
+  for (const currentModel of modelsToTry) {
+    const url = `${GEMINI_BASE_URL}/${currentModel}:generateContent?key=${geminiApiKey}`;
+    const contents = [
+      ...buildGeminiHistory(history),
+      { role: "user", parts: newUserParts },
+    ];
+    const body = {
+      contents,
+      generationConfig: { temperature, maxOutputTokens },
+    };
+    if (systemInstruction) {
+      body.systemInstruction = { parts: [{ text: systemInstruction }] };
+    }
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const t = await r.text().catch(() => "");
+      const errText = t.slice(0, 800);
+      // 503 = server overloaded — try fallback model
+      if (r.status === 503 && currentModel !== GEMINI_CHAT_FALLBACK) {
+        console.warn(`${currentModel} returned 503, retrying with fallback ${GEMINI_CHAT_FALLBACK}...`);
+        lastError = new Error("Gemini API error: " + errText);
+        continue;
+      }
+      throw new Error("Gemini API error: " + errText);
+    }
+    const data = await r.json();
+    if (currentModel !== GEMINI_CHAT_MODEL) {
+      console.log(`Used fallback model: ${currentModel}`);
+    }
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
   }
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const t = await r.text().catch(() => "");
-    throw new Error("Gemini API error: " + t.slice(0, 800));
-  }
-  const data = await r.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "";
+  throw lastError || new Error("All Gemini models unavailable.");
 }
 
 /**
@@ -124,25 +144,34 @@ async function geminiChatWithHistory({ geminiApiKey, model = GEMINI_CHAT_MODEL, 
  * maxOutputTokens — small for classifier, larger for free-text
  */
 async function geminiVisionCall(promptText, imageBase64, geminiApiKey, maxOutputTokens = 80, mimeType = "image/jpeg") {
-  const url = `${GEMINI_BASE_URL}/${GEMINI_VISION_MODEL}:generateContent?key=${geminiApiKey}`;
-  const body = {
-    contents: [{
-      role: "user",
-      parts: [
-        { text: promptText },
-        { inlineData: { mimeType, data: imageBase64 } },
-      ],
-    }],
-    generationConfig: { temperature: 0, maxOutputTokens },
-  };
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) return null;
-  const data = await r.json();
-  return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+  // Try primary model first, fallback on 503
+  const modelsToTry = [GEMINI_VISION_MODEL, GEMINI_CHAT_FALLBACK];
+  for (const currentModel of modelsToTry) {
+    const url = `${GEMINI_BASE_URL}/${currentModel}:generateContent?key=${geminiApiKey}`;
+    const body = {
+      contents: [{
+        role: "user",
+        parts: [
+          { text: promptText },
+          { inlineData: { mimeType, data: imageBase64 } },
+        ],
+      }],
+      generationConfig: { temperature: 0, maxOutputTokens },
+    };
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      if (r.status === 503 && currentModel !== GEMINI_CHAT_FALLBACK) {
+        console.warn(`Vision: ${currentModel} 503, trying fallback...`);
+        continue;
+      }
+      return null;
+    }
+    const data = await r.json();
+    return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
 }
 
 // =============================================================================
