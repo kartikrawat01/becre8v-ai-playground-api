@@ -172,6 +172,7 @@ async function geminiVisionCall(promptText, imageBase64, geminiApiKey, maxOutput
     }
     const data = await r.json();
     return data?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || null;
+  }
 }
 
 // =============================================================================
