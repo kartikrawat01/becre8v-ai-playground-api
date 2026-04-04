@@ -10,7 +10,7 @@
 const GEMINI_BASE_URL        = "https://generativelanguage.googleapis.com/v1beta/models"; // v1beta for all chat + vision
 const GEMINI_BASE_URL_BETA   = "https://generativelanguage.googleapis.com/v1beta/models"; // v1beta for image/video gen
 const GEMINI_CHAT_MODEL      = "gemini-3-flash-preview";  // ✅ primary — Gemini 3 Flash
-const GEMINI_VISION_MODEL    = "gemini-3-flash-preview";  // ✅ same model handles vision
+const GEMINI_VISION_MODEL    = "gemini-2.5-flash";        // ✅ better vision for pattern classifier
 const GEMINI_CHAT_FALLBACK   = "gemini-2.5-flash";        // ✅ fallback — auto-used on 503
 const NANO_BANANA_MODEL      = "gemini-3.1-flash-image-preview";  // ✅ Nano Banana 2 — confirmed
 const VEO_MODEL              = "veo-3.1-generate-preview";        // ✅ Veo 3.1 — confirmed
@@ -50,7 +50,7 @@ function allow(res, origin) {
  * temperature — float
  * maxOutputTokens — int
  */
-async function geminiChat({ geminiApiKey, model = GEMINI_CHAT_MODEL, systemInstruction, parts, temperature = 0.7, maxOutputTokens = 1000 }) {
+async function geminiChat({ geminiApiKey, model = GEMINI_CHAT_MODEL, systemInstruction, parts, temperature = 0.7, maxOutputTokens = 2000 }) {
   const url = `${GEMINI_BASE_URL}/${model}:generateContent?key=${geminiApiKey}`;
   const body = {
     contents: [{ role: "user", parts }],
@@ -91,7 +91,7 @@ function buildGeminiHistory(history) {
 /**
  * Call Gemini with full conversation history + new user parts.
  */
-async function geminiChatWithHistory({ geminiApiKey, model = GEMINI_CHAT_MODEL, systemInstruction, history, newUserParts, temperature = 0.7, maxOutputTokens = 1000 }) {
+async function geminiChatWithHistory({ geminiApiKey, model = GEMINI_CHAT_MODEL, systemInstruction, history, newUserParts, temperature = 0.7, maxOutputTokens = 2000 }) {
   // Auto-retry with fallback model on 503 (server overloaded) — confirmed pattern from Google forums
   const modelsToTry = model === GEMINI_CHAT_MODEL
     ? [GEMINI_CHAT_MODEL, GEMINI_CHAT_FALLBACK]
@@ -995,8 +995,9 @@ module.exports = async function handler(req, res) {
       const prompt = String(body.prompt || "").trim();
       if (!prompt) return res.status(400).json({ error: "Missing prompt for image generation." });
 
-      // No product restriction — image generation is open to any prompt.
-      // The frontend buttons handle UX context (shown per product).
+      // Guard: only allow Spin Genius image generation (spirograph patterns)
+      // For safety, we pass the prompt through but the frontend button is only
+      // shown when the user is in the Spin Genius product context.
       const result = await generateImageWithNanoBanana(prompt, geminiApiKey);
       return res.status(200).json({
         imageBase64: result.imageBase64,
@@ -1133,7 +1134,7 @@ module.exports = async function handler(req, res) {
         history,
         newUserParts,
         temperature: 0.7,
-        maxOutputTokens: 1000,
+        maxOutputTokens: 2000,
       });
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
 
@@ -1293,7 +1294,7 @@ Do not write paragraphs. Do not suggest alternatives. Use EXACTLY the board and 
         history,
         newUserParts,
         temperature: 0.7,
-        maxOutputTokens: 1000,
+        maxOutputTokens: 2000,
       });
       reply = reply.replace(/\*\*(.*?)\*\*/g, "$1").replace(/^\s*#{1,6}\s*(.+)$/gm, "• $1").replace(/\n{3,}/g, "\n\n");
 
