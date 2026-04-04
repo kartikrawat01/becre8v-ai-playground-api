@@ -995,9 +995,8 @@ module.exports = async function handler(req, res) {
       const prompt = String(body.prompt || "").trim();
       if (!prompt) return res.status(400).json({ error: "Missing prompt for image generation." });
 
-      // Guard: only allow Spin Genius image generation (spirograph patterns)
-      // For safety, we pass the prompt through but the frontend button is only
-      // shown when the user is in the Spin Genius product context.
+      // No product restriction — image generation is open to any prompt.
+      // The frontend buttons handle UX context (shown per product).
       const result = await generateImageWithNanoBanana(prompt, geminiApiKey);
       return res.status(200).json({
         imageBase64: result.imageBase64,
